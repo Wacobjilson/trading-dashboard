@@ -1,0 +1,83 @@
+# ─── Global image settings ──────────────────────────────────────────────────────
+# Push your built images here (e.g. GHCR) and reference them below.
+image:
+  registry: ghcr.io
+  repository: your-org/quanta
+  pullPolicy: IfNotPresent
+
+backend:
+  image: backend
+  tag: "0.1.0"
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  # Quote ingestion / provider config
+  marketDataProvider: ""        # "", polygon, finnhub, alphavantage, mock
+  quotePollInterval: "5s"
+  aiProvider: "anthropic"
+  anthropicModel: "claude-opus-4-8"
+
+frontend:
+  image: frontend
+  tag: "0.1.0"
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# ─── Secrets ────────────────────────────────────────────────────────────────────
+# In production create this Secret out-of-band (sealed-secrets / external-secrets)
+# and set existingSecret. For a quick start, set create=true and fill in values.
+secret:
+  create: true
+  existingSecret: ""           # if set, the chart references it instead of creating one
+  values:
+    JWT_SECRET: "change-me-to-a-long-random-secret"
+    POLYGON_API_KEY: ""
+    FINNHUB_API_KEY: ""
+    ALPHAVANTAGE_API_KEY: ""
+    TWELVEDATA_API_KEY: ""
+    ANTHROPIC_API_KEY: ""
+    POSTGRES_PASSWORD: "quanta"
+
+# ─── PostgreSQL (in-cluster, single instance) ─────────────────────────────────────
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  user: quanta
+  database: quanta
+  storage: 10Gi
+  storageClassName: ""          # "" = cluster default
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+# ─── Redis (in-cluster) ──────────────────────────────────────────────────────────
+redis:
+  enabled: true
+  image: redis:7-alpine
+  storage: 2Gi
+  storageClassName: ""
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+# ─── Networking / Ingress ────────────────────────────────────────────────────────
+# className: "traefik" or "nginx". The chart adds WebSocket-friendly annotations
+# for the selected controller.
+ingress:
+  enabled: true
+  className: "traefik"
+  host: quanta.local
+  tls:
+    enabled: false
+    secretName: quanta-tls
+  # Browser origin allowed by the backend (CORS + WebSocket origin check).
+  # Should match the scheme+host you serve the app on.
+  corsAllowedOrigins: "https://quanta.local"

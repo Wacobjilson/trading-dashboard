@@ -1,0 +1,12 @@
+apiVersion: v2
+name: trading-dashboard
+description: Quanta — self-hosted trading intelligence platform (backend, frontend, Postgres, Redis)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - trading
+  - finance
+  - dashboard
+maintainers:
+  - name: quanta

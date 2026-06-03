@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-terminal-bg text-terminal-text font-sans antialiased;
+}
+
+/* Tabular figures for price/number columns */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  @apply font-mono;
+}
+
+/* Subtle flash when a value updates */
+@keyframes flash-up {
+  0% { background-color: rgba(46, 204, 113, 0.25); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-down {
+  0% { background-color: rgba(255, 77, 79, 0.25); }
+  100% { background-color: transparent; }
+}
+.flash-up { animation: flash-up 0.6s ease-out; }
+.flash-down { animation: flash-down 0.6s ease-out; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { @apply bg-terminal-border rounded; }

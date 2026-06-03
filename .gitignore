@@ -1,0 +1,33 @@
+# Env / secrets
+.env
+.env.local
+*.local
+
+# Local tooling
+.claude/
+
+# Go
+backend/bin/
+backend/tmp/
+*.test
+*.out
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+Thumbs.db
+
+# Build artifacts
+dist/
+*.tgz

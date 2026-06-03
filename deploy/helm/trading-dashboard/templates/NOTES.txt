@@ -1,0 +1,28 @@
+Quanta has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+{{- if .Values.ingress.enabled }}
+
+Access the terminal at:
+  {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}
+
+Make sure {{ .Values.ingress.host }} resolves to your ingress controller's address
+(add it to /etc/hosts for a local cluster).
+{{- else }}
+
+Ingress is disabled. Port-forward to reach the services:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "quanta.fullname" . }}-frontend 3000:3000
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "quanta.fullname" . }}-backend 8080:8080
+{{- end }}
+
+IMPORTANT:
+  * The frontend talks to the backend same-origin via the ingress (/api and /ws),
+    so the image needs no host-specific build args. Just make sure
+    ingress.corsAllowedOrigins ({{ .Values.ingress.corsAllowedOrigins }}) matches the
+    scheme+host you serve on.
+  * Set a strong JWT_SECRET and at least one market-data API key in your secret.
+    {{- if not .Values.secret.values.POLYGON_API_KEY }}{{- if not .Values.secret.values.FINNHUB_API_KEY }}{{- if not .Values.secret.values.ALPHAVANTAGE_API_KEY }}
+    No market-data key detected — the backend will run in synthetic MOCK mode.
+    {{- end }}{{- end }}{{- end }}
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}

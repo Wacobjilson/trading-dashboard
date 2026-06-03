@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: quanta-postgres
+  namespace: quanta
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: quanta-postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: quanta-postgres
+  namespace: quanta
+spec:
+  serviceName: quanta-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quanta-postgres
+  template:
+    metadata:
+      labels:
+        app: quanta-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: quanta
+            - name: POSTGRES_DB
+              value: quanta
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: quanta-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "quanta", "-d", "quanta"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

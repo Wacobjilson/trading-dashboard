@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: quanta-frontend
+  namespace: quanta
+spec:
+  ports:
+    - port: 3000
+      targetPort: 3000
+  selector:
+    app: quanta-frontend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quanta-frontend
+  namespace: quanta
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: quanta-frontend
+  template:
+    metadata:
+      labels:
+        app: quanta-frontend
+    spec:
+      containers:
+        # Host-agnostic image: the browser reaches the backend same-origin via the
+        # ingress (/api and /ws), so no NEXT_PUBLIC_* config is needed.
+        - name: frontend
+          image: ghcr.io/your-org/quanta-frontend:0.1.0
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }

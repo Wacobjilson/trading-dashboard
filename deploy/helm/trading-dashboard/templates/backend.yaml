@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "quanta.fullname" . }}-backend
+  labels:
+    {{- include "quanta.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: backend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "quanta.fullname" . }}-backend
+  labels:
+    {{- include "quanta.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  {{- if not .Values.backend.autoscaling.enabled }}
+  replicas: {{ .Values.backend.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: backend
+        {{- include "quanta.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: backend
+          image: {{ include "quanta.image" (dict "Values" .Values "component" .Values.backend.image "tag" .Values.backend.tag) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "quanta.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "{{ include "quanta.databaseUrl" . }}"
+            - name: REDIS_URL
+              value: "redis://{{ include "quanta.fullname" . }}-redis:6379/0"
+            - name: API_PORT
+              value: "8080"
+            - name: CORS_ALLOWED_ORIGINS
+              value: {{ .Values.ingress.corsAllowedOrigins | quote }}
+            - name: MARKET_DATA_PROVIDER
+              value: {{ .Values.backend.marketDataProvider | quote }}
+            - name: QUOTE_POLL_INTERVAL
+              value: {{ .Values.backend.quotePollInterval | quote }}
+            - name: AI_PROVIDER
+              value: {{ .Values.backend.aiProvider | quote }}
+            - name: ANTHROPIC_MODEL
+              value: {{ .Values.backend.anthropicModel | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ include "quanta.secretName" . }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+{{- if .Values.backend.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "quanta.fullname" . }}-backend
+  labels:
+    {{- include "quanta.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "quanta.fullname" . }}-backend
+  minReplicas: {{ .Values.backend.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.backend.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.backend.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
