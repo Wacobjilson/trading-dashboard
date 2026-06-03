@@ -2,12 +2,12 @@
 # Push your built images here (e.g. GHCR) and reference them below.
 image:
   registry: ghcr.io
-  repository: your-org/quanta
+  repository: wacobjilson/quanta
   pullPolicy: IfNotPresent
 
 backend:
   image: backend
-  tag: "0.1.0"
+  tag: "latest"
   replicas: 2
   resources:
     requests: { cpu: 100m, memory: 128Mi }
@@ -25,7 +25,7 @@ backend:
 
 frontend:
   image: frontend
-  tag: "0.1.0"
+  tag: "latest"
   replicas: 2
   resources:
     requests: { cpu: 50m, memory: 128Mi }

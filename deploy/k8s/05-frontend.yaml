@@ -29,7 +29,7 @@ spec:
         # Host-agnostic image: the browser reaches the backend same-origin via the
         # ingress (/api and /ws), so no NEXT_PUBLIC_* config is needed.
         - name: frontend
-          image: ghcr.io/your-org/quanta-frontend:0.1.0
+          image: ghcr.io/wacobjilson/quanta-frontend:latest
           ports:
             - containerPort: 3000
           readinessProbe:
