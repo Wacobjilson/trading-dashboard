@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -166,9 +167,5 @@ func (p *Polygon) get(ctx context.Context, u string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("polygon status %d", resp.StatusCode)
 	}
-	var buf strings.Builder
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, err
-	}
-	return []byte(buf.String()), nil
+	return io.ReadAll(resp.Body)
 }
