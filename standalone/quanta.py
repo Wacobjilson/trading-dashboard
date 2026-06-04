@@ -56,12 +56,10 @@ API_KEYS = {
     "polygon": _key("polygon"),
     "finnhub": _key("finnhub"),
     "alphavantage": _key("alphavantage"),
-    "anthropic": _key("anthropic"),
 }
 PROVIDER = os.environ.get("MARKET_DATA_PROVIDER", "").lower()
 PORT = int(os.environ.get("PORT", "8000"))
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "20"))
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 # Default screener watchlist (override in the UI or via SCREENER_SYMBOLS).
 SCREENER_SYMBOLS = [s.strip().upper() for s in os.environ.get(
     "SCREENER_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD,NFLX,JPM").split(",") if s.strip()]
@@ -520,44 +518,9 @@ def build_brief():
                        "sentiment": n["sentiment"]} for n in news],
         "events": ([e for e in cal.get("economic", []) if e.get("impact") in ("High", "Medium")][:6]
                    or cal.get("economic", [])[:6] or cal.get("earnings", [])[:6]),
-        "summary": rule_text, "ai": False,
+        "summary": rule_text,
     }
-
-    # Optional AI narrative
-    if API_KEYS.get("anthropic"):
-        try:
-            out["summary"] = ai_brief(quotes, news, cal)
-            out["ai"] = True
-        except Exception as e:
-            out["aiError"] = str(e)
     return out
-
-
-def ai_brief(quotes, news, cal):
-    snap = "\n".join("%s: %.2f (%+.2f%%)" % (q["symbol"], q["last"], q["changePercent"]) for q in quotes)
-    heads = "\n".join("- [%s/%s] %s" % (n["category"], n["sentiment"], n["headline"]) for n in news[:8])
-    econ = [e for e in cal.get("economic", []) if e.get("impact") in ("High", "Medium")] or cal.get("economic", [])
-    events = "\n".join("- %s [%s] %s %s (est %s, prev %s%s)" % (
-        e.get("date", ""), e.get("impact", ""), e.get("country", ""), e.get("event", ""),
-        e.get("estimate") or "—", e.get("prev") or "—",
-        ", actual %s" % e["actual"] if e.get("actual") else "") for e in econ[:8])
-    prompt = (
-        "You are a markets desk analyst writing a concise pre-market morning brief for an "
-        "active retail trader who also uses ThinkOrSwim. Use ONLY the data below. 120-180 words, "
-        "plain text, no markdown headers. Cover: overall risk tone, index/futures posture, notable "
-        "movers, what the news flow implies, and what to watch on the calendar today.\n\n"
-        "MARKET SNAPSHOT:\n%s\n\nTOP HEADLINES:\n%s\n\nCALENDAR:\n%s\n" % (snap, heads, events or "(none)"))
-    body = json.dumps({
-        "model": ANTHROPIC_MODEL, "max_tokens": 700,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode("utf-8")
-    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
-        "x-api-key": API_KEYS["anthropic"], "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return "".join(b.get("text", "") for b in data.get("content", [])).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -622,10 +585,8 @@ def _cache_and_return(key, fn):
 
 def main():
     prov = active_provider()
-    ai = "on (%s)" % ANTHROPIC_MODEL if API_KEYS.get("anthropic") else "off (no Anthropic key)"
     print("Quanta standalone — morning debrief")
     print("  provider : %s%s" % (prov, "  (no API key set)" if prov == "mock" else ""))
-    print("  AI brief : %s" % ai)
     print("  refresh  : every %ds" % REFRESH_SECONDS)
     print("  open     : http://localhost:%d/" % PORT)
     threading.Thread(target=refresh_loop, daemon=True).start()

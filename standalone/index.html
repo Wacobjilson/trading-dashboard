@@ -88,7 +88,7 @@
 <main>
   <section class="tab active" id="tab-brief">
     <div class="card">
-      <h2>Morning Brief <span id="brief-ai" class="pill" style="margin-left:8px"></span></h2>
+      <h2>Morning Brief</h2>
       <div class="brief-text" id="brief-text">Loading the brief…</div>
     </div>
     <div class="cols">
@@ -211,7 +211,6 @@ async function loadBrief(){
   try{
     const d=await(await fetch(`${API}/api/brief`)).json();
     document.getElementById("brief-text").textContent=d.summary||"No data yet.";
-    document.getElementById("brief-ai").textContent=d.ai?"AI generated":"rule-based";
     const mv=(d.movers||{});
     const row=q=>`<div style="display:flex;justify-content:space-between;padding:3px 0"><span>${q.symbol} <span class="muted" style="font-size:11px">${q.name||""}</span></span><span class="mono ${dir(q.changePercent)}">${pct(q.changePercent)}</span></div>`;
     document.getElementById("brief-movers").innerHTML=
@@ -302,3 +301,6 @@ renderHead();
 loadQuotes(); loadBrief();
 setInterval(loadQuotes, 5000);
 setInterval(()=>{ if(document.getElementById("tab-brief").classList.contains("active")) loadBrief(); }, 120000);
+</script>
+</body>
+</html>

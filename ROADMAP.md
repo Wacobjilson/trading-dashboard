@@ -26,7 +26,7 @@ Each later stage is additive and does not require rewriting earlier stages.
 The zero-dependency `standalone/` Python+HTML app delivers a lightweight slice of
 Stages 3–4 and 7 for single-user use, on Finnhub free-tier data:
 - [x] Tabbed morning-debrief UI: Brief / Markets / News / Calendar / Screener
-- [x] AI morning brief (optional Anthropic; rule-based fallback)
+- [x] Rule-based morning brief (movers + headlines + high-impact events)
 - [x] News: auto-categorized + sentiment + impact (keyword classifier)
 - [x] Calendar: economic events (free FairEconomy/ForexFactory feed, w/ forecast/actual/surprise) + earnings
 - [x] Screener: watchlist fundamentals + heuristic Bull/Bear/Momentum/Risk scores

@@ -8,7 +8,7 @@ no database, no login. Just Python 3 (standard library only) serving one HTML pa
 
 | Tab | What it shows |
 |-----|---------------|
-| **Brief** | Morning debrief: risk tone, index/futures posture, leaders/laggards, top headlines, today's events. Rule-based, or an AI-written narrative if an Anthropic key is set. |
+| **Brief** | Morning debrief: risk tone, index/futures posture, leaders/laggards, top headlines, today's events. |
 | **Markets** | Live index / futures / macro grid + heat tiles (SPY, QQQ, IWM, DIA, VIX, ES, NQ, RTY, CL, GC, US10Y, DXY). |
 | **News** | Market news auto-categorized (Fed, Inflation, Jobs, Earnings, M&A, …) with bullish/bearish sentiment + impact bars. |
 | **Calendar** | Economic events (CPI, NFP, FOMC, GDP…) with forecast/previous/actual + surprise %, plus earnings (next 7d). |
@@ -17,7 +17,6 @@ no database, no login. Just Python 3 (standard library only) serving one HTML pa
 > Data comes from Finnhub (free tier covers quotes, news, earnings, fundamentals).
 > Economic events come from a free, keyless weekly feed (FairEconomy / ForexFactory)
 > — filter currencies with `CALENDAR_COUNTRIES` (default `USD,EUR,GBP,JPY,CNY,CAD`).
-> The AI brief is optional — set an `anthropic` key to enable it.
 
 ## Run it
 
