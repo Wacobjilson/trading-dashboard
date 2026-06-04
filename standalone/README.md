@@ -1,22 +1,37 @@
-# Quanta standalone (Python + HTML)
+# Quanta standalone — quant swing-trading companion (Python + HTML)
 
-A zero-dependency, single-user **morning-debrief** dashboard — built to complement a
-main trading platform (e.g. ThinkOrSwim), not replace it. No Docker, no Kubernetes,
-no database, no login. Just Python 3 (standard library only) serving one HTML page.
+A zero-dependency, single-user dashboard built to complement a main platform
+(e.g. ThinkOrSwim). It answers: **where is money rotating, and where are the 50%
+retracement entries?** No Docker, no Kubernetes, no database, no login — just
+Python 3 (standard library only) serving one HTML page.
 
 ## Tabs
 
 | Tab | What it shows |
 |-----|---------------|
-| **Brief** | Morning debrief: risk tone, index/futures posture, leaders/laggards, top headlines, today's events. |
-| **Markets** | Live index / futures / macro grid + heat tiles (SPY, QQQ, IWM, DIA, VIX, ES, NQ, RTY, CL, GC, US10Y, DXY). |
-| **News** | Market news auto-categorized (Fed, Inflation, Jobs, Earnings, M&A, …) with bullish/bearish sentiment + impact bars. |
-| **Calendar** | Economic events (CPI, NFP, FOMC, GDP…) with forecast/previous/actual + surprise %, plus earnings (next 7d). |
-| **Screener** | Type a watchlist → fundamentals (P/E, market cap, margins, growth, 52w position, beta) + heuristic Bull/Bear/Momentum/Risk scores. |
+| **Rotation** | The 11 SPDR sector ETFs ranked by relative strength vs SPY (1w/1m/3m) with an RRG-style scatter (Leading / Weakening / Lagging / Improving) — *where the money is moving*. |
+| **Entries** | A scanner that finds **50% retracement setups** on the **daily and weekly** timeframe: recent swing high/low → Fibonacci, the golden-pocket entry zone, suggested stop/target, R:R, and an entry-quality score. Long = pullback in an up-leg; short = bounce in a down-leg. |
+| **Chart** | Per-symbol SVG candlestick with SMA20/50, swing high/low, Fib 38.2/50/61.8 lines and the shaded entry zone. Click any Rotation/Entries row to chart it. |
+| **Markets** | Macro overview grid (SPY, QQQ, IWM, DIA, VIX, CL, GC, US10Y, DXY). |
+| **News** | Market news auto-categorized (Fed, Inflation, Jobs, Earnings, M&A…) with sentiment + impact. |
+| **Calendar** | Economic events (CPI, NFP, FOMC, GDP…) with forecast/actual + surprise %, plus earnings. |
 
-> Data comes from Finnhub (free tier covers quotes, news, earnings, fundamentals).
-> Economic events come from a free, keyless weekly feed (FairEconomy / ForexFactory)
-> — filter currencies with `CALENDAR_COUNTRIES` (default `USD,EUR,GBP,JPY,CNY,CAD`).
+> **Data:** quotes/news/earnings from Finnhub; **historical daily bars from Polygon**
+> (free tier: 2 years daily, 5 req/min — so bars warm up in the background over a few
+> minutes on first launch, then cache for the day). Weekly bars are resampled from daily.
+> Economic events use a free, keyless weekly feed (FairEconomy/ForexFactory).
+>
+> **No Polygon key?** Set `QUANTA_SYNTH_BARS=1` (or just leave it unset) to run the
+> rotation/entries/chart features on **synthetic bars** so you can explore the UI.
+
+## Trading logic (transparent heuristics, not advice)
+
+- **Swing detection:** the highest high and lowest low over a lookback window
+  (90 daily bars / 52 weekly). Their order sets the leg direction.
+- **50% retracement:** entry = midpoint of the swing (the 50% Fib). "Ready" when
+  price sits in the 38.2–61.8% golden pocket. Stop = swing extreme; target = prior swing.
+- **Entry score** blends proximity to the 50% level, trend alignment (vs SMA50),
+  and R:R. **Rotation** uses sector-minus-SPY returns (3m = strength axis, 1m = momentum axis).
 
 ## Run it
 

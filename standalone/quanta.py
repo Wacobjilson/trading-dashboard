@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """
-Quanta standalone — a zero-dependency morning-debrief trading dashboard.
+Quanta — a quant swing-trading companion (for use alongside ThinkOrSwim).
 
-A companion to your main platform (e.g. ThinkOrSwim): glanceable market context,
-news, calendar, and a watchlist screener — plus an optional AI morning brief.
+Standalone, zero-dependency (Python standard library only). It focuses on three
+things a discretionary swing trader actually wants each morning:
 
-Runs a tiny HTTP server (Python standard library only) that serves:
-  /                 the dashboard (index.html)
-  /api/quotes       index / futures / macro snapshot
-  /api/news         categorized + sentiment-tagged market news
-  /api/calendar     economic + earnings events (best-effort, free tier)
-  /api/screener     fundamentals + heuristic scores for a list of tickers
-  /api/brief        morning debrief (rule-based, or AI if an Anthropic key is set)
+  1. SECTOR ROTATION — where the money is moving. Relative strength of the 11
+     SPDR sector ETFs vs SPY, with RRG-style Leading/Weakening/Lagging/Improving
+     quadrants and 1w/1m/3m relative performance.
+  2. ENTRIES — a scanner that finds 50% retracement setups on the DAILY and
+     WEEKLY timeframe: recent swing high/low, Fibonacci levels, the entry zone
+     (golden pocket), suggested stop/target, R:R, and an entry-quality score.
+  3. CHARTS — per-symbol candlestick with SMAs, swing levels, fib lines and the
+     entry zone shaded, so you can eyeball the setup before pulling it up in ToS.
 
-No pip install, no database, no auth. Just:  python3 quanta.py
+Plus the macro overview, news, and an economic calendar for context.
 
-Keys: copy keys.local.json.example -> keys.local.json and fill it in, or set
-env vars. With no key set it runs in MOCK mode so you can try it instantly.
+Data:
+  * Quotes      — Finnhub / Polygon / Alpha Vantage (or mock).
+  * Daily bars  — Polygon aggregates (free tier: 2yr daily, 5 req/min). Weekly is
+                  resampled from daily. Falls back to synthetic bars if no
+                  Polygon key (or set QUANTA_SYNTH_BARS=1 to force a demo).
+  * News        — Finnhub. Economic calendar — free FairEconomy/ForexFactory feed.
+
+Run:  python3 quanta.py   →   http://localhost:8000/
+Keys: copy keys.local.json.example -> keys.local.json (gitignored) or use env vars.
 """
 
 import datetime as dt
 import json
+import math
 import os
 import random
 import threading
@@ -29,12 +38,11 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Config
+# Config / keys
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_local_keys():
-    """Load API keys from keys.local.json next to this script, if present.
-    That file is gitignored, so your keys never get committed/pushed."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.local.json")
     try:
         with open(path) as f:
@@ -50,62 +58,75 @@ def _key(name):
     return os.environ.get(name.upper() + "_API_KEY") or _LOCAL_KEYS.get(name, "")
 
 
-# Resolution per provider: env var → keys.local.json → empty.
-# Do NOT hardcode keys here — this file is committed to git.
-API_KEYS = {
-    "polygon": _key("polygon"),
-    "finnhub": _key("finnhub"),
-    "alphavantage": _key("alphavantage"),
-}
+def _envbool(name, default=False):
+    v = os.environ.get(name, "")
+    if v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+API_KEYS = {"polygon": _key("polygon"), "finnhub": _key("finnhub"), "alphavantage": _key("alphavantage")}
 PROVIDER = os.environ.get("MARKET_DATA_PROVIDER", "").lower()
 PORT = int(os.environ.get("PORT", "8000"))
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "20"))
-# Default screener watchlist (override in the UI or via SCREENER_SYMBOLS).
-SCREENER_SYMBOLS = [s.strip().upper() for s in os.environ.get(
-    "SCREENER_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD,NFLX,JPM").split(",") if s.strip()]
+FORCE_SYNTH = _envbool("QUANTA_SYNTH_BARS", False)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Universes
+# ─────────────────────────────────────────────────────────────────────────────
+# Macro overview (Markets tab). Futures use liquid ETF proxies for free tiers.
 INSTRUMENTS = [
-    ("SPY",  "S&P 500 ETF",          "etf",    {"polygon": "SPY", "finnhub": "SPY", "alphavantage": "SPY"}),
-    ("QQQ",  "Nasdaq 100 ETF",       "etf",    {"polygon": "QQQ", "finnhub": "QQQ", "alphavantage": "QQQ"}),
-    ("IWM",  "Russell 2000 ETF",     "etf",    {"polygon": "IWM", "finnhub": "IWM", "alphavantage": "IWM"}),
-    ("DIA",  "Dow Jones ETF",        "etf",    {"polygon": "DIA", "finnhub": "DIA", "alphavantage": "DIA"}),
-    ("VIX",  "Volatility Index",     "index",  {"polygon": "I:VIX", "finnhub": "^VIX", "alphavantage": "VIXY"}),
-    ("ES",   "E-mini S&P 500",       "future", {"polygon": "SPY", "finnhub": "SPY", "alphavantage": "SPY"}),
-    ("NQ",   "E-mini Nasdaq 100",    "future", {"polygon": "QQQ", "finnhub": "QQQ", "alphavantage": "QQQ"}),
-    ("RTY",  "E-mini Russell 2000",  "future", {"polygon": "IWM", "finnhub": "IWM", "alphavantage": "IWM"}),
-    ("CL",   "Crude Oil WTI",        "future", {"polygon": "USO", "finnhub": "USO", "alphavantage": "USO"}),
-    ("GC",   "Gold",                 "future", {"polygon": "GLD", "finnhub": "GLD", "alphavantage": "GLD"}),
-    ("US10Y","US 10Y Yield",         "rate",   {"polygon": "I:TNX", "finnhub": "^TNX", "alphavantage": "IEF"}),
-    ("DXY",  "US Dollar Index",      "index",  {"polygon": "I:DXY", "finnhub": "^DXY", "alphavantage": "UUP"}),
+    ("SPY", "S&P 500 ETF", "etf", {"polygon": "SPY", "finnhub": "SPY", "alphavantage": "SPY"}),
+    ("QQQ", "Nasdaq 100 ETF", "etf", {"polygon": "QQQ", "finnhub": "QQQ", "alphavantage": "QQQ"}),
+    ("IWM", "Russell 2000 ETF", "etf", {"polygon": "IWM", "finnhub": "IWM", "alphavantage": "IWM"}),
+    ("DIA", "Dow Jones ETF", "etf", {"polygon": "DIA", "finnhub": "DIA", "alphavantage": "DIA"}),
+    ("VIX", "Volatility Index", "index", {"polygon": "I:VIX", "finnhub": "^VIX", "alphavantage": "VIXY"}),
+    ("CL", "Crude Oil (USO)", "future", {"polygon": "USO", "finnhub": "USO", "alphavantage": "USO"}),
+    ("GC", "Gold (GLD)", "future", {"polygon": "GLD", "finnhub": "GLD", "alphavantage": "GLD"}),
+    ("US10Y", "US 10Y Yield", "rate", {"polygon": "I:TNX", "finnhub": "^TNX", "alphavantage": "IEF"}),
+    ("DXY", "US Dollar Index", "index", {"polygon": "I:DXY", "finnhub": "^DXY", "alphavantage": "UUP"}),
 ]
-SEED_PRICES = {
-    "SPY": 545.0, "QQQ": 470.0, "IWM": 205.0, "DIA": 395.0, "VIX": 14.2,
-    "ES": 5460.0, "NQ": 19500.0, "RTY": 2050.0, "CL": 78.5, "GC": 2350.0,
-    "US10Y": 4.35, "DXY": 104.8,
-}
+
+# The 11 SPDR sector ETFs + SPY benchmark.
+BENCH = "SPY"
+SECTORS = [
+    ("XLK", "Technology"), ("XLC", "Communication Svcs"), ("XLY", "Consumer Discretionary"),
+    ("XLF", "Financials"), ("XLV", "Health Care"), ("XLI", "Industrials"),
+    ("XLE", "Energy"), ("XLB", "Materials"), ("XLP", "Consumer Staples"),
+    ("XLU", "Utilities"), ("XLRE", "Real Estate"),
+]
+SECTOR_NAME = dict(SECTORS)
+
+# Extra tickers to scan for entries (override via SCREENER_SYMBOLS).
+WATCHLIST = [s.strip().upper() for s in os.environ.get(
+    "SCREENER_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD,JPM,NFLX").split(",") if s.strip()]
+
+# Everything we keep historical bars for.
+BAR_UNIVERSE = []
+for _s in [BENCH, "QQQ", "IWM"] + [s for s, _ in SECTORS] + WATCHLIST:
+    if _s not in BAR_UNIVERSE:
+        BAR_UNIVERSE.append(_s)
+
+SEED_PRICES = {"SPY": 545, "QQQ": 470, "IWM": 205, "DIA": 395, "VIX": 14.2, "CL": 78.5, "GC": 2350,
+               "US10Y": 4.35, "DXY": 104.8, "XLK": 230, "XLC": 100, "XLY": 200, "XLF": 48, "XLV": 145,
+               "XLI": 135, "XLE": 92, "XLB": 90, "XLP": 80, "XLU": 72, "XLRE": 40}
 
 FINNHUB = "https://finnhub.io/api/v1"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP helper + tiny TTL cache
-# ─────────────────────────────────────────────────────────────────────────────
-def http_get_json(url, timeout=12):
+def http_get_json(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "quanta-standalone"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-_cache = {}
-_cache_lock = threading.Lock()
+_cache, _cache_lock = {}, threading.Lock()
 
 
 def cache_get(key, ttl):
     with _cache_lock:
         item = _cache.get(key)
-    if item and (time.time() - item[0]) < ttl:
-        return item[1]
-    return None
+    return item[1] if item and (time.time() - item[0]) < ttl else None
 
 
 def cache_set(key, value):
@@ -114,29 +135,25 @@ def cache_set(key, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quote providers
+# Quote providers (Markets tab)
 # ─────────────────────────────────────────────────────────────────────────────
 def active_provider():
     if PROVIDER in ("polygon", "finnhub", "alphavantage", "mock"):
         return PROVIDER
-    for name in ("finnhub", "polygon", "alphavantage"):  # finnhub first: best free tier
+    for name in ("finnhub", "polygon", "alphavantage"):
         if API_KEYS.get(name):
             return name
     return "mock"
 
 
 def quote_finnhub(sym, vendor):
-    url = "%s/quote?symbol=%s&token=%s" % (FINNHUB, urllib.parse.quote(vendor),
-                                           urllib.parse.quote(API_KEYS["finnhub"]))
+    url = "%s/quote?symbol=%s&token=%s" % (FINNHUB, urllib.parse.quote(vendor), urllib.parse.quote(API_KEYS["finnhub"]))
     d = http_get_json(url)
     if not d or (d.get("c", 0) == 0 and d.get("pc", 0) == 0):
         raise ValueError("empty finnhub quote")
-    return {
-        "last": d.get("c", 0.0), "change": d.get("d", 0.0), "changePercent": d.get("dp", 0.0),
-        "open": d.get("o", 0.0), "high": d.get("h", 0.0), "low": d.get("l", 0.0),
-        "prevClose": d.get("pc", 0.0), "volume": 0, "atr": d.get("h", 0.0) - d.get("l", 0.0),
-        "weekChangePct": 0.0, "relVolume": 0.0, "trendStrength": 0.0,
-    }
+    return {"last": d.get("c", 0.0), "change": d.get("d", 0.0), "changePercent": d.get("dp", 0.0),
+            "open": d.get("o", 0.0), "high": d.get("h", 0.0), "low": d.get("l", 0.0),
+            "prevClose": d.get("pc", 0.0), "volume": 0, "atr": d.get("h", 0.0) - d.get("l", 0.0)}
 
 
 def quote_alphavantage(sym, vendor):
@@ -144,15 +161,12 @@ def quote_alphavantage(sym, vendor):
         urllib.parse.quote(vendor), urllib.parse.quote(API_KEYS["alphavantage"]))
     d = http_get_json(url).get("Global Quote", {})
     if not d.get("05. price"):
-        raise ValueError("empty/limited alphavantage quote")
+        raise ValueError("empty alphavantage quote")
     f = lambda k: float(d.get(k, 0) or 0)
-    pct = d.get("10. change percent", "0").replace("%", "")
-    return {
-        "last": f("05. price"), "change": f("09. change"), "changePercent": float(pct or 0),
-        "open": f("02. open"), "high": f("03. high"), "low": f("04. low"),
-        "prevClose": f("08. previous close"), "volume": int(f("06. volume")),
-        "atr": f("03. high") - f("04. low"), "weekChangePct": 0.0, "relVolume": 0.0, "trendStrength": 0.0,
-    }
+    return {"last": f("05. price"), "change": f("09. change"),
+            "changePercent": float((d.get("10. change percent", "0") or "0").replace("%", "")),
+            "open": f("02. open"), "high": f("03. high"), "low": f("04. low"),
+            "prevClose": f("08. previous close"), "volume": int(f("06. volume")), "atr": f("03. high") - f("04. low")}
 
 
 def quote_polygon(sym, vendor):
@@ -163,105 +177,326 @@ def quote_polygon(sym, vendor):
         if not res:
             raise ValueError("empty polygon index")
         r = res[0]; s = r.get("session", {})
-        return {
-            "last": r.get("value", 0.0), "change": s.get("change", 0.0),
-            "changePercent": s.get("change_percent", 0.0), "open": s.get("open", 0.0),
-            "high": s.get("high", 0.0), "low": s.get("low", 0.0),
-            "prevClose": s.get("previous_close", 0.0), "volume": 0,
-            "atr": s.get("high", 0.0) - s.get("low", 0.0), "weekChangePct": 0.0,
-            "relVolume": 0.0, "trendStrength": 0.0,
-        }
-    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/%s?apiKey=%s" % (
-        urllib.parse.quote(vendor), key)
+        return {"last": r.get("value", 0.0), "change": s.get("change", 0.0), "changePercent": s.get("change_percent", 0.0),
+                "open": s.get("open", 0.0), "high": s.get("high", 0.0), "low": s.get("low", 0.0),
+                "prevClose": s.get("previous_close", 0.0), "volume": 0, "atr": s.get("high", 0.0) - s.get("low", 0.0)}
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/%s?apiKey=%s" % (urllib.parse.quote(vendor), key)
     t = http_get_json(url).get("ticker", {})
     day, prev, lt = t.get("day", {}), t.get("prevDay", {}), t.get("lastTrade", {})
-    last = lt.get("p") or day.get("c", 0.0)
-    relv = (day.get("v", 0) / prev["v"]) if prev.get("v") else 0.0
-    return {
-        "last": last, "change": t.get("todaysChange", 0.0), "changePercent": t.get("todaysChangePerc", 0.0),
-        "open": day.get("o", 0.0), "high": day.get("h", 0.0), "low": day.get("l", 0.0),
-        "prevClose": prev.get("c", 0.0), "volume": int(day.get("v", 0)),
-        "atr": day.get("h", 0.0) - day.get("l", 0.0), "weekChangePct": 0.0,
-        "relVolume": relv, "trendStrength": 0.0,
-    }
+    return {"last": lt.get("p") or day.get("c", 0.0), "change": t.get("todaysChange", 0.0),
+            "changePercent": t.get("todaysChangePerc", 0.0), "open": day.get("o", 0.0), "high": day.get("h", 0.0),
+            "low": day.get("l", 0.0), "prevClose": prev.get("c", 0.0), "volume": int(day.get("v", 0)),
+            "atr": day.get("h", 0.0) - day.get("l", 0.0)}
 
 
-_mock_state = {}
+_mock_q = {}
 
 
 def quote_mock(sym, vendor):
-    st = _mock_state.get(sym)
+    st = _mock_q.get(sym)
     if st is None:
         base = SEED_PRICES.get(sym, 100.0)
-        st = {"last": base, "prevClose": base * (1 - (random.random() - 0.5) * 0.01),
-              "week": base * (1 - (random.random() - 0.5) * 0.04), "open": base,
-              "high": base, "low": base, "vol": random.randint(10_000_000, 40_000_000),
-              "avg": random.randint(30_000_000, 80_000_000)}
-        _mock_state[sym] = st
-    st["last"] = max(0.01, st["last"] + (random.random() - 0.5) * 0.001 * st["last"])
-    st["high"] = max(st["high"], st["last"]); st["low"] = min(st["low"], st["last"])
-    st["vol"] += random.randint(0, 250_000)
+        st = {"last": base, "pc": base * (1 - (random.random() - .5) * .01), "o": base, "h": base, "l": base, "v": random.randint(8_000_000, 40_000_000)}
+        _mock_q[sym] = st
+    st["last"] = max(.01, st["last"] + (random.random() - .5) * .001 * st["last"])
+    st["h"] = max(st["h"], st["last"]); st["l"] = min(st["l"], st["last"]); st["v"] += random.randint(0, 200_000)
     r2 = lambda x: round(x, 2)
-    return {
-        "last": r2(st["last"]), "prevClose": r2(st["prevClose"]), "open": r2(st["open"]),
-        "high": r2(st["high"]), "low": r2(st["low"]), "volume": st["vol"],
-        "change": r2(st["last"] - st["prevClose"]),
-        "changePercent": r2((st["last"] - st["prevClose"]) / st["prevClose"] * 100),
-        "weekChangePct": r2((st["last"] - st["week"]) / st["week"] * 100),
-        "relVolume": r2(st["vol"] / max(st["avg"], 1)), "atr": r2(st["last"] * 0.012),
-        "trendStrength": r2(20 + random.random() * 60),
-    }
+    return {"last": r2(st["last"]), "prevClose": r2(st["pc"]), "open": r2(st["o"]), "high": r2(st["h"]), "low": r2(st["l"]),
+            "volume": st["v"], "change": r2(st["last"] - st["pc"]), "changePercent": r2((st["last"] - st["pc"]) / st["pc"] * 100),
+            "atr": r2(st["last"] * .012)}
 
 
-PROVIDER_FNS = {"finnhub": quote_finnhub, "alphavantage": quote_alphavantage,
-                "polygon": quote_polygon, "mock": quote_mock}
-
-_quotes_lock = threading.Lock()
-_quotes_cache = []
-_status = {"provider": active_provider(), "updated": 0}
+QUOTE_FNS = {"finnhub": quote_finnhub, "alphavantage": quote_alphavantage, "polygon": quote_polygon, "mock": quote_mock}
+_quotes_lock, _quotes_cache, _status = threading.Lock(), [], {"provider": active_provider(), "updated": 0}
 
 
-def refresh_loop():
-    provider = active_provider()
-    fn = PROVIDER_FNS[provider]
+def quotes_loop():
+    provider = active_provider(); fn = QUOTE_FNS[provider]
     while True:
         out = []
         for sym, name, klass, vendors in INSTRUMENTS:
-            vendor = vendors.get(provider, sym)
             try:
-                q = fn(sym, vendor); src = provider
+                q = fn(sym, vendors.get(provider, sym)); src = provider
             except Exception:
-                q = quote_mock(sym, vendor); src = "mock"
+                q = quote_mock(sym, sym); src = "mock"
             q.update({"symbol": sym, "name": name, "assetClass": klass, "source": src})
             out.append(q)
             if provider == "alphavantage":
                 time.sleep(13)
         with _quotes_lock:
             global _quotes_cache
-            _quotes_cache = out
-            _status["updated"] = int(time.time())
+            _quotes_cache = out; _status["updated"] = int(time.time())
         time.sleep(REFRESH_SECONDS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# News  (Finnhub /news, free) + lightweight classification
+# Historical bars (Polygon aggregates) + synthetic fallback
+# ─────────────────────────────────────────────────────────────────────────────
+_bars = {}            # symbol -> list[{t,o,h,l,c,v}] (daily, ascending)
+_bars_meta = {}       # symbol -> {"updated": ts, "source": "polygon"|"synth"}
+_bars_lock = threading.Lock()
+
+
+def fetch_polygon_daily(symbol, days=740):
+    to = dt.date.today()
+    frm = to - dt.timedelta(days=days)
+    url = ("https://api.polygon.io/v2/aggs/ticker/%s/range/1/day/%s/%s?adjusted=true&sort=asc&limit=50000&apiKey=%s"
+           % (urllib.parse.quote(symbol), frm.isoformat(), to.isoformat(), urllib.parse.quote(API_KEYS["polygon"])))
+    res = http_get_json(url).get("results") or []
+    if not res:
+        raise ValueError("no polygon aggregates for %s" % symbol)
+    return [{"t": r["t"], "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r.get("v", 0)} for r in res]
+
+
+def synth_daily(symbol, n=520):
+    """Deterministic-ish synthetic daily bars with trend + swings, for demo/fallback."""
+    rnd = random.Random(hash(symbol) & 0xffffffff)
+    price = SEED_PRICES.get(symbol, 50 + rnd.random() * 250)
+    drift = (rnd.random() - 0.45) * 0.0008
+    bars = []
+    today = dt.datetime.now(dt.timezone.utc)
+    for i in range(n):
+        # cyclical component to create real swing highs/lows
+        cycle = math.sin(i / 22.0) * 0.004 + math.sin(i / 60.0) * 0.006
+        ret = drift + cycle + (rnd.random() - 0.5) * 0.018
+        o = price
+        c = max(1.0, price * (1 + ret))
+        hi = max(o, c) * (1 + rnd.random() * 0.008)
+        lo = min(o, c) * (1 - rnd.random() * 0.008)
+        ts = int((today - dt.timedelta(days=(n - i))).timestamp() * 1000)
+        bars.append({"t": ts, "o": round(o, 2), "h": round(hi, 2), "l": round(lo, 2),
+                     "c": round(c, 2), "v": rnd.randint(5_000_000, 50_000_000)})
+        price = c
+    return bars
+
+
+def load_bars(symbol):
+    """Fetch daily bars for a symbol (polygon, else synthetic). Returns (bars, source)."""
+    if not FORCE_SYNTH and API_KEYS.get("polygon"):
+        try:
+            return fetch_polygon_daily(symbol), "polygon"
+        except Exception:
+            pass
+    return synth_daily(symbol), "synth"
+
+
+def get_bars(symbol):
+    with _bars_lock:
+        return _bars.get(symbol)
+
+
+def bars_loop():
+    """Background warmer. Daily bars only change once/day, so refresh slowly and
+    pace Polygon calls to respect the 5 req/min free-tier limit."""
+    use_polygon = bool(API_KEYS.get("polygon")) and not FORCE_SYNTH
+    while True:
+        for symbol in BAR_UNIVERSE:
+            meta = _bars_meta.get(symbol)
+            if meta and (time.time() - meta["updated"]) < 6 * 3600:
+                continue
+            bars, src = load_bars(symbol)
+            with _bars_lock:
+                _bars[symbol] = bars
+                _bars_meta[symbol] = {"updated": time.time(), "source": src}
+            if use_polygon and src == "polygon":
+                time.sleep(12)  # ≈5 calls/min
+        time.sleep(300)
+
+
+def warm_status():
+    have = sum(1 for s in BAR_UNIVERSE if s in _bars)
+    src = _bars_meta.get(BENCH, {}).get("source", "—")
+    return {"have": have, "total": len(BAR_UNIVERSE), "source": src, "ready": have >= len(BAR_UNIVERSE)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics: SMA, returns, swing detection, Fibonacci, entry setup
+# ─────────────────────────────────────────────────────────────────────────────
+def sma(vals, n):
+    return sum(vals[-n:]) / n if len(vals) >= n else None
+
+
+def pct_return(closes, n):
+    if len(closes) > n and closes[-1 - n]:
+        return (closes[-1] / closes[-1 - n] - 1) * 100
+    return None
+
+
+def resample_weekly(daily):
+    """Aggregate daily bars into weekly OHLCV by ISO (year, week)."""
+    weeks = {}
+    order = []
+    for b in daily:
+        d = dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).isocalendar()
+        key = (d[0], d[1])
+        w = weeks.get(key)
+        if w is None:
+            weeks[key] = {"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
+            order.append(key)
+        else:
+            w["h"] = max(w["h"], b["h"]); w["l"] = min(w["l"], b["l"]); w["c"] = b["c"]; w["v"] += b["v"]; w["t"] = b["t"]
+    return [weeks[k] for k in order]
+
+
+def clamp(x, lo=0.0, hi=100.0):
+    return max(lo, min(hi, x))
+
+
+FIB = [0.236, 0.382, 0.5, 0.618, 0.786]
+
+
+def analyze(symbol, tf="daily"):
+    """Swing + 50% retracement setup analysis for one symbol/timeframe."""
+    daily = get_bars(symbol)
+    if not daily or len(daily) < 40:
+        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up / no data"}
+    bars = resample_weekly(daily) if tf == "weekly" else daily
+    if len(bars) < 20:
+        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "not enough bars"}
+
+    closes = [b["c"] for b in bars]
+    win = 52 if tf == "weekly" else 90
+    seg = bars[-win:]
+
+    hi_i = max(range(len(seg)), key=lambda i: seg[i]["h"])
+    lo_i = min(range(len(seg)), key=lambda i: seg[i]["l"])
+    HH, LL = seg[hi_i]["h"], seg[lo_i]["l"]
+    rng = max(HH - LL, 1e-9)
+    direction = "long" if lo_i < hi_i else "short"   # low-then-high = up-leg (buy dips)
+    fib50 = (HH + LL) / 2.0
+    # fib level prices (measured from the leg origin)
+    if direction == "long":
+        levels = {str(p): round(HH - p * rng, 2) for p in FIB}
+    else:
+        levels = {str(p): round(LL + p * rng, 2) for p in FIB}
+    levels["0.0"] = round(LL if direction == "short" else HH, 2)
+    levels["1.0"] = round(HH if direction == "short" else LL, 2)
+
+    close = closes[-1]
+    depth = (HH - close) / rng if direction == "long" else (close - LL) / rng  # 0=at extreme, 1=full retrace
+    dist50 = (close - fib50) / fib50 * 100
+    status = "Ready" if 0.382 <= depth <= 0.618 else ("Approaching" if 0.236 <= depth <= 0.786 else "Extended")
+
+    s20, s50, s200 = sma(closes, 20), sma(closes, 50), sma(closes, 200)
+    if s50 and s200:
+        trend = "up" if close > s50 > s200 else "down" if close < s50 < s200 else "side"
+    elif s50:
+        trend = "up" if close > s50 else "down"
+    else:
+        trend = "side"
+
+    if direction == "long":
+        entry, stop, target = fib50, round(LL, 2), round(HH, 2)
+    else:
+        entry, stop, target = fib50, round(HH, 2), round(LL, 2)
+    risk = abs(entry - stop); reward = abs(target - entry)
+    rr = round(reward / risk, 2) if risk > 0 else None
+
+    prox = max(0.0, 1 - abs(depth - 0.5) / 0.5)
+    aligned = (direction == "long" and s50 and close > s50) or (direction == "short" and s50 and close < s50)
+    rr_bonus = min(1.0, (rr or 0) / 3.0)
+    score = round(clamp(100 * (0.55 * prox + 0.25 * (1 if aligned else 0) + 0.20 * rr_bonus)), 1)
+
+    return {
+        "symbol": symbol, "name": SECTOR_NAME.get(symbol, ""), "tf": tf, "ok": True,
+        "direction": direction, "trend": trend, "status": status,
+        "price": round(close, 2), "swingHigh": round(HH, 2), "swingLow": round(LL, 2),
+        "fib50": round(fib50, 2), "depth": round(depth, 3), "dist50": round(dist50, 2),
+        "entry": round(entry, 2), "stop": stop, "target": target, "rr": rr, "score": score,
+        "sma20": round(s20, 2) if s20 else None, "sma50": round(s50, 2) if s50 else None,
+        "sma200": round(s200, 2) if s200 else None,
+        "fibLevels": levels,
+        "barsCount": len(bars),
+    }
+
+
+def build_entries(symbols, tf="daily"):
+    rows = []
+    for s in symbols:
+        a = analyze(s, tf)
+        if a.get("ok"):
+            rows.append(a)
+    # sort: ready first, then closeness to the 50% level
+    rows.sort(key=lambda r: (0 if r["status"] == "Ready" else 1 if r["status"] == "Approaching" else 2,
+                             abs(r["depth"] - 0.5)))
+    return {"tf": tf, "rows": rows, "warm": warm_status()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sector rotation (relative strength vs SPY + RRG-style quadrants)
+# ─────────────────────────────────────────────────────────────────────────────
+def rotation():
+    spy = get_bars(BENCH)
+    out = {"warm": warm_status(), "sectors": [], "bench": BENCH}
+    if not spy:
+        return out
+    spc = [b["c"] for b in spy]
+
+    def rel(closes, n):
+        a, b = pct_return(closes, n), pct_return(spc, n)
+        return round(a - b, 2) if (a is not None and b is not None) else None
+
+    for sym, name in SECTORS:
+        bars = get_bars(sym)
+        if not bars:
+            out["sectors"].append({"symbol": sym, "name": name, "warming": True})
+            continue
+        c = [b["c"] for b in bars]
+        r1w, r1m, r3m = rel(c, 5), rel(c, 21), rel(c, 63)
+        ratio = r3m if r3m is not None else 0.0     # x-axis: 3-month relative strength
+        mom = r1m if r1m is not None else 0.0        # y-axis: 1-month relative momentum
+        quad = ("Leading" if ratio >= 0 and mom >= 0 else "Weakening" if ratio >= 0 and mom < 0
+                else "Improving" if ratio < 0 and mom >= 0 else "Lagging")
+        s50 = sma(c, 50)
+        out["sectors"].append({
+            "symbol": sym, "name": name, "price": round(c[-1], 2),
+            "chg1d": round(pct_return(c, 1) or 0, 2), "rs1w": r1w, "rs1m": r1m, "rs3m": r3m,
+            "rsRatio": round(ratio, 2), "rsMom": round(mom, 2), "quadrant": quad,
+            "trend": "up" if (s50 and c[-1] > s50) else "down",
+        })
+    ranked = [s for s in out["sectors"] if s.get("rs3m") is not None]
+    ranked.sort(key=lambda s: s["rs3m"], reverse=True)
+    out["sectors"] = ranked + [s for s in out["sectors"] if s.get("rs3m") is None]
+    out["leaders"] = [s["symbol"] for s in ranked[:3]]
+    out["laggards"] = [s["symbol"] for s in ranked[-3:]][::-1]
+    return out
+
+
+def chart_data(symbol, tf="daily", n=120):
+    daily = get_bars(symbol)
+    if not daily:
+        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up"}
+    bars = resample_weekly(daily) if tf == "weekly" else daily
+    a = analyze(symbol, tf)
+    show = bars[-n:]
+    closes = [b["c"] for b in bars]
+    # SMA series aligned to the shown window
+    def sma_series(period):
+        out = []
+        for i in range(len(bars) - len(show), len(bars)):
+            out.append(round(sum(closes[i - period + 1:i + 1]) / period, 2) if i >= period - 1 else None)
+        return out
+    return {"symbol": symbol, "tf": tf, "ok": a.get("ok", False), "setup": a,
+            "bars": show, "sma20": sma_series(20), "sma50": sma_series(50)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# News (Finnhub) + classification
 # ─────────────────────────────────────────────────────────────────────────────
 CATEGORY_RULES = [
-    ("Fed",        ["fed", "fomc", "powell", "rate cut", "rate hike", "interest rate", "central bank"]),
-    ("Inflation",  ["cpi", "ppi", "inflation", "pce", "deflation"]),
-    ("Jobs",       ["jobs", "payroll", "nfp", "unemployment", "jobless", "labor market"]),
-    ("Earnings",   ["earnings", "eps", "revenue", "guidance", "beats", "misses", "quarter"]),
-    ("M&A",        ["acquire", "acquisition", "merger", "buyout", "takeover", "deal to buy"]),
-    ("Upgrade",    ["upgrade", "raised to", "outperform", "overweight", "buy rating", "price target raised"]),
-    ("Downgrade",  ["downgrade", "cut to", "underperform", "underweight", "sell rating", "price target cut"]),
-    ("Geopolitics",["war", "sanction", "tariff", "opec", "conflict", "election", "geopolit"]),
-    ("Crypto",     ["bitcoin", "ethereum", "crypto", "btc", "etf approval"]),
-    ("Legal",      ["lawsuit", "sec charges", "fraud", "settlement", "antitrust", "investigation"]),
+    ("Fed", ["fed", "fomc", "powell", "rate cut", "rate hike", "interest rate", "central bank"]),
+    ("Inflation", ["cpi", "ppi", "inflation", "pce", "deflation"]),
+    ("Jobs", ["jobs", "payroll", "nfp", "unemployment", "jobless", "labor market"]),
+    ("Earnings", ["earnings", "eps", "revenue", "guidance", "beats", "misses", "quarter"]),
+    ("M&A", ["acquire", "acquisition", "merger", "buyout", "takeover"]),
+    ("Upgrade", ["upgrade", "raised to", "outperform", "overweight", "price target raised"]),
+    ("Downgrade", ["downgrade", "cut to", "underperform", "underweight", "price target cut"]),
+    ("Geopolitics", ["war", "sanction", "tariff", "opec", "conflict", "election", "geopolit"]),
+    ("Crypto", ["bitcoin", "ethereum", "crypto", "btc"]),
+    ("Legal", ["lawsuit", "sec charges", "fraud", "settlement", "antitrust", "investigation"]),
 ]
-BULL_WORDS = ["beats", "surge", "soar", "jumps", "rally", "record", "upgrade", "raises", "tops",
-              "strong", "growth", "approval", "wins", "gains", "outperform", "bullish"]
-BEAR_WORDS = ["misses", "plunge", "slump", "falls", "drops", "downgrade", "cuts", "warns", "weak",
-              "lawsuit", "bankruptcy", "recall", "probe", "layoffs", "loss", "bearish", "halts"]
+BULL_WORDS = ["beats", "surge", "soar", "jumps", "rally", "record", "upgrade", "raises", "tops", "strong", "growth", "approval", "wins", "gains", "outperform", "bullish"]
+BEAR_WORDS = ["misses", "plunge", "slump", "falls", "drops", "downgrade", "cuts", "warns", "weak", "lawsuit", "bankruptcy", "recall", "probe", "layoffs", "loss", "bearish", "halts"]
 
 
 def classify(text):
@@ -269,72 +504,48 @@ def classify(text):
     category = "General"
     for name, words in CATEGORY_RULES:
         if any(w in t for w in words):
-            category = name
-            break
+            category = name; break
     score = sum(w in t for w in BULL_WORDS) - sum(w in t for w in BEAR_WORDS)
     sentiment = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
-    # impact: more keyword hits / macro categories rank higher (0..100)
-    impact = 40
-    if category in ("Fed", "Inflation", "Jobs"):
-        impact = 85
-    elif category in ("Earnings", "M&A", "Geopolitics"):
-        impact = 65
-    impact = min(100, impact + 8 * abs(score))
-    return category, sentiment, impact
+    impact = 85 if category in ("Fed", "Inflation", "Jobs") else 65 if category in ("Earnings", "M&A", "Geopolitics") else 40
+    return category, sentiment, min(100, impact + 8 * abs(score))
 
 
 def fetch_news():
     if not API_KEYS.get("finnhub"):
         return {"error": "Finnhub key required for live news", "items": []}
-    url = "%s/news?category=general&token=%s" % (FINNHUB, urllib.parse.quote(API_KEYS["finnhub"]))
     try:
-        raw = http_get_json(url)
+        raw = http_get_json("%s/news?category=general&token=%s" % (FINNHUB, urllib.parse.quote(API_KEYS["finnhub"])))
     except Exception as e:
         return {"error": "news fetch failed: %s" % e, "items": []}
     items = []
     for n in raw[:60]:
         head = n.get("headline", "")
         cat, sent, impact = classify(head + " " + n.get("summary", ""))
-        items.append({
-            "headline": head, "source": n.get("source", ""), "url": n.get("url", ""),
-            "summary": (n.get("summary", "") or "")[:280], "datetime": n.get("datetime", 0),
-            "image": n.get("image", ""), "related": n.get("related", ""),
-            "category": cat, "sentiment": sent, "impact": impact,
-        })
+        items.append({"headline": head, "source": n.get("source", ""), "url": n.get("url", ""),
+                      "summary": (n.get("summary", "") or "")[:280], "datetime": n.get("datetime", 0),
+                      "related": n.get("related", ""), "category": cat, "sentiment": sent, "impact": impact})
     items.sort(key=lambda x: (x["impact"], x["datetime"]), reverse=True)
     return {"items": items}
 
 
 def news_loop():
     while True:
-        data = fetch_news()
-        if not data.get("error") or not cache_get("news", 1e9):
-            cache_set("news", data)
+        d = fetch_news()
+        if not d.get("error") or not cache_get("news", 1e9):
+            cache_set("news", d)
         time.sleep(180)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calendar  (Finnhub earnings + economic; economic often needs a paid plan)
+# Economic calendar (free FairEconomy/ForexFactory feed) + Finnhub earnings
 # ─────────────────────────────────────────────────────────────────────────────
-def _date_range(days_ahead=7):
-    today = dt.date.today()
-    return today.isoformat(), (today + dt.timedelta(days=days_ahead)).isoformat()
-
-
-# Economic events: free, keyless weekly feed (FairEconomy / ForexFactory JSON).
-# Fields per event: title, country (currency code), date (ISO w/ TZ), impact
-# (High|Medium|Low|Holiday), forecast, previous, actual.
-FAIRECONOMY_FEEDS = [
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-]
-# Filter to these currencies/countries (set CALENDAR_COUNTRIES="" for all).
-CALENDAR_COUNTRIES = set(c.strip().upper() for c in os.environ.get(
-    "CALENDAR_COUNTRIES", "USD,EUR,GBP,JPY,CNY,CAD").split(",") if c.strip())
+FAIRECONOMY_FEEDS = ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                     "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]
+CALENDAR_COUNTRIES = set(c.strip().upper() for c in os.environ.get("CALENDAR_COUNTRIES", "USD,EUR,GBP,JPY,CNY,CAD").split(",") if c.strip())
 
 
 def _parse_num(s):
-    """Best-effort numeric parse of values like '3.2%', '-0.1', '210K', '1.5M'."""
     if s is None:
         return None
     t = str(s).strip().replace(",", "")
@@ -342,8 +553,7 @@ def _parse_num(s):
         return None
     mult = 1.0
     if t and t[-1] in "KkMmBbTt":
-        mult = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[t[-1].lower()]
-        t = t[:-1]
+        mult = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[t[-1].lower()]; t = t[:-1]
     neg = t.startswith("-")
     num = "".join(ch for ch in t if ch.isdigit() or ch == ".")
     if num in ("", "."):
@@ -356,7 +566,6 @@ def _parse_num(s):
 
 
 def fetch_economic():
-    """Pull the free weekly economic calendar and normalize + compute surprise %."""
     events = []
     for url in FAIRECONOMY_FEEDS:
         try:
@@ -368,41 +577,31 @@ def fetch_economic():
             if CALENDAR_COUNTRIES and country not in CALENDAR_COUNTRIES:
                 continue
             ts = e.get("date", "") or ""
-            fc, prev, act = e.get("forecast", ""), e.get("previous", ""), e.get("actual", "")
-            f, a = _parse_num(fc), _parse_num(act)
+            f, a = _parse_num(e.get("forecast", "")), _parse_num(e.get("actual", ""))
             surprise = round((a - f) / abs(f) * 100, 1) if (f is not None and a is not None and f != 0) else None
-            events.append({
-                "date": ts[:10], "time": ts, "country": country, "event": e.get("title", ""),
-                "impact": e.get("impact", ""), "estimate": fc, "prev": prev,
-                "actual": act, "surprise": surprise,
-            })
+            events.append({"date": ts[:10], "time": ts, "country": country, "event": e.get("title", ""),
+                           "impact": e.get("impact", ""), "estimate": e.get("forecast", ""),
+                           "prev": e.get("previous", ""), "actual": e.get("actual", ""), "surprise": surprise})
     events.sort(key=lambda x: x["time"])
     return events
 
 
 def fetch_calendar():
     out = {"earnings": [], "economic": [], "notes": []}
-    # Economic events — free keyless feed (no API key needed).
     try:
         out["economic"] = fetch_economic()
         if not out["economic"]:
             out["notes"].append("No economic events for the current window.")
     except Exception as e:
         out["notes"].append("Economic feed unavailable (%s)." % e)
-    # Earnings — Finnhub (needs a key).
     if API_KEYS.get("finnhub"):
-        frm, to = _date_range(7)
-        tok = urllib.parse.quote(API_KEYS["finnhub"])
+        today = dt.date.today()
+        frm, to = today.isoformat(), (today + dt.timedelta(days=7)).isoformat()
         try:
-            url = "%s/calendar/earnings?from=%s&to=%s&token=%s" % (FINNHUB, frm, to, tok)
-            ec = http_get_json(url).get("earningsCalendar", []) or []
-            for e in ec[:100]:
-                out["earnings"].append({
-                    "date": e.get("date"), "symbol": e.get("symbol"),
-                    "hour": e.get("hour", ""), "epsEstimate": e.get("epsEstimate"),
-                    "epsActual": e.get("epsActual"), "revenueEstimate": e.get("revenueEstimate"),
-                    "revenueActual": e.get("revenueActual"),
-                })
+            url = "%s/calendar/earnings?from=%s&to=%s&token=%s" % (FINNHUB, frm, to, urllib.parse.quote(API_KEYS["finnhub"]))
+            for e in (http_get_json(url).get("earningsCalendar", []) or [])[:100]:
+                out["earnings"].append({"date": e.get("date"), "symbol": e.get("symbol"), "hour": e.get("hour", ""),
+                                        "epsEstimate": e.get("epsEstimate"), "epsActual": e.get("epsActual")})
         except Exception as e:
             out["notes"].append("Earnings calendar unavailable (%s)." % e)
     else:
@@ -417,110 +616,6 @@ def calendar_loop():
         except Exception:
             pass
         time.sleep(1800)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Screener  (per-symbol quote + Finnhub fundamentals + heuristic scores)
-# ─────────────────────────────────────────────────────────────────────────────
-def clamp(x, lo=0, hi=100):
-    return max(lo, min(hi, x))
-
-
-def fetch_metrics(symbol):
-    if not API_KEYS.get("finnhub"):
-        return {}
-    url = "%s/stock/metric?symbol=%s&metric=all&token=%s" % (
-        FINNHUB, urllib.parse.quote(symbol), urllib.parse.quote(API_KEYS["finnhub"]))
-    try:
-        return http_get_json(url).get("metric", {}) or {}
-    except Exception:
-        return {}
-
-
-def screen(symbols):
-    rows = []
-    use_finnhub = bool(API_KEYS.get("finnhub"))
-    for sym in symbols[:25]:
-        try:
-            q = quote_finnhub(sym, sym) if use_finnhub else quote_mock(sym, sym)
-        except Exception:
-            q = quote_mock(sym, sym)
-        m = fetch_metrics(sym) if use_finnhub else {}
-        hi52 = m.get("52WeekHigh") or 0
-        lo52 = m.get("52WeekLow") or 0
-        price = q.get("last", 0)
-        pos52 = clamp(((price - lo52) / (hi52 - lo52) * 100) if hi52 > lo52 else 50)
-        chg = q.get("changePercent", 0) or 0
-        beta = m.get("beta") or 1.0
-        momentum = round(clamp(50 + chg * 6 + (pos52 - 50) * 0.4), 1)
-        bullish = round(clamp(50 + chg * 5 + (pos52 - 50) * 0.5), 1)
-        bearish = round(clamp(100 - bullish), 1)
-        risk = round(clamp(beta * 28 + (100 - pos52) * 0.25), 1)
-        rows.append({
-            "symbol": sym, "price": price, "changePercent": chg,
-            "pe": m.get("peTTM") or m.get("peBasicExclExtraTTM"),
-            "pb": m.get("pb"), "ps": m.get("psTTM"),
-            "marketCap": m.get("marketCapitalization"),
-            "roeTTM": m.get("roeTTM"), "netMargin": m.get("netProfitMarginTTM"),
-            "revGrowth": m.get("revenueGrowthTTMYoy"),
-            "beta": beta, "high52": hi52, "low52": lo52, "pos52": round(pos52, 1),
-            "momentum": momentum, "bullish": bullish, "bearish": bearish, "risk": risk,
-            "source": "finnhub" if use_finnhub else "mock",
-        })
-        if use_finnhub:
-            time.sleep(0.2)  # gentle pacing
-    return {"rows": rows}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Morning brief  (rule-based; AI narrative if an Anthropic key is set)
-# ─────────────────────────────────────────────────────────────────────────────
-def _movers(quotes):
-    eq = [q for q in quotes if q.get("changePercent") is not None]
-    up = sorted(eq, key=lambda q: q["changePercent"], reverse=True)[:3]
-    dn = sorted(eq, key=lambda q: q["changePercent"])[:3]
-    return up, dn
-
-
-def build_brief():
-    with _quotes_lock:
-        quotes = list(_quotes_cache)
-    news = (cache_get("news", 1e9) or {}).get("items", [])[:8]
-    cal = cache_get("calendar", 1e9) or {}
-
-    def find(sym):
-        return next((q for q in quotes if q["symbol"] == sym), None)
-
-    spy, vix = find("SPY"), find("VIX")
-    up, dn = _movers(quotes)
-    risk_tone = "risk-on" if (spy and spy["changePercent"] > 0) else "risk-off"
-
-    # Rule-based brief (always available)
-    lines = []
-    if spy:
-        lines.append("S&P 500 (SPY) %s%.2f%% at %.2f." % (
-            "+" if spy["changePercent"] >= 0 else "", spy["changePercent"], spy["last"]))
-    if vix:
-        lines.append("VIX %.2f (%s%.2f%%) — %s." % (
-            vix["last"], "+" if vix["changePercent"] >= 0 else "", vix["changePercent"],
-            "elevated" if vix["last"] > 20 else "calm"))
-    if up:
-        lines.append("Leaders: " + ", ".join("%s %+.2f%%" % (q["symbol"], q["changePercent"]) for q in up))
-    if dn:
-        lines.append("Laggards: " + ", ".join("%s %+.2f%%" % (q["symbol"], q["changePercent"]) for q in dn))
-    lines.append("Overall tone looks %s." % risk_tone)
-    rule_text = " ".join(lines)
-
-    out = {
-        "tone": risk_tone, "generatedAt": int(time.time()),
-        "movers": {"up": up, "down": dn},
-        "headlines": [{"headline": n["headline"], "category": n["category"],
-                       "sentiment": n["sentiment"]} for n in news],
-        "events": ([e for e in cal.get("economic", []) if e.get("impact") in ("High", "Medium")][:6]
-                   or cal.get("economic", [])[:6] or cal.get("earnings", [])[:6]),
-        "summary": rule_text,
-    }
-    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -544,26 +639,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj), "application/json")
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
+        u = urllib.parse.urlparse(self.path)
+        path, qs = u.path, urllib.parse.parse_qs(u.query)
+        tf = "weekly" if (qs.get("tf", ["daily"])[0] == "weekly") else "daily"
 
         if path == "/api/quotes":
             with _quotes_lock:
-                self._json({"provider": _status["provider"], "updated": _status["updated"],
-                            "quotes": list(_quotes_cache)})
+                self._json({"provider": _status["provider"], "updated": _status["updated"], "quotes": list(_quotes_cache)})
+        elif path == "/api/sectors":
+            self._json(cache_get("sectors", 120) or _cache_and_return("sectors", rotation))
+        elif path == "/api/entries":
+            syms = [s.strip().upper() for s in (qs.get("symbols", [""])[0]).split(",") if s.strip()] \
+                   or ([s for s, _ in SECTORS] + WATCHLIST)
+            ck = "entries:%s:%s" % (tf, ",".join(syms))
+            self._json(cache_get(ck, 120) or _cache_and_return(ck, lambda: build_entries(syms, tf)))
+        elif path == "/api/chart":
+            sym = (qs.get("symbol", ["SPY"])[0]).upper()
+            self._json(chart_data(sym, tf))
         elif path == "/api/news":
             self._json(cache_get("news", 1e9) or fetch_news())
         elif path == "/api/calendar":
             self._json(cache_get("calendar", 1e9) or fetch_calendar())
-        elif path == "/api/screener":
-            syms = [s.strip().upper() for s in (qs.get("symbols", [""])[0]).split(",") if s.strip()] \
-                   or SCREENER_SYMBOLS
-            ck = "screener:" + ",".join(syms)
-            data = cache_get(ck, 60) or screen(syms)
-            cache_set(ck, data)
-            self._json(data)
-        elif path == "/api/brief":
-            self._json(cache_get("brief", 300) or _cache_and_return("brief", build_brief))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -578,26 +674,24 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _cache_and_return(key, fn):
-    val = fn()
-    cache_set(key, val)
-    return val
+    val = fn(); cache_set(key, val); return val
 
 
 def main():
     prov = active_provider()
-    print("Quanta standalone — morning debrief")
-    print("  provider : %s%s" % (prov, "  (no API key set)" if prov == "mock" else ""))
-    print("  refresh  : every %ds" % REFRESH_SECONDS)
+    bars_src = "synthetic (demo)" if (FORCE_SYNTH or not API_KEYS.get("polygon")) else "polygon (daily aggregates)"
+    print("Quanta — quant swing companion")
+    print("  quotes   : %s%s" % (prov, "  (no API key)" if prov == "mock" else ""))
+    print("  bars     : %s — warming %d symbols in the background" % (bars_src, len(BAR_UNIVERSE)))
+    print("  sectors  : %s" % ", ".join(s for s, _ in SECTORS))
     print("  open     : http://localhost:%d/" % PORT)
-    threading.Thread(target=refresh_loop, daemon=True).start()
-    threading.Thread(target=news_loop, daemon=True).start()
-    threading.Thread(target=calendar_loop, daemon=True).start()
+    for fn in (quotes_loop, bars_loop, news_loop, calendar_loop):
+        threading.Thread(target=fn, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down")
-        server.shutdown()
+        print("\nshutting down"); server.shutdown()
 
 
 if __name__ == "__main__":

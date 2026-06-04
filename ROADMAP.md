@@ -23,13 +23,12 @@ Each later stage is additive and does not require rewriting earlier stages.
 
 ## Standalone app (shipped, complementary to ThinkOrSwim) ✅
 
-The zero-dependency `standalone/` Python+HTML app delivers a lightweight slice of
-Stages 3–4 and 7 for single-user use, on Finnhub free-tier data:
-- [x] Tabbed morning-debrief UI: Brief / Markets / News / Calendar / Screener
-- [x] Rule-based morning brief (movers + headlines + high-impact events)
-- [x] News: auto-categorized + sentiment + impact (keyword classifier)
-- [x] Calendar: economic events (free FairEconomy/ForexFactory feed, w/ forecast/actual/surprise) + earnings
-- [x] Screener: watchlist fundamentals + heuristic Bull/Bear/Momentum/Risk scores
+The zero-dependency `standalone/` Python+HTML app is a quant swing-trading companion
+for single-user use (Finnhub quotes/news + Polygon daily bars):
+- [x] Sector rotation: 11 SPDR ETFs RS vs SPY (1w/1m/3m) + RRG quadrants
+- [x] Entry scanner: 50% retracement setups on daily & weekly (swing→Fib, zone, stop/target, R:R, score)
+- [x] SVG charts: candles + SMA20/50 + swing/Fib levels + entry zone
+- [x] Macro overview, news (categorized + sentiment), economic + earnings calendar
 
 The full-stack stages below remain the target for the production (Go/React/K8s) build.
 
