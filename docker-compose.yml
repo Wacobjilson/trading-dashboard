@@ -37,6 +37,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-secret}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      DISABLE_AUTH: ${DISABLE_AUTH:-false}
       MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-}
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}

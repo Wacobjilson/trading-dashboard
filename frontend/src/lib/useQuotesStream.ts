@@ -33,9 +33,11 @@ export function useQuotesStream(symbols: string[], seed?: Quote[]) {
     let timer: ReturnType<typeof setTimeout>;
 
     function connect() {
+      // Include the token when present; in single-user mode the backend accepts
+      // the connection without one.
       const token = getToken();
-      if (!token) return;
-      const ws = new WebSocket(`${wsBase()}/ws?token=${encodeURIComponent(token)}`);
+      const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+      const ws = new WebSocket(`${wsBase()}/ws${qs}`);
       wsRef.current = ws;
 
       ws.onopen = () => {

@@ -68,16 +68,25 @@ func VerifyPassword(password, encoded string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// LocalUserID is the synthetic user id used in single-user (DisableAuth) mode.
+const LocalUserID = "local-single-user"
+
 // Manager issues and verifies JWTs.
 type Manager struct {
-	secret []byte
-	ttl    time.Duration
+	secret  []byte
+	ttl     time.Duration
+	disable bool
 }
 
-// NewManager creates a JWT manager with a 7-day token lifetime.
-func NewManager(secret string) *Manager {
-	return &Manager{secret: []byte(secret), ttl: 7 * 24 * time.Hour}
+// NewManager creates a JWT manager with a 7-day token lifetime. When disable is
+// true the app runs in single-user mode and Middleware lets every request through
+// as the built-in local user.
+func NewManager(secret string, disable bool) *Manager {
+	return &Manager{secret: []byte(secret), ttl: 7 * 24 * time.Hour, disable: disable}
 }
+
+// Disabled reports whether auth is bypassed (single-user mode).
+func (m *Manager) Disabled() bool { return m.disable }
 
 // Issue returns a signed token for the given user id.
 func (m *Manager) Issue(userID string) (string, error) {
@@ -111,6 +120,11 @@ func (m *Manager) Parse(tokenStr string) (string, error) {
 // and stores the user id in the request context.
 func (m *Manager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m.disable {
+			ctx := context.WithValue(r.Context(), userIDKey, LocalUserID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 		token := tokenFromRequest(r)
 		if token == "" {
 			http.Error(w, "missing token", http.StatusUnauthorized)

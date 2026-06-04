@@ -43,6 +43,9 @@ spec:
               value: "8080"
             - name: CORS_ALLOWED_ORIGINS
               value: "https://quanta.example.com"
+            # Single-user mode: removes login/register. Set "false" to require auth.
+            - name: DISABLE_AUTH
+              value: "true"
             - name: QUOTE_POLL_INTERVAL
               value: "5s"
             - name: AI_PROVIDER

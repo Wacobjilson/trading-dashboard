@@ -13,6 +13,9 @@ type Config struct {
 	LogLevel    string
 	JWTSecret   string
 	CORSOrigins []string
+	// DisableAuth runs the app in single-user mode: no login/register required,
+	// all requests act as a built-in local user. For private/self-hosted use only.
+	DisableAuth bool
 
 	DatabaseURL string
 	RedisURL    string
@@ -42,6 +45,7 @@ func Load() *Config {
 		LogLevel:    env("LOG_LEVEL", "info"),
 		JWTSecret:   env("JWT_SECRET", "change-me-to-a-long-random-secret"),
 		CORSOrigins: splitCSV(env("CORS_ALLOWED_ORIGINS", "http://localhost:3000")),
+		DisableAuth: envBool("DISABLE_AUTH", false),
 
 		DatabaseURL: env("DATABASE_URL", "postgres://quanta:quanta@localhost:5432/quanta?sslmode=disable"),
 		RedisURL:    env("REDIS_URL", "redis://localhost:6379/0"),
@@ -68,6 +72,17 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 func envDuration(key string, def time.Duration) time.Duration {

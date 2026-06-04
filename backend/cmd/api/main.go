@@ -54,7 +54,10 @@ func main() {
 
 	// Wiring.
 	st := store.New(database.Pool)
-	am := auth.NewManager(cfg.JWTSecret)
+	am := auth.NewManager(cfg.JWTSecret, cfg.DisableAuth)
+	if cfg.DisableAuth {
+		log.Warn("AUTH DISABLED — running in single-user mode (no login required)")
+	}
 	provider := market.Select(cfg, log)
 	log.Info("market provider selected", "provider", provider.Name())
 

@@ -17,6 +17,9 @@ backend:
     minReplicas: 2
     maxReplicas: 6
     targetCPUUtilizationPercentage: 70
+  # Single-user mode: set true to remove login/register (every request is the
+  # built-in local user). Intended for private, self-hosted single-user installs.
+  disableAuth: false
   # Quote ingestion / provider config
   marketDataProvider: ""        # "", polygon, finnhub, alphavantage, mock
   quotePollInterval: "5s"

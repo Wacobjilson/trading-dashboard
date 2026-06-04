@@ -198,6 +198,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	uid := auth.UserID(r.Context())
+	// Single-user mode: the local user has no DB row; return a synthetic profile.
+	if uid == auth.LocalUserID {
+		writeJSON(w, http.StatusOK, models.User{
+			ID:          auth.LocalUserID,
+			Email:       "local@quanta",
+			DisplayName: "Local User",
+		})
+		return
+	}
 	u, err := s.store.UserByID(r.Context(), uid)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "user not found")

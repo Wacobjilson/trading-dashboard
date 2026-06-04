@@ -21,15 +21,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
 
   useEffect(() => {
-    // Restore session from a stored token on mount.
-    if (!getToken()) {
-      setLoading(false);
-      return;
-    }
+    // Probe /me on mount. In single-user mode the backend has auth disabled and
+    // returns the local user even without a token, so login is skipped entirely.
+    // With auth enabled and no/invalid token, /me 401s and we fall back to login.
     api
       .me()
       .then(setUser)
-      .catch(() => clearToken())
+      .catch(() => {
+        if (getToken()) clearToken();
+      })
       .finally(() => setLoading(false));
   }, []);
 

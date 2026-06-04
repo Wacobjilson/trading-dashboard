@@ -55,6 +55,8 @@ spec:
               value: "8080"
             - name: CORS_ALLOWED_ORIGINS
               value: {{ .Values.ingress.corsAllowedOrigins | quote }}
+            - name: DISABLE_AUTH
+              value: {{ .Values.backend.disableAuth | quote }}
             - name: MARKET_DATA_PROVIDER
               value: {{ .Values.backend.marketDataProvider | quote }}
             - name: QUOTE_POLL_INTERVAL
