@@ -1,5 +1,6 @@
 {
   "polygon": "your-polygon-key-or-leave-blank",
   "finnhub": "your-finnhub-key-or-leave-blank",
-  "alphavantage": "your-alphavantage-key-or-leave-blank"
+  "alphavantage": "your-alphavantage-key-or-leave-blank",
+  "anthropic": "optional-anthropic-key-for-the-AI-morning-brief"
 }

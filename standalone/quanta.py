@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Quanta standalone — a zero-dependency trading dashboard.
+Quanta standalone — a zero-dependency morning-debrief trading dashboard.
 
-Runs a tiny HTTP server (Python standard library only) that:
-  * fetches quotes from Finnhub / Polygon / Alpha Vantage (or synthetic mock data),
-  * serves the dashboard at  http://localhost:8000/
-  * serves quote JSON at     http://localhost:8000/api/quotes
+A companion to your main platform (e.g. ThinkOrSwim): glanceable market context,
+news, calendar, and a watchlist screener — plus an optional AI morning brief.
+
+Runs a tiny HTTP server (Python standard library only) that serves:
+  /                 the dashboard (index.html)
+  /api/quotes       index / futures / macro snapshot
+  /api/news         categorized + sentiment-tagged market news
+  /api/calendar     economic + earnings events (best-effort, free tier)
+  /api/screener     fundamentals + heuristic scores for a list of tickers
+  /api/brief        morning debrief (rule-based, or AI if an Anthropic key is set)
 
 No pip install, no database, no auth. Just:  python3 quanta.py
 
-Configure by editing API_KEYS below, or set the matching environment variables.
-With no key set it runs in MOCK mode (synthetic data) so you can try it instantly.
+Keys: copy keys.local.json.example -> keys.local.json and fill it in, or set
+env vars. With no key set it runs in MOCK mode so you can try it instantly.
 """
 
+import datetime as dt
 import json
-import math
 import os
 import random
 import threading
@@ -24,7 +30,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config — edit these, or set env vars of the same name.
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_local_keys():
     """Load API keys from keys.local.json next to this script, if present.
@@ -39,25 +45,27 @@ def _load_local_keys():
 
 _LOCAL_KEYS = _load_local_keys()
 
-# Resolution order per provider: environment variable → keys.local.json → empty.
+
+def _key(name):
+    return os.environ.get(name.upper() + "_API_KEY") or _LOCAL_KEYS.get(name, "")
+
+
+# Resolution per provider: env var → keys.local.json → empty.
 # Do NOT hardcode keys here — this file is committed to git.
 API_KEYS = {
-    "polygon": os.environ.get("POLYGON_API_KEY") or _LOCAL_KEYS.get("polygon", ""),
-    "finnhub": os.environ.get("FINNHUB_API_KEY") or _LOCAL_KEYS.get("finnhub", ""),
-    "alphavantage": os.environ.get("ALPHAVANTAGE_API_KEY") or _LOCAL_KEYS.get("alphavantage", ""),
+    "polygon": _key("polygon"),
+    "finnhub": _key("finnhub"),
+    "alphavantage": _key("alphavantage"),
+    "anthropic": _key("anthropic"),
 }
-# Pin a provider ("polygon" | "finnhub" | "alphavantage" | "mock"), or "" to
-# auto-pick the first one with a key set.
 PROVIDER = os.environ.get("MARKET_DATA_PROVIDER", "").lower()
 PORT = int(os.environ.get("PORT", "8000"))
-# How often the server refreshes quotes from the provider (seconds). Keep this
-# reasonable to respect free-tier rate limits (Finnhub ~60/min, Alpha Vantage ~5/min).
-REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "15"))
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "20"))
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+# Default screener watchlist (override in the UI or via SCREENER_SYMBOLS).
+SCREENER_SYMBOLS = [s.strip().upper() for s in os.environ.get(
+    "SCREENER_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD,NFLX,JPM").split(",") if s.strip()]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Instruments. Futures are mapped to liquid ETF proxies so free tiers work.
-# fields: (symbol, name, asset_class, {provider: vendor_symbol})
-# ─────────────────────────────────────────────────────────────────────────────
 INSTRUMENTS = [
     ("SPY",  "S&P 500 ETF",          "etf",    {"polygon": "SPY", "finnhub": "SPY", "alphavantage": "SPY"}),
     ("QQQ",  "Nasdaq 100 ETF",       "etf",    {"polygon": "QQQ", "finnhub": "QQQ", "alphavantage": "QQQ"}),
@@ -78,27 +86,50 @@ SEED_PRICES = {
     "US10Y": 4.35, "DXY": 104.8,
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Provider selection
-# ─────────────────────────────────────────────────────────────────────────────
-def active_provider():
-    if PROVIDER in ("polygon", "finnhub", "alphavantage", "mock"):
-        return PROVIDER
-    for name in ("polygon", "finnhub", "alphavantage"):
-        if API_KEYS.get(name):
-            return name
-    return "mock"
+FINNHUB = "https://finnhub.io/api/v1"
 
 
-def http_get_json(url, timeout=10):
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP helper + tiny TTL cache
+# ─────────────────────────────────────────────────────────────────────────────
+def http_get_json(url, timeout=12):
     req = urllib.request.Request(url, headers={"User-Agent": "quanta-standalone"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+_cache = {}
+_cache_lock = threading.Lock()
+
+
+def cache_get(key, ttl):
+    with _cache_lock:
+        item = _cache.get(key)
+    if item and (time.time() - item[0]) < ttl:
+        return item[1]
+    return None
+
+
+def cache_set(key, value):
+    with _cache_lock:
+        _cache[key] = (time.time(), value)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quote providers
+# ─────────────────────────────────────────────────────────────────────────────
+def active_provider():
+    if PROVIDER in ("polygon", "finnhub", "alphavantage", "mock"):
+        return PROVIDER
+    for name in ("finnhub", "polygon", "alphavantage"):  # finnhub first: best free tier
+        if API_KEYS.get(name):
+            return name
+    return "mock"
+
+
 def quote_finnhub(sym, vendor):
-    url = "https://finnhub.io/api/v1/quote?symbol=%s&token=%s" % (
-        urllib.parse.quote(vendor), urllib.parse.quote(API_KEYS["finnhub"]))
+    url = "%s/quote?symbol=%s&token=%s" % (FINNHUB, urllib.parse.quote(vendor),
+                                           urllib.parse.quote(API_KEYS["finnhub"]))
     d = http_get_json(url)
     if not d or (d.get("c", 0) == 0 and d.get("pc", 0) == 0):
         raise ValueError("empty finnhub quote")
@@ -157,7 +188,6 @@ def quote_polygon(sym, vendor):
     }
 
 
-# Mock state (random walk), kept across refreshes.
 _mock_state = {}
 
 
@@ -165,12 +195,10 @@ def quote_mock(sym, vendor):
     st = _mock_state.get(sym)
     if st is None:
         base = SEED_PRICES.get(sym, 100.0)
-        st = {
-            "last": base, "prevClose": base * (1 - (random.random() - 0.5) * 0.01),
-            "week": base * (1 - (random.random() - 0.5) * 0.04), "open": base,
-            "high": base, "low": base, "vol": random.randint(10_000_000, 40_000_000),
-            "avg": random.randint(30_000_000, 80_000_000),
-        }
+        st = {"last": base, "prevClose": base * (1 - (random.random() - 0.5) * 0.01),
+              "week": base * (1 - (random.random() - 0.5) * 0.04), "open": base,
+              "high": base, "low": base, "vol": random.randint(10_000_000, 40_000_000),
+              "avg": random.randint(30_000_000, 80_000_000)}
         _mock_state[sym] = st
     st["last"] = max(0.01, st["last"] + (random.random() - 0.5) * 0.001 * st["last"])
     st["high"] = max(st["high"], st["last"]); st["low"] = min(st["low"], st["last"])
@@ -187,16 +215,9 @@ def quote_mock(sym, vendor):
     }
 
 
-PROVIDER_FNS = {
-    "finnhub": quote_finnhub, "alphavantage": quote_alphavantage,
-    "polygon": quote_polygon, "mock": quote_mock,
-}
+PROVIDER_FNS = {"finnhub": quote_finnhub, "alphavantage": quote_alphavantage,
+                "polygon": quote_polygon, "mock": quote_mock}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Background refresher — fetches all instruments every REFRESH_SECONDS.
-# Falls back to mock per-symbol if the live provider errors, so the dashboard is
-# always fully populated.
-# ─────────────────────────────────────────────────────────────────────────────
 _quotes_lock = threading.Lock()
 _quotes_cache = []
 _status = {"provider": active_provider(), "updated": 0}
@@ -210,20 +231,278 @@ def refresh_loop():
         for sym, name, klass, vendors in INSTRUMENTS:
             vendor = vendors.get(provider, sym)
             try:
-                q = fn(sym, vendor)
-                src = provider
+                q = fn(sym, vendor); src = provider
             except Exception:
-                q = quote_mock(sym, vendor)  # graceful fallback
-                src = "mock"
+                q = quote_mock(sym, vendor); src = "mock"
             q.update({"symbol": sym, "name": name, "assetClass": klass, "source": src})
             out.append(q)
             if provider == "alphavantage":
-                time.sleep(13)  # crude rate-limit guard for AV free tier
+                time.sleep(13)
         with _quotes_lock:
             global _quotes_cache
             _quotes_cache = out
             _status["updated"] = int(time.time())
         time.sleep(REFRESH_SECONDS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# News  (Finnhub /news, free) + lightweight classification
+# ─────────────────────────────────────────────────────────────────────────────
+CATEGORY_RULES = [
+    ("Fed",        ["fed", "fomc", "powell", "rate cut", "rate hike", "interest rate", "central bank"]),
+    ("Inflation",  ["cpi", "ppi", "inflation", "pce", "deflation"]),
+    ("Jobs",       ["jobs", "payroll", "nfp", "unemployment", "jobless", "labor market"]),
+    ("Earnings",   ["earnings", "eps", "revenue", "guidance", "beats", "misses", "quarter"]),
+    ("M&A",        ["acquire", "acquisition", "merger", "buyout", "takeover", "deal to buy"]),
+    ("Upgrade",    ["upgrade", "raised to", "outperform", "overweight", "buy rating", "price target raised"]),
+    ("Downgrade",  ["downgrade", "cut to", "underperform", "underweight", "sell rating", "price target cut"]),
+    ("Geopolitics",["war", "sanction", "tariff", "opec", "conflict", "election", "geopolit"]),
+    ("Crypto",     ["bitcoin", "ethereum", "crypto", "btc", "etf approval"]),
+    ("Legal",      ["lawsuit", "sec charges", "fraud", "settlement", "antitrust", "investigation"]),
+]
+BULL_WORDS = ["beats", "surge", "soar", "jumps", "rally", "record", "upgrade", "raises", "tops",
+              "strong", "growth", "approval", "wins", "gains", "outperform", "bullish"]
+BEAR_WORDS = ["misses", "plunge", "slump", "falls", "drops", "downgrade", "cuts", "warns", "weak",
+              "lawsuit", "bankruptcy", "recall", "probe", "layoffs", "loss", "bearish", "halts"]
+
+
+def classify(text):
+    t = (text or "").lower()
+    category = "General"
+    for name, words in CATEGORY_RULES:
+        if any(w in t for w in words):
+            category = name
+            break
+    score = sum(w in t for w in BULL_WORDS) - sum(w in t for w in BEAR_WORDS)
+    sentiment = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+    # impact: more keyword hits / macro categories rank higher (0..100)
+    impact = 40
+    if category in ("Fed", "Inflation", "Jobs"):
+        impact = 85
+    elif category in ("Earnings", "M&A", "Geopolitics"):
+        impact = 65
+    impact = min(100, impact + 8 * abs(score))
+    return category, sentiment, impact
+
+
+def fetch_news():
+    if not API_KEYS.get("finnhub"):
+        return {"error": "Finnhub key required for live news", "items": []}
+    url = "%s/news?category=general&token=%s" % (FINNHUB, urllib.parse.quote(API_KEYS["finnhub"]))
+    try:
+        raw = http_get_json(url)
+    except Exception as e:
+        return {"error": "news fetch failed: %s" % e, "items": []}
+    items = []
+    for n in raw[:60]:
+        head = n.get("headline", "")
+        cat, sent, impact = classify(head + " " + n.get("summary", ""))
+        items.append({
+            "headline": head, "source": n.get("source", ""), "url": n.get("url", ""),
+            "summary": (n.get("summary", "") or "")[:280], "datetime": n.get("datetime", 0),
+            "image": n.get("image", ""), "related": n.get("related", ""),
+            "category": cat, "sentiment": sent, "impact": impact,
+        })
+    items.sort(key=lambda x: (x["impact"], x["datetime"]), reverse=True)
+    return {"items": items}
+
+
+def news_loop():
+    while True:
+        data = fetch_news()
+        if not data.get("error") or not cache_get("news", 1e9):
+            cache_set("news", data)
+        time.sleep(180)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calendar  (Finnhub earnings + economic; economic often needs a paid plan)
+# ─────────────────────────────────────────────────────────────────────────────
+def _date_range(days_ahead=7):
+    today = dt.date.today()
+    return today.isoformat(), (today + dt.timedelta(days=days_ahead)).isoformat()
+
+
+def fetch_calendar():
+    out = {"earnings": [], "economic": [], "notes": []}
+    if not API_KEYS.get("finnhub"):
+        out["notes"].append("Finnhub key required for calendar data.")
+        return out
+    frm, to = _date_range(7)
+    tok = urllib.parse.quote(API_KEYS["finnhub"])
+    # Earnings
+    try:
+        url = "%s/calendar/earnings?from=%s&to=%s&token=%s" % (FINNHUB, frm, to, tok)
+        ec = http_get_json(url).get("earningsCalendar", []) or []
+        for e in ec[:80]:
+            out["earnings"].append({
+                "date": e.get("date"), "symbol": e.get("symbol"),
+                "hour": e.get("hour", ""), "epsEstimate": e.get("epsEstimate"),
+                "epsActual": e.get("epsActual"), "revenueEstimate": e.get("revenueEstimate"),
+                "revenueActual": e.get("revenueActual"),
+            })
+    except Exception as e:
+        out["notes"].append("Earnings calendar unavailable (%s)." % e)
+    # Economic (premium on many plans → degrade gracefully)
+    try:
+        url = "%s/calendar/economic?token=%s" % (FINNHUB, tok)
+        ev = http_get_json(url).get("economicCalendar", []) or []
+        for x in ev:
+            d = x.get("time", "")[:10]
+            if frm <= d <= to:
+                out["economic"].append({
+                    "date": d, "time": x.get("time", ""), "country": x.get("country", ""),
+                    "event": x.get("event", ""), "impact": x.get("impact", ""),
+                    "actual": x.get("actual"), "estimate": x.get("estimate"), "prev": x.get("prev"),
+                })
+        out["economic"].sort(key=lambda r: r["time"])
+    except Exception:
+        out["notes"].append("Economic calendar needs a paid Finnhub plan — showing earnings only.")
+    return out
+
+
+def calendar_loop():
+    while True:
+        try:
+            cache_set("calendar", fetch_calendar())
+        except Exception:
+            pass
+        time.sleep(1800)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screener  (per-symbol quote + Finnhub fundamentals + heuristic scores)
+# ─────────────────────────────────────────────────────────────────────────────
+def clamp(x, lo=0, hi=100):
+    return max(lo, min(hi, x))
+
+
+def fetch_metrics(symbol):
+    if not API_KEYS.get("finnhub"):
+        return {}
+    url = "%s/stock/metric?symbol=%s&metric=all&token=%s" % (
+        FINNHUB, urllib.parse.quote(symbol), urllib.parse.quote(API_KEYS["finnhub"]))
+    try:
+        return http_get_json(url).get("metric", {}) or {}
+    except Exception:
+        return {}
+
+
+def screen(symbols):
+    rows = []
+    use_finnhub = bool(API_KEYS.get("finnhub"))
+    for sym in symbols[:25]:
+        try:
+            q = quote_finnhub(sym, sym) if use_finnhub else quote_mock(sym, sym)
+        except Exception:
+            q = quote_mock(sym, sym)
+        m = fetch_metrics(sym) if use_finnhub else {}
+        hi52 = m.get("52WeekHigh") or 0
+        lo52 = m.get("52WeekLow") or 0
+        price = q.get("last", 0)
+        pos52 = clamp(((price - lo52) / (hi52 - lo52) * 100) if hi52 > lo52 else 50)
+        chg = q.get("changePercent", 0) or 0
+        beta = m.get("beta") or 1.0
+        momentum = round(clamp(50 + chg * 6 + (pos52 - 50) * 0.4), 1)
+        bullish = round(clamp(50 + chg * 5 + (pos52 - 50) * 0.5), 1)
+        bearish = round(clamp(100 - bullish), 1)
+        risk = round(clamp(beta * 28 + (100 - pos52) * 0.25), 1)
+        rows.append({
+            "symbol": sym, "price": price, "changePercent": chg,
+            "pe": m.get("peTTM") or m.get("peBasicExclExtraTTM"),
+            "pb": m.get("pb"), "ps": m.get("psTTM"),
+            "marketCap": m.get("marketCapitalization"),
+            "roeTTM": m.get("roeTTM"), "netMargin": m.get("netProfitMarginTTM"),
+            "revGrowth": m.get("revenueGrowthTTMYoy"),
+            "beta": beta, "high52": hi52, "low52": lo52, "pos52": round(pos52, 1),
+            "momentum": momentum, "bullish": bullish, "bearish": bearish, "risk": risk,
+            "source": "finnhub" if use_finnhub else "mock",
+        })
+        if use_finnhub:
+            time.sleep(0.2)  # gentle pacing
+    return {"rows": rows}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Morning brief  (rule-based; AI narrative if an Anthropic key is set)
+# ─────────────────────────────────────────────────────────────────────────────
+def _movers(quotes):
+    eq = [q for q in quotes if q.get("changePercent") is not None]
+    up = sorted(eq, key=lambda q: q["changePercent"], reverse=True)[:3]
+    dn = sorted(eq, key=lambda q: q["changePercent"])[:3]
+    return up, dn
+
+
+def build_brief():
+    with _quotes_lock:
+        quotes = list(_quotes_cache)
+    news = (cache_get("news", 1e9) or {}).get("items", [])[:8]
+    cal = cache_get("calendar", 1e9) or {}
+
+    def find(sym):
+        return next((q for q in quotes if q["symbol"] == sym), None)
+
+    spy, vix = find("SPY"), find("VIX")
+    up, dn = _movers(quotes)
+    risk_tone = "risk-on" if (spy and spy["changePercent"] > 0) else "risk-off"
+
+    # Rule-based brief (always available)
+    lines = []
+    if spy:
+        lines.append("S&P 500 (SPY) %s%.2f%% at %.2f." % (
+            "+" if spy["changePercent"] >= 0 else "", spy["changePercent"], spy["last"]))
+    if vix:
+        lines.append("VIX %.2f (%s%.2f%%) — %s." % (
+            vix["last"], "+" if vix["changePercent"] >= 0 else "", vix["changePercent"],
+            "elevated" if vix["last"] > 20 else "calm"))
+    if up:
+        lines.append("Leaders: " + ", ".join("%s %+.2f%%" % (q["symbol"], q["changePercent"]) for q in up))
+    if dn:
+        lines.append("Laggards: " + ", ".join("%s %+.2f%%" % (q["symbol"], q["changePercent"]) for q in dn))
+    lines.append("Overall tone looks %s." % risk_tone)
+    rule_text = " ".join(lines)
+
+    out = {
+        "tone": risk_tone, "generatedAt": int(time.time()),
+        "movers": {"up": up, "down": dn},
+        "headlines": [{"headline": n["headline"], "category": n["category"],
+                       "sentiment": n["sentiment"]} for n in news],
+        "events": cal.get("economic", [])[:6] or cal.get("earnings", [])[:6],
+        "summary": rule_text, "ai": False,
+    }
+
+    # Optional AI narrative
+    if API_KEYS.get("anthropic"):
+        try:
+            out["summary"] = ai_brief(quotes, news, cal)
+            out["ai"] = True
+        except Exception as e:
+            out["aiError"] = str(e)
+    return out
+
+
+def ai_brief(quotes, news, cal):
+    snap = "\n".join("%s: %.2f (%+.2f%%)" % (q["symbol"], q["last"], q["changePercent"]) for q in quotes)
+    heads = "\n".join("- [%s/%s] %s" % (n["category"], n["sentiment"], n["headline"]) for n in news[:8])
+    events = "\n".join("- %s %s %s" % (e.get("date", ""), e.get("event", e.get("symbol", "")),
+                                       e.get("country", "")) for e in (cal.get("economic") or cal.get("earnings") or [])[:8])
+    prompt = (
+        "You are a markets desk analyst writing a concise pre-market morning brief for an "
+        "active retail trader who also uses ThinkOrSwim. Use ONLY the data below. 120-180 words, "
+        "plain text, no markdown headers. Cover: overall risk tone, index/futures posture, notable "
+        "movers, what the news flow implies, and what to watch on the calendar today.\n\n"
+        "MARKET SNAPSHOT:\n%s\n\nTOP HEADLINES:\n%s\n\nCALENDAR:\n%s\n" % (snap, heads, events or "(none)"))
+    body = json.dumps({
+        "model": ANTHROPIC_MODEL, "max_tokens": 700,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+        "x-api-key": API_KEYS["anthropic"], "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return "".join(b.get("text", "") for b in data.get("content", [])).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,41 +513,69 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Access-Control-Allow-Origin", "*")  # allow file:// usage
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj), "application/json")
+
     def do_GET(self):
-        if self.path.startswith("/api/quotes"):
+        parsed = urllib.parse.urlparse(self.path)
+        path, qs = parsed.path, urllib.parse.parse_qs(parsed.query)
+
+        if path == "/api/quotes":
             with _quotes_lock:
-                payload = {"provider": _status["provider"], "updated": _status["updated"],
-                           "quotes": list(_quotes_cache)}
-            self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
-            return
-        if self.path in ("/", "/index.html"):
-            path = os.path.join(HERE, "index.html")
+                self._json({"provider": _status["provider"], "updated": _status["updated"],
+                            "quotes": list(_quotes_cache)})
+        elif path == "/api/news":
+            self._json(cache_get("news", 1e9) or fetch_news())
+        elif path == "/api/calendar":
+            self._json(cache_get("calendar", 1e9) or fetch_calendar())
+        elif path == "/api/screener":
+            syms = [s.strip().upper() for s in (qs.get("symbols", [""])[0]).split(",") if s.strip()] \
+                   or SCREENER_SYMBOLS
+            ck = "screener:" + ",".join(syms)
+            data = cache_get(ck, 60) or screen(syms)
+            cache_set(ck, data)
+            self._json(data)
+        elif path == "/api/brief":
+            self._json(cache_get("brief", 300) or _cache_and_return("brief", build_brief))
+        elif path in ("/", "/index.html"):
             try:
-                with open(path, "rb") as f:
+                with open(os.path.join(HERE, "index.html"), "rb") as f:
                     self._send(200, f.read(), "text/html; charset=utf-8")
             except FileNotFoundError:
                 self._send(404, b"index.html not found next to quanta.py", "text/plain")
-            return
-        self._send(404, b"not found", "text/plain")
+        else:
+            self._send(404, b"not found", "text/plain")
 
     def log_message(self, *args):
-        pass  # quiet
+        pass
+
+
+def _cache_and_return(key, fn):
+    val = fn()
+    cache_set(key, val)
+    return val
 
 
 def main():
     prov = active_provider()
-    print("Quanta standalone")
+    ai = "on (%s)" % ANTHROPIC_MODEL if API_KEYS.get("anthropic") else "off (no Anthropic key)"
+    print("Quanta standalone — morning debrief")
     print("  provider : %s%s" % (prov, "  (no API key set)" if prov == "mock" else ""))
+    print("  AI brief : %s" % ai)
     print("  refresh  : every %ds" % REFRESH_SECONDS)
     print("  open     : http://localhost:%d/" % PORT)
     threading.Thread(target=refresh_loop, daemon=True).start()
+    threading.Thread(target=news_loop, daemon=True).start()
+    threading.Thread(target=calendar_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
