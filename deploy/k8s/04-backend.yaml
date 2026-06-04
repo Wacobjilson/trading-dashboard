@@ -27,6 +27,7 @@ spec:
       containers:
         - name: backend
           image: ghcr.io/wacobjilson/quanta-backend:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:

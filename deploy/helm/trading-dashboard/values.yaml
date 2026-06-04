@@ -3,7 +3,9 @@
 image:
   registry: ghcr.io
   repository: wacobjilson/quanta
-  pullPolicy: IfNotPresent
+  # Always, because we deploy the mutable :latest tag — ensures restarts/upgrades
+  # fetch the newest image. Pin a :sha-... tag + IfNotPresent for reproducible deploys.
+  pullPolicy: Always
 
 backend:
   image: backend

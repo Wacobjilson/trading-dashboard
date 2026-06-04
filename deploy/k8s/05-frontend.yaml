@@ -30,6 +30,7 @@ spec:
         # ingress (/api and /ws), so no NEXT_PUBLIC_* config is needed.
         - name: frontend
           image: ghcr.io/wacobjilson/quanta-frontend:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 3000
           readinessProbe:
