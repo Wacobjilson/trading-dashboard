@@ -10,11 +10,11 @@ Python 3 (standard library only) serving one HTML page.
 | Tab | What it shows |
 |-----|---------------|
 | **Rotation** | The 11 SPDR sector ETFs ranked by relative strength vs SPY (1w/1m/3m) with an RRG-style scatter (Leading / Weakening / Lagging / Improving) — *where the money is moving*. |
-| **Entries** | A scanner that finds **50% retracement setups** on the **daily and weekly** timeframe: recent swing high/low → Fibonacci, the golden-pocket entry zone, suggested stop/target, R:R, and an entry-quality score. Long = pullback in an up-leg; short = bounce in a down-leg. |
-| **Chart** | Per-symbol SVG candlestick with SMA20/50, swing high/low, Fib 38.2/50/61.8 lines and the shaded entry zone. Click any Rotation/Entries row to chart it. |
+| **Entries** | A **sector-ETF-only** scanner for **50% retracement setups** (daily & weekly). Swings come from an ATR-scaled **ZigZag** (real pivots). Each candidate gets a multi-factor **confluence score** (hover it for the breakdown), entry zone, ATR-buffered stop, prior-swing + 1.272-extension targets, R:R, RSI and RS-vs-SPY. |
+| **Chart** | Per-symbol SVG candlestick: SMA20/50, the ZigZag swing pivots, swing high/low, Fib 38.2/50/61.8 and the shaded entry zone. Click any Rotation/Entries row to chart it. |
 | **Markets** | Macro overview grid (SPY, QQQ, IWM, DIA, VIX, CL, GC, US10Y, DXY). |
-| **News** | Market news auto-categorized (Fed, Inflation, Jobs, Earnings, M&A…) with sentiment + impact. |
-| **Calendar** | Economic events (CPI, NFP, FOMC, GDP…) with forecast/actual + surprise %, plus earnings. |
+| **News** | Market news in chronological order (newest first), auto-categorized (Fed, Inflation, Jobs, Earnings, M&A…) with sentiment + impact. |
+| **Calendar** | Economic events with **forecast / previous / actual + surprise %**, filterable by impact and currency, plus a live **countdown** to the next high-impact release. Earnings too. |
 
 > **Data:** quotes/news/earnings from Finnhub; **historical daily bars from Polygon**
 > (free tier: 2 years daily, 5 req/min — so bars warm up in the background over a few
@@ -24,14 +24,20 @@ Python 3 (standard library only) serving one HTML page.
 > **No Polygon key?** Set `QUANTA_SYNTH_BARS=1` (or just leave it unset) to run the
 > rotation/entries/chart features on **synthetic bars** so you can explore the UI.
 
-## Trading logic (transparent heuristics, not advice)
+## Entry algorithm (transparent — not advice)
 
-- **Swing detection:** the highest high and lowest low over a lookback window
-  (90 daily bars / 52 weekly). Their order sets the leg direction.
-- **50% retracement:** entry = midpoint of the swing (the 50% Fib). "Ready" when
-  price sits in the 38.2–61.8% golden pocket. Stop = swing extreme; target = prior swing.
-- **Entry score** blends proximity to the 50% level, trend alignment (vs SMA50),
-  and R:R. **Rotation** uses sector-minus-SPY returns (3m = strength axis, 1m = momentum axis).
+- **Swing detection:** an ATR-scaled **ZigZag** identifies real pivot highs/lows
+  (the reversal threshold adapts to each ETF's volatility), then the most recent
+  confirmed pivot defines the active impulse leg and its direction.
+- **50% retracement:** entry = the leg's 50% Fib; the zone is the 38.2–61.8% golden
+  pocket. Stop = swing extreme buffered by 0.5×ATR; targets = prior swing (T1) and a
+  1.272 extension (T2).
+- **Confluence score (0–100)** = weighted blend of: location in the pocket (.26),
+  trend alignment vs SMA20/50/200 + slope (.18), RSI posture (.12), MACD momentum
+  (.10), relative strength vs SPY (.14), pullback volume (.06), reversal candle (.06),
+  and reward:risk (.08). Hover the score in the Entries table for the per-factor breakdown.
+- **Rotation** uses sector-minus-SPY returns: 3-month = strength axis, 1-month =
+  momentum axis → Leading / Weakening / Lagging / Improving quadrants.
 
 ## Run it
 

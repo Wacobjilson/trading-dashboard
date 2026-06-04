@@ -345,39 +345,158 @@ def clamp(x, lo=0.0, hi=100.0):
 FIB = [0.236, 0.382, 0.5, 0.618, 0.786]
 
 
-def analyze(symbol, tf="daily"):
-    """Swing + 50% retracement setup analysis for one symbol/timeframe."""
+# ── Indicators ───────────────────────────────────────────────────────────────
+def ema_series(vals, n):
+    if len(vals) < n:
+        return [None] * len(vals)
+    k = 2.0 / (n + 1)
+    out = [None] * (n - 1)
+    e = sum(vals[:n]) / n
+    out.append(e)
+    for v in vals[n:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def rsi(closes, n=14):
+    if len(closes) <= n:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    ag = sum(d for d in deltas[:n] if d > 0) / n
+    al = -sum(d for d in deltas[:n] if d < 0) / n
+    for d in deltas[n:]:
+        ag = (ag * (n - 1) + (d if d > 0 else 0)) / n
+        al = (al * (n - 1) + (-d if d < 0 else 0)) / n
+    if al == 0:
+        return 100.0
+    return 100 - 100 / (1 + ag / al)
+
+
+def atr(bars, n=14):
+    if len(bars) <= n:
+        return None
+    trs = [max(bars[i]["h"] - bars[i]["l"], abs(bars[i]["h"] - bars[i - 1]["c"]),
+               abs(bars[i]["l"] - bars[i - 1]["c"])) for i in range(1, len(bars))]
+    a = sum(trs[:n]) / n
+    for tr in trs[n:]:
+        a = (a * (n - 1) + tr) / n
+    return a
+
+
+def macd_hist(closes):
+    """Return (hist_now, hist_prev) for MACD(12,26,9)."""
+    if len(closes) < 35:
+        return None, None
+    e12, e26 = ema_series(closes, 12), ema_series(closes, 26)
+    line = [(a - b) if (a is not None and b is not None) else None for a, b in zip(e12, e26)]
+    vals = [m for m in line if m is not None]
+    sig = ema_series(vals, 9)
+    sigfull = [None] * (len(line) - len(sig)) + sig
+    hist = [(m - s) if (m is not None and s is not None) else None for m, s in zip(line, sigfull)]
+    hv = [h for h in hist if h is not None]
+    if len(hv) < 2:
+        return None, None
+    return hv[-1], hv[-2]
+
+
+# ── ZigZag swing detection (ATR-scaled reversal threshold) ───────────────────
+def zigzag(bars, pct):
+    """Return confirmed pivots [(idx, price, 'H'|'L')] using a % reversal filter."""
+    n = len(bars)
+    if n < 3:
+        return []
+    pivots = []
+    last_high, last_high_i = bars[0]["h"], 0
+    last_low, last_low_i = bars[0]["l"], 0
+    dirn = 0
+    for i in range(1, n):
+        h, l = bars[i]["h"], bars[i]["l"]
+        if dirn > 0:
+            if h > last_high:
+                last_high, last_high_i = h, i
+            elif l <= last_high * (1 - pct):
+                pivots.append((last_high_i, last_high, "H")); dirn = -1; last_low, last_low_i = l, i
+        elif dirn < 0:
+            if l < last_low:
+                last_low, last_low_i = l, i
+            elif h >= last_low * (1 + pct):
+                pivots.append((last_low_i, last_low, "L")); dirn = 1; last_high, last_high_i = h, i
+        else:
+            if h > last_high:
+                last_high, last_high_i = h, i
+            if l < last_low:
+                last_low, last_low_i = l, i
+            if l <= last_high * (1 - pct):
+                pivots.append((last_high_i, last_high, "H")); dirn = -1; last_low, last_low_i = l, i
+            elif h >= last_low * (1 + pct):
+                pivots.append((last_low_i, last_low, "L")); dirn = 1; last_high, last_high_i = h, i
+    return pivots
+
+
+def active_leg(bars, pivots):
+    """From the last confirmed pivot, define the current impulse leg + direction."""
+    if pivots:
+        li, lp, lt = pivots[-1]
+        seg = bars[li:]
+        if lt == "L":  # turned up at the low → current upswing; high = max since
+            hi_rel = max(range(len(seg)), key=lambda k: seg[k]["h"])
+            return lp, seg[hi_rel]["h"], li, li + hi_rel, "long"
+        lo_rel = min(range(len(seg)), key=lambda k: seg[k]["l"])
+        return seg[lo_rel]["l"], lp, li + lo_rel, li, "short"
+    # fallback: window extremes
+    win = bars[-90:] if len(bars) >= 90 else bars
+    hi_i = max(range(len(win)), key=lambda i: win[i]["h"])
+    lo_i = min(range(len(win)), key=lambda i: win[i]["l"])
+    base = len(bars) - len(win)
+    if lo_i <= hi_i:
+        return win[lo_i]["l"], win[hi_i]["h"], base + lo_i, base + hi_i, "long"
+    return win[lo_i]["l"], win[hi_i]["h"], base + lo_i, base + hi_i, "short"
+
+
+def _gauss(x, mu, w):
+    return math.exp(-((x - mu) / w) ** 2)
+
+
+def pivots_for(symbol, tf="daily"):
     daily = get_bars(symbol)
-    if not daily or len(daily) < 40:
-        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up / no data"}
+    if not daily:
+        return [], []
     bars = resample_weekly(daily) if tf == "weekly" else daily
-    if len(bars) < 20:
-        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "not enough bars"}
+    av = atr(bars, 14) or (bars[-1]["c"] * 0.02)
+    pct = min(0.15, max(0.02, (av / bars[-1]["c"]) * (3.0 if tf == "daily" else 4.0)))
+    return bars, zigzag(bars, pct)
+
+
+def analyze(symbol, tf="daily"):
+    """Sophisticated 50% retracement setup with multi-factor confluence scoring.
+
+    Swing structure is found with an ATR-scaled ZigZag (real pivots, not window
+    max/min). The entry zone is the 38.2–61.8% 'golden pocket' of the most recent
+    impulse leg. The score blends: location in the pocket, trend alignment,
+    RSI posture, MACD momentum, relative strength vs SPY, pullback volume, a
+    reversal-candle check, and reward:risk (ATR-based stop)."""
+    bars, pivots = pivots_for(symbol, tf)
+    if not bars or len(bars) < 40:
+        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up / no data"}
 
     closes = [b["c"] for b in bars]
-    win = 52 if tf == "weekly" else 90
-    seg = bars[-win:]
+    vols = [b.get("v", 0) for b in bars]
+    close = closes[-1]
 
-    hi_i = max(range(len(seg)), key=lambda i: seg[i]["h"])
-    lo_i = min(range(len(seg)), key=lambda i: seg[i]["l"])
-    HH, LL = seg[hi_i]["h"], seg[lo_i]["l"]
+    LL, HH, _lo_i, _hi_i, direction = active_leg(bars, pivots)
     rng = max(HH - LL, 1e-9)
-    direction = "long" if lo_i < hi_i else "short"   # low-then-high = up-leg (buy dips)
-    fib50 = (HH + LL) / 2.0
-    # fib level prices (measured from the leg origin)
     if direction == "long":
         levels = {str(p): round(HH - p * rng, 2) for p in FIB}
+        depth = (HH - close) / rng
     else:
         levels = {str(p): round(LL + p * rng, 2) for p in FIB}
-    levels["0.0"] = round(LL if direction == "short" else HH, 2)
-    levels["1.0"] = round(HH if direction == "short" else LL, 2)
-
-    close = closes[-1]
-    depth = (HH - close) / rng if direction == "long" else (close - LL) / rng  # 0=at extreme, 1=full retrace
+        depth = (close - LL) / rng
+    fib50 = round((HH + LL) / 2.0, 2)
     dist50 = (close - fib50) / fib50 * 100
-    status = "Ready" if 0.382 <= depth <= 0.618 else ("Approaching" if 0.236 <= depth <= 0.786 else "Extended")
 
     s20, s50, s200 = sma(closes, 20), sma(closes, 50), sma(closes, 200)
+    s50_prev = sma(closes[:-5], 50) if len(closes) > 55 else None
     if s50 and s200:
         trend = "up" if close > s50 > s200 else "down" if close < s50 < s200 else "side"
     elif s50:
@@ -385,40 +504,91 @@ def analyze(symbol, tf="daily"):
     else:
         trend = "side"
 
-    if direction == "long":
-        entry, stop, target = fib50, round(LL, 2), round(HH, 2)
-    else:
-        entry, stop, target = fib50, round(HH, 2), round(LL, 2)
-    risk = abs(entry - stop); reward = abs(target - entry)
-    rr = round(reward / risk, 2) if risk > 0 else None
+    av = atr(bars, 14) or rng * 0.05
+    rs_val = rsi(closes, 14)
+    hist, hist_prev = macd_hist(closes)
+    rs3m = rs_vs_spy(symbol, 63)
+    rs1m = rs_vs_spy(symbol, 21)
+    avg20 = sum(vols[-20:]) / 20 if len(vols) >= 20 else (sum(vols) / len(vols) if vols else 0)
+    avg5 = sum(vols[-5:]) / 5 if len(vols) >= 5 else avg20
 
-    prox = max(0.0, 1 - abs(depth - 0.5) / 0.5)
-    aligned = (direction == "long" and s50 and close > s50) or (direction == "short" and s50 and close < s50)
-    rr_bonus = min(1.0, (rr or 0) / 3.0)
-    score = round(clamp(100 * (0.55 * prox + 0.25 * (1 if aligned else 0) + 0.20 * rr_bonus)), 1)
+    # ── trade levels (ATR-buffered structural stop, fib-extension T2) ──
+    if direction == "long":
+        entry = fib50
+        stop = round(LL - 0.5 * av, 2)
+        target = round(HH, 2)
+        target2 = round(LL + 1.272 * rng, 2)
+    else:
+        entry = fib50
+        stop = round(HH + 0.5 * av, 2)
+        target = round(LL, 2)
+        target2 = round(HH - 1.272 * rng, 2)
+    risk = abs(entry - stop)
+    rr = round(abs(target - entry) / risk, 2) if risk > 0 else None
+
+    # ── confluence sub-scores (0..1) ──
+    loc = max(0.0, 1 - abs(depth - 0.5) / 0.5)
+    if direction == "long":
+        tr = sum([close > (s20 or close), close > (s50 or close), (s50 or 0) > (s200 or 0),
+                  bool(s50_prev and s50 and s50 > s50_prev)]) / 4.0
+        mom = _gauss(rs_val, 43, 18) if rs_val is not None else 0.4
+        mac = (0.6 if (hist is not None and hist_prev is not None and hist > hist_prev) else 0.0) + (0.4 if (hist is not None and hist > 0) else 0.0)
+        rsc = clamp((0.5 + (rs3m or 0) / 12.0), 0, 1)
+        candle = 1.0 if bars[-1]["c"] >= bars[-1]["o"] else 0.4
+    else:
+        tr = sum([close < (s20 or close), close < (s50 or close), (s50 or 1e9) < (s200 or 1e9),
+                  bool(s50_prev and s50 and s50 < s50_prev)]) / 4.0
+        mom = _gauss(rs_val, 57, 18) if rs_val is not None else 0.4
+        mac = (0.6 if (hist is not None and hist_prev is not None and hist < hist_prev) else 0.0) + (0.4 if (hist is not None and hist < 0) else 0.0)
+        rsc = clamp((0.5 - (rs3m or 0) / 12.0), 0, 1)
+        candle = 1.0 if bars[-1]["c"] <= bars[-1]["o"] else 0.4
+    volsc = 1.0 if (avg20 and avg5 < avg20) else 0.4   # healthy pullbacks come on lighter volume
+    rrsc = min(1.0, (rr or 0) / 3.0)
+
+    weights = {"location": 0.26, "trend": 0.18, "momentum": 0.12, "macd": 0.10,
+               "rs": 0.14, "volume": 0.06, "candle": 0.06, "rr": 0.08}
+    subs = {"location": loc, "trend": tr, "momentum": mom, "macd": mac,
+            "rs": rsc, "volume": volsc, "candle": candle, "rr": rrsc}
+    score = round(clamp(100 * sum(weights[k] * subs[k] for k in weights)), 1)
+    sub_scores = {k: round(subs[k] * 100) for k in subs}
+
+    in_pocket = 0.382 <= depth <= 0.618
+    status = "Ready" if (in_pocket and score >= 55) else ("Approaching" if 0.25 <= depth <= 0.75 else "Extended")
+    bias = "with-trend" if (direction == "long" and trend == "up") or (direction == "short" and trend == "down") else "counter-trend"
+    label = "%s %s pullback to 50%%%s" % (
+        ("Bullish" if direction == "long" else "Bearish"), bias,
+        " · RS+" if (rs3m or 0) > 0 else " · RS-")
 
     return {
         "symbol": symbol, "name": SECTOR_NAME.get(symbol, ""), "tf": tf, "ok": True,
-        "direction": direction, "trend": trend, "status": status,
+        "direction": direction, "trend": trend, "status": status, "bias": bias, "label": label,
         "price": round(close, 2), "swingHigh": round(HH, 2), "swingLow": round(LL, 2),
-        "fib50": round(fib50, 2), "depth": round(depth, 3), "dist50": round(dist50, 2),
-        "entry": round(entry, 2), "stop": stop, "target": target, "rr": rr, "score": score,
+        "fib50": fib50, "depth": round(depth, 3), "dist50": round(dist50, 2),
+        "entry": round(entry, 2), "zoneHi": levels["0.382"], "zoneLo": levels["0.618"],
+        "stop": stop, "target": target, "target2": target2, "rr": rr,
+        "score": score, "subScores": sub_scores,
+        "rsi": round(rs_val, 1) if rs_val is not None else None,
+        "macdHist": round(hist, 3) if hist is not None else None,
+        "atr": round(av, 2), "rs3m": rs3m, "rs1m": rs1m,
         "sma20": round(s20, 2) if s20 else None, "sma50": round(s50, 2) if s50 else None,
         "sma200": round(s200, 2) if s200 else None,
-        "fibLevels": levels,
-        "barsCount": len(bars),
+        "fibLevels": levels, "barsCount": len(bars),
     }
 
 
+def rs_vs_spy(symbol, n=63):
+    a, b = get_bars(symbol), get_bars(BENCH)
+    if not a or not b:
+        return None
+    ca, cb = [x["c"] for x in a], [x["c"] for x in b]
+    ra, rb = pct_return(ca, n), pct_return(cb, n)
+    return round(ra - rb, 2) if (ra is not None and rb is not None) else None
+
+
 def build_entries(symbols, tf="daily"):
-    rows = []
-    for s in symbols:
-        a = analyze(s, tf)
-        if a.get("ok"):
-            rows.append(a)
-    # sort: ready first, then closeness to the 50% level
-    rows.sort(key=lambda r: (0 if r["status"] == "Ready" else 1 if r["status"] == "Approaching" else 2,
-                             abs(r["depth"] - 0.5)))
+    rows = [a for a in (analyze(s, tf) for s in symbols) if a.get("ok")]
+    rank = {"Ready": 0, "Approaching": 1, "Extended": 2}
+    rows.sort(key=lambda r: (rank.get(r["status"], 3), -r["score"]))
     return {"tf": tf, "rows": rows, "warm": warm_status()}
 
 
@@ -463,21 +633,22 @@ def rotation():
 
 
 def chart_data(symbol, tf="daily", n=120):
-    daily = get_bars(symbol)
-    if not daily:
+    bars, pivots = pivots_for(symbol, tf)
+    if not bars:
         return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up"}
-    bars = resample_weekly(daily) if tf == "weekly" else daily
     a = analyze(symbol, tf)
     show = bars[-n:]
+    offset = len(bars) - len(show)
     closes = [b["c"] for b in bars]
-    # SMA series aligned to the shown window
+
     def sma_series(period):
-        out = []
-        for i in range(len(bars) - len(show), len(bars)):
-            out.append(round(sum(closes[i - period + 1:i + 1]) / period, 2) if i >= period - 1 else None)
-        return out
+        return [round(sum(closes[i - period + 1:i + 1]) / period, 2) if i >= period - 1 else None
+                for i in range(offset, len(bars))]
+
+    # pivots within the shown window (x = index in show)
+    pv = [{"x": i - offset, "price": round(p, 2), "type": t} for (i, p, t) in pivots if i >= offset]
     return {"symbol": symbol, "tf": tf, "ok": a.get("ok", False), "setup": a,
-            "bars": show, "sma20": sma_series(20), "sma50": sma_series(50)}
+            "bars": show, "sma20": sma_series(20), "sma50": sma_series(50), "pivots": pv}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,7 +696,7 @@ def fetch_news():
         items.append({"headline": head, "source": n.get("source", ""), "url": n.get("url", ""),
                       "summary": (n.get("summary", "") or "")[:280], "datetime": n.get("datetime", 0),
                       "related": n.get("related", ""), "category": cat, "sentiment": sent, "impact": impact})
-    items.sort(key=lambda x: (x["impact"], x["datetime"]), reverse=True)
+    items.sort(key=lambda x: x["datetime"], reverse=True)  # chronological, newest first
     return {"items": items}
 
 
@@ -542,7 +713,9 @@ def news_loop():
 # ─────────────────────────────────────────────────────────────────────────────
 FAIRECONOMY_FEEDS = ["https://nfs.faireconomy.media/ff_calendar_thisweek.json",
                      "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]
-CALENDAR_COUNTRIES = set(c.strip().upper() for c in os.environ.get("CALENDAR_COUNTRIES", "USD,EUR,GBP,JPY,CNY,CAD").split(",") if c.strip())
+# Broad default so the UI can filter currencies; set CALENDAR_COUNTRIES="" for all.
+CALENDAR_COUNTRIES = set(c.strip().upper() for c in os.environ.get(
+    "CALENDAR_COUNTRIES", "USD,EUR,GBP,JPY,CAD,AUD,CHF,NZD,CNY").split(",") if c.strip())
 
 
 def _parse_num(s):
@@ -650,7 +823,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("sectors", 120) or _cache_and_return("sectors", rotation))
         elif path == "/api/entries":
             syms = [s.strip().upper() for s in (qs.get("symbols", [""])[0]).split(",") if s.strip()] \
-                   or ([s for s, _ in SECTORS] + WATCHLIST)
+                   or [s for s, _ in SECTORS]   # sector ETFs only by default
             ck = "entries:%s:%s" % (tf, ",".join(syms))
             self._json(cache_get(ck, 120) or _cache_and_return(ck, lambda: build_entries(syms, tf)))
         elif path == "/api/chart":

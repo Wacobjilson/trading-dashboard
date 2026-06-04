@@ -54,6 +54,12 @@
   .kv{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;border-bottom:1px solid var(--border);}
   .q-Leading{color:var(--up);}.q-Weakening{color:var(--amber);}.q-Improving{color:var(--accent);}.q-Lagging{color:var(--down);}
   svg text{font-family:"JetBrains Mono",monospace;}
+  .cd-bar{position:sticky;top:81px;z-index:8;display:flex;align-items:center;gap:10px;justify-content:center;
+    padding:6px 16px;font-size:13px;background:var(--panelAlt);border-bottom:1px solid var(--border);}
+  .cd-hidden{display:none;}
+  .cd-time{font-weight:700;font-size:15px;}
+  .cd-soon{background:rgba(245,166,35,.15);} .cd-imminent{background:rgba(255,77,79,.18);animation:pulse 1s infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
 </style>
 </head>
 <body>
@@ -69,6 +75,7 @@
   <button data-tab="news">News</button>
   <button data-tab="calendar">Calendar</button>
 </nav>
+<div id="countdown" class="cd-bar cd-hidden"></div>
 <main>
   <!-- ROTATION -->
   <section class="tab active" id="tab-rotation">
@@ -87,14 +94,15 @@
       <div class="ctl">
         <span class="seg" id="ent-tf"><button data-tf="daily" class="on">Daily</button><button data-tf="weekly">Weekly</button></span>
         <span class="seg" id="ent-filter"><button data-f="all" class="on">All</button><button data-f="ready">Ready only</button></span>
-        <input class="ipt" id="ent-syms" style="flex:1;min-width:260px" placeholder="symbols (blank = sectors + watchlist)" />
+        <input class="ipt" id="ent-syms" style="flex:1;min-width:260px" placeholder="blank = all 11 SPDR sector ETFs (or type symbols)" />
         <button class="go" id="ent-go">Scan</button>
       </div>
       <div id="ent-result"><div class="loading">Scanning for 50% retracement setups…</div></div>
-      <div class="note">Setups: recent swing high/low → Fibonacci. <b>Ready</b> = price in the 38.2–61.8% "golden
-        pocket" (around the 50% retracement). <b>Dir</b> long = pullback in an up-leg (buy the dip); short =
-        bounce in a down-leg. Stop = swing extreme, target = prior swing. Click a row to chart it.
-        Heuristic scan — confirm on your own chart.</div>
+      <div class="note">Swings come from an ATR-scaled <b>ZigZag</b> (real pivots). <b>Score</b> is a multi-factor
+        confluence (hover it for the breakdown): location in the 38.2–61.8% golden pocket, trend alignment,
+        RSI posture, MACD momentum, relative strength vs SPY, pullback volume, reversal candle, and R:R.
+        <b>Ready</b> = in the pocket with score ≥ 55. Stop is ATR-buffered below structure; targets are the prior
+        swing and a 1.272 extension. Click a row to chart it. Heuristic scan — always confirm on your own chart.</div>
     </div>
   </section>
 
@@ -127,11 +135,18 @@
 
   <!-- CALENDAR -->
   <section class="tab" id="tab-calendar">
-    <div class="cols cols2">
-      <div class="card"><h2>Economic Events (7d)</h2><div id="cal-econ"><div class="loading">Loading…</div></div></div>
-      <div class="card"><h2>Earnings (7d)</h2><div id="cal-earn"><div class="loading">Loading…</div></div></div>
+    <div class="card">
+      <div class="ctl">
+        <span class="muted" style="font-size:12px">Impact</span>
+        <span class="seg" id="cal-imp"><button data-i="High" class="on">High</button><button data-i="Medium" class="on">Medium</button><button data-i="Low">Low</button></span>
+        <span class="muted" style="font-size:12px;margin-left:8px">Currency</span>
+        <select class="ipt" id="cal-ccy"><option value="">All</option></select>
+        <span class="seg" id="cal-when" style="margin-left:8px"><button data-w="all" class="on">7 days</button><button data-w="today">Today</button></span>
+      </div>
+      <div id="cal-econ"><div class="loading">Loading…</div></div>
+      <div class="note" id="cal-notes"></div>
     </div>
-    <div class="note" id="cal-notes"></div>
+    <div class="card"><h2>Earnings (7d)</h2><div id="cal-earn"><div class="loading">Loading…</div></div></div>
   </section>
 </main>
 
@@ -163,7 +178,7 @@ function activate(t){
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
   if(t==="markets"&&!loaded.markets){loadQuotes();loaded.markets=true;}
   if(t==="news"&&!loaded.news){loadNews();loaded.news=true;}
-  if(t==="calendar"&&!loaded.calendar){loadCalendar();loaded.calendar=true;}
+  if(t==="calendar"){ if(!loaded.calendar){loadCalendarData();loaded.calendar=true;} else renderCalendar(); }
 }
 
 // ── ROTATION ──
@@ -225,7 +240,7 @@ document.querySelectorAll("#ent-filter button").forEach(b=>b.onclick=()=>{docume
 document.getElementById("ent-go").onclick=runEntries;
 document.getElementById("ent-syms").addEventListener("keydown",e=>{if(e.key==="Enter")runEntries();});
 const ENT_COLS=[
-  {k:"symbol",l:"Sym",r:o=>`<b>${o.symbol}</b>`},
+  {k:"symbol",l:"Sym",r:o=>`<b title="${o.label||''}">${o.symbol}</b><div class="news-meta">${o.name||""}</div>`},
   {k:"direction",l:"Dir",r:o=>`<span class="badge ${o.direction==='long'?'b-long':'b-short'}">${o.direction}</span>`},
   {k:"trend",l:"Trend",r:o=>`<span class="${o.trend==='up'?'up':o.trend==='down'?'down':'muted'}">${o.trend}</span>`},
   {k:"status",l:"Status",r:o=>statusBadge(o.status)},
@@ -235,10 +250,13 @@ const ENT_COLS=[
   {k:"swingHigh",l:"Swing Hi",r:o=>`<span class="mono muted">${fmt(o.swingHigh)}</span>`},
   {k:"depth",l:"Retr.",r:o=>`<span class="mono">${(o.depth*100).toFixed(0)}%</span>`},
   {k:"dist50",l:"Dist→50%",r:o=>`<span class="mono ${Math.abs(o.dist50)<=1.5?'amber':'muted'}">${pct(o.dist50)}</span>`},
+  {k:"rsi",l:"RSI",r:o=>`<span class="mono ${o.rsi==null?'muted':o.rsi<35?'up':o.rsi>70?'down':'muted'}">${o.rsi==null?'—':o.rsi.toFixed(0)}</span>`},
+  {k:"rs3m",l:"RS 3m",r:o=>`<span class="mono ${dir(o.rs3m)}">${o.rs3m==null?'—':pct(o.rs3m)}</span>`},
   {k:"stop",l:"Stop",r:o=>`<span class="mono down">${fmt(o.stop)}</span>`},
   {k:"target",l:"Target",r:o=>`<span class="mono up">${fmt(o.target)}</span>`},
   {k:"rr",l:"R:R",r:o=>`<span class="mono">${o.rr?o.rr.toFixed(2):"—"}</span>`},
-  {k:"score",l:"Score",r:o=>`<span class="mono ${o.score>=66?'up':o.score>=45?'amber':'muted'}">${o.score}</span>`},
+  {k:"score",l:"Score",r:o=>{const s=o.subScores||{};const tip=Object.keys(s).map(k=>`${k}: ${s[k]}`).join(" · ");
+    return `<span class="mono ${o.score>=66?'up':o.score>=45?'amber':'muted'}" title="confluence — ${tip}">${o.score}</span>`;}},
 ];
 async function runEntries(){
   const syms=document.getElementById("ent-syms").value.trim();
@@ -313,7 +331,14 @@ function drawChart(d){
   // SMA polylines
   const poly=(arr,col)=>{let pts=arr.map((v,i)=>v==null?null:`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean).join(" ");return pts?`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.2" opacity=".9"/>`:"";};
   g+=poly(d.sma20,"#3b82f6"); g+=poly(d.sma50,"#a855f7");
-  g+=`<text x="${padL+2}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+54}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text>`;
+  // ZigZag pivots + connecting line (the detected swing structure)
+  const pv=d.pivots||[];
+  if(pv.length){
+    const pts=pv.map(p=>`${X(p.x).toFixed(1)},${Y(p.price).toFixed(1)}`).join(" ");
+    g+=`<polyline points="${pts}" fill="none" stroke="#8893a3" stroke-width="1" opacity=".55"/>`;
+    pv.forEach(p=>{const col=p.type==='H'?"var(--down)":"var(--up)";g+=`<circle cx="${X(p.x).toFixed(1)}" cy="${Y(p.price).toFixed(1)}" r="3" fill="${col}"/>`;});
+  }
+  g+=`<text x="${padL+2}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+54}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text><text x="${padL+106}" y="${H-6}" fill="#8893a3" font-size="10">ZigZag swings</text>`;
   g+=`</svg>`;
   document.getElementById("ch-svg").innerHTML=g;
 }
@@ -355,27 +380,80 @@ async function loadNews(){
 }
 
 // ── CALENDAR ──
-async function loadCalendar(){
-  try{const d=await(await fetch(`${API}/api/calendar`)).json();
-    const econ=document.getElementById("cal-econ"),earn=document.getElementById("cal-earn");
-    const impCol=i=>i==="High"?"var(--down)":i==="Medium"?"var(--amber)":"var(--muted)";
-    const surp=s=>s==null?'<span class="muted">—</span>':`<span class="${s>=0?'up':'down'}">${s>0?'+':''}${s}%</span>`;
-    econ.innerHTML=(d.economic&&d.economic.length)?
-      "<table><thead><tr><th>When</th><th>Imp</th><th>Ctry</th><th>Event</th><th>Act</th><th>Est</th><th>Surp</th></tr></thead><tbody>"+
-      d.economic.map(e=>`<tr><td class="mono">${(e.time||"").slice(5,16).replace('T',' ')}</td><td><span class="dot" style="background:${impCol(e.impact)}"></span></td><td class="muted">${e.country||""}</td><td>${e.event||""}</td><td class="mono">${e.actual||"—"}</td><td class="mono">${e.estimate||"—"}</td><td class="mono">${surp(e.surprise)}</td></tr>`).join("")+"</tbody></table>"
-      :'<div class="muted" style="padding:8px">No economic events.</div>';
-    earn.innerHTML=(d.earnings&&d.earnings.length)?
-      "<table><thead><tr><th>Date</th><th>Sym</th><th>When</th><th>EPS est</th></tr></thead><tbody>"+
-      d.earnings.map(e=>`<tr><td class="mono">${e.date||""}</td><td><b>${e.symbol||""}</b></td><td class="muted">${e.hour||""}</td><td class="mono">${e.epsEstimate??"—"}</td></tr>`).join("")+"</tbody></table>"
-      :'<div class="muted" style="padding:8px">No earnings.</div>';
-    document.getElementById("cal-notes").textContent=(d.notes||[]).join("  ");
+let CAL={economic:[],earnings:[],notes:[]};
+let calImp=new Set(["High","Medium"]), calCcy="", calWhen="all", calCcyFilled=false;
+const impCol=i=>i==="High"?"var(--down)":i==="Medium"?"var(--amber)":"var(--muted)";
+
+document.querySelectorAll("#cal-imp button").forEach(b=>b.onclick=()=>{
+  b.classList.toggle("on"); const i=b.dataset.i; if(b.classList.contains("on"))calImp.add(i);else calImp.delete(i); renderCalendar();});
+document.querySelectorAll("#cal-when button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#cal-when button").forEach(x=>x.classList.remove("on"));b.classList.add("on");calWhen=b.dataset.w;renderCalendar();});
+document.getElementById("cal-ccy").onchange=e=>{calCcy=e.target.value;renderCalendar();};
+
+async function loadCalendarData(){
+  try{
+    CAL=await(await fetch(`${API}/api/calendar`)).json();
+    if(!calCcyFilled){
+      const ccys=[...new Set((CAL.economic||[]).map(e=>e.country).filter(Boolean))].sort();
+      document.getElementById("cal-ccy").innerHTML='<option value="">All</option>'+ccys.map(c=>`<option value="${c}">${c}</option>`).join("");
+      calCcyFilled=true;
+    }
+    renderCalendar(); tickCountdown();
   }catch(e){document.getElementById("cal-econ").innerHTML='<div class="loading">Calendar failed.</div>';}
 }
+function filteredEcon(){
+  const today=new Date().toDateString();
+  return (CAL.economic||[]).filter(e=>{
+    if(calImp.size && !calImp.has(e.impact))return false;
+    if(calCcy && e.country!==calCcy)return false;
+    if(calWhen==="today" && new Date(e.time).toDateString()!==today)return false;
+    return true;
+  });
+}
+function renderCalendar(){
+  const econ=document.getElementById("cal-econ"),earn=document.getElementById("cal-earn");
+  const surp=s=>s==null?'<span class="muted">—</span>':`<span class="${s>=0?'up':'down'}">${s>0?'+':''}${s}%</span>`;
+  const rows=filteredEcon();
+  econ.innerHTML=rows.length?
+    "<table><thead><tr><th>When</th><th>Imp</th><th>Ccy</th><th>Event</th><th>Actual</th><th>Forecast</th><th>Previous</th><th>Surprise</th></tr></thead><tbody>"+
+    rows.map(e=>{const d=new Date(e.time);const when=isNaN(d)?(e.time||"").slice(5,16):d.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      return `<tr><td class="mono">${when}</td><td><span class="dot" style="background:${impCol(e.impact)}"></span><span class="muted" style="font-size:10px">${e.impact||""}</span></td><td class="muted">${e.country||""}</td><td>${e.event||""}</td><td class="mono ${e.actual?'amber':''}">${e.actual||"—"}</td><td class="mono">${e.estimate||"—"}</td><td class="mono muted">${e.prev||"—"}</td><td class="mono">${surp(e.surprise)}</td></tr>`;}).join("")+"</tbody></table>"
+    :'<div class="muted" style="padding:8px">No economic events match the filter.</div>';
+  earn.innerHTML=(CAL.earnings&&CAL.earnings.length)?
+    "<table><thead><tr><th>Date</th><th>Sym</th><th>When</th><th>EPS est</th></tr></thead><tbody>"+
+    CAL.earnings.map(e=>`<tr><td class="mono">${e.date||""}</td><td><b>${e.symbol||""}</b></td><td class="muted">${e.hour||""}</td><td class="mono">${e.epsEstimate??"—"}</td></tr>`).join("")+"</tbody></table>"
+    :'<div class="muted" style="padding:8px">No earnings.</div>';
+  document.getElementById("cal-notes").textContent=(CAL.notes||[]).join("  ");
+}
+
+// ── COUNTDOWN to next high/medium-impact release ──
+function nextEcon(){
+  const now=Date.now(); let best=null;
+  (CAL.economic||[]).forEach(e=>{
+    if(!(e.impact==="High"||e.impact==="Medium"))return;
+    const t=new Date(e.time).getTime(); if(isNaN(t)||t<now)return;
+    if(!best||t<best.t)best={t,e};});
+  return best;
+}
+function tickCountdown(){
+  const bar=document.getElementById("countdown"); const nx=nextEcon();
+  if(!nx){bar.className="cd-bar cd-hidden";return;}
+  let secs=Math.floor((nx.t-Date.now())/1000);
+  const e=nx.e, hh=String(Math.floor(secs/3600)).padStart(2,'0'),mm=String(Math.floor(secs%3600/60)).padStart(2,'0'),ss=String(secs%60).padStart(2,'0');
+  const tstr=secs>=3600?`${hh}:${mm}:${ss}`:`${mm}:${ss}`;
+  const when=new Date(nx.t).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  bar.className="cd-bar"+(secs<=60?" cd-imminent":secs<=300?" cd-soon":"");
+  bar.innerHTML=`<span class="dot" style="background:${impCol(e.impact)}"></span>
+    <span>Next <b>${e.impact}</b> release: <b>${e.country||""} ${e.event||""}</b> at ${when}</span>
+    <span class="cd-time mono">⏱ ${tstr}</span>
+    <span class="muted" style="font-size:12px">fcst ${e.estimate||"—"} · prev ${e.prev||"—"}</span>`;
+}
+setInterval(tickCountdown,1000);
 
 // ── boot ──
-loadRotation(); loadQuotes();
+loadRotation(); loadQuotes(); loadCalendarData();   // calendar at boot so the countdown runs from any tab
 setInterval(loadQuotes,5000);
 setInterval(()=>{if(document.getElementById("tab-rotation").classList.contains("active"))loadRotation();},60000);
+setInterval(loadCalendarData,300000);   // refresh calendar (and actuals) every 5 min
 </script>
 </body>
 </html>
