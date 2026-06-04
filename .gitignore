@@ -6,6 +6,14 @@
 # Local tooling
 .claude/
 
+# Standalone local API keys (never commit real keys)
+standalone/keys.local.json
+keys.local.json
+
+# Python
+__pycache__/
+*.pyc
+
 # Go
 backend/bin/
 backend/tmp/

@@ -26,10 +26,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ─────────────────────────────────────────────────────────────────────────────
 # Config — edit these, or set env vars of the same name.
 # ─────────────────────────────────────────────────────────────────────────────
+def _load_local_keys():
+    """Load API keys from keys.local.json next to this script, if present.
+    That file is gitignored, so your keys never get committed/pushed."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.local.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+_LOCAL_KEYS = _load_local_keys()
+
+# Resolution order per provider: environment variable → keys.local.json → empty.
+# Do NOT hardcode keys here — this file is committed to git.
 API_KEYS = {
-    "polygon": os.environ.get("POLYGON_API_KEY", ""),
-    "finnhub": os.environ.get("FINNHUB_API_KEY", ""),
-    "alphavantage": os.environ.get("ALPHAVANTAGE_API_KEY", ""),
+    "polygon": os.environ.get("POLYGON_API_KEY") or _LOCAL_KEYS.get("polygon", ""),
+    "finnhub": os.environ.get("FINNHUB_API_KEY") or _LOCAL_KEYS.get("finnhub", ""),
+    "alphavantage": os.environ.get("ALPHAVANTAGE_API_KEY") or _LOCAL_KEYS.get("alphavantage", ""),
 }
 # Pin a provider ("polygon" | "finnhub" | "alphavantage" | "mock"), or "" to
 # auto-pick the first one with a key set.
@@ -254,7 +269,12 @@ def main():
     print("  refresh  : every %ds" % REFRESH_SECONDS)
     print("  open     : http://localhost:%d/" % PORT)
     threading.Thread(target=refresh_loop, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down")
+        server.shutdown()
 
 
 if __name__ == "__main__":

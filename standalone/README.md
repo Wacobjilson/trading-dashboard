@@ -25,8 +25,18 @@ You can also just **double-click `index.html`** — it falls back to calling
 
 ## Configure
 
-Either set environment variables, or edit the `API_KEYS` / settings block at the
-top of [`quanta.py`](./quanta.py):
+**Keys (recommended — keeps them out of git):** copy the example file and fill it in:
+
+```bash
+cp keys.local.json.example keys.local.json
+# then edit keys.local.json with your keys
+```
+
+`keys.local.json` is gitignored, so it never gets committed. The server loads keys
+in this order per provider: **environment variable → keys.local.json → empty**.
+Do **not** hardcode keys inside `quanta.py` — that file is tracked by git.
+
+Other settings (env vars):
 
 | Variable | Meaning |
 |----------|---------|
