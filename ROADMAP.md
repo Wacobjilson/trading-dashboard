@@ -28,7 +28,7 @@ Stages 3–4 and 7 for single-user use, on Finnhub free-tier data:
 - [x] Tabbed morning-debrief UI: Brief / Markets / News / Calendar / Screener
 - [x] AI morning brief (optional Anthropic; rule-based fallback)
 - [x] News: auto-categorized + sentiment + impact (keyword classifier)
-- [x] Calendar: earnings (economic where the data plan allows)
+- [x] Calendar: economic events (free FairEconomy/ForexFactory feed, w/ forecast/actual/surprise) + earnings
 - [x] Screener: watchlist fundamentals + heuristic Bull/Bear/Momentum/Risk scores
 
 The full-stack stages below remain the target for the production (Go/React/K8s) build.

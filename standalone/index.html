@@ -95,6 +95,7 @@
       <div class="card"><h2>Leaders / Laggards</h2><div id="brief-movers"></div></div>
       <div class="card"><h2>Top Headlines</h2><div id="brief-news"></div></div>
     </div>
+    <div class="card"><h2>On the Calendar</h2><div id="brief-events"></div></div>
   </section>
 
   <section class="tab" id="tab-markets">
@@ -218,6 +219,11 @@ async function loadBrief(){
        <div class="down" style="font-size:11px;margin:8px 0 4px">▼ LAGGARDS</div>${(mv.down||[]).map(row).join("")}`;
     document.getElementById("brief-news").innerHTML=(d.headlines||[]).map(h=>
       `<div style="padding:4px 0">${sentBadge(h.sentiment)}<span class="badge b-neu">${h.category}</span> ${h.headline}</div>`).join("")||'<span class="muted">No headlines (needs a Finnhub key).</span>';
+    const impCol=i=>i==="High"?"var(--down)":i==="Medium"?"var(--amber)":"var(--muted)";
+    document.getElementById("brief-events").innerHTML=(d.events||[]).map(e=>
+      `<div style="display:flex;justify-content:space-between;padding:3px 0">
+         <span><span class="dot" style="background:${impCol(e.impact)}"></span><span class="mono muted" style="font-size:11px">${(e.time||e.date||"").slice(5,16).replace('T',' ')}</span> ${e.event||e.symbol||""} <span class="muted">${e.country||""}</span></span>
+         <span class="mono muted" style="font-size:12px">${e.estimate?'est '+e.estimate:''}${e.actual?' · act '+e.actual:''}</span></div>`).join("")||'<span class="muted">No notable events.</span>';
   }catch(e){document.getElementById("brief-text").textContent="Couldn't load the brief.";}
 }
 
@@ -241,10 +247,13 @@ async function loadCalendar(){
   try{
     const d=await(await fetch(`${API}/api/calendar`)).json();
     const econ=document.getElementById("cal-econ"), earn=document.getElementById("cal-earn");
+    const impCol=i=>i==="High"?"var(--down)":i==="Medium"?"var(--amber)":"var(--muted)";
+    const dot=i=>`<span class="dot" style="background:${impCol(i)}"></span>`;
+    const surp=s=>s==null?'<span class="muted">—</span>':`<span class="${s>=0?'up':'down'}">${s>0?'+':''}${s}%</span>`;
     econ.innerHTML=(d.economic&&d.economic.length)?
-      "<table><thead><tr><th>Date</th><th>Event</th><th>Ctry</th><th>Est</th><th>Prev</th></tr></thead><tbody>"+
-      d.economic.map(e=>`<tr><td class="mono">${(e.time||e.date||"").slice(0,16)}</td><td>${e.event||""}</td><td class="muted">${e.country||""}</td><td class="mono">${e.estimate??"—"}</td><td class="mono muted">${e.prev??"—"}</td></tr>`).join("")+"</tbody></table>"
-      : '<div class="muted" style="padding:8px">No economic events (often needs a paid data plan).</div>';
+      "<table><thead><tr><th>When</th><th>Imp</th><th>Ctry</th><th>Event</th><th>Act</th><th>Est</th><th>Prev</th><th>Surp</th></tr></thead><tbody>"+
+      d.economic.map(e=>`<tr><td class="mono">${(e.time||e.date||"").slice(5,16).replace('T',' ')}</td><td>${dot(e.impact)}</td><td class="muted">${e.country||""}</td><td>${e.event||""}</td><td class="mono">${e.actual||"—"}</td><td class="mono">${e.estimate||"—"}</td><td class="mono muted">${e.prev||"—"}</td><td class="mono">${surp(e.surprise)}</td></tr>`).join("")+"</tbody></table>"
+      : '<div class="muted" style="padding:8px">No economic events for the current window.</div>';
     earn.innerHTML=(d.earnings&&d.earnings.length)?
       "<table><thead><tr><th>Date</th><th>Sym</th><th>When</th><th>EPS est</th></tr></thead><tbody>"+
       d.earnings.map(e=>`<tr><td class="mono">${e.date||""}</td><td style="font-weight:600">${e.symbol||""}</td><td class="muted">${e.hour||""}</td><td class="mono">${e.epsEstimate??"—"}</td></tr>`).join("")+"</tbody></table>"

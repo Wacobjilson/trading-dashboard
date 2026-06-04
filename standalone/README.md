@@ -11,11 +11,12 @@ no database, no login. Just Python 3 (standard library only) serving one HTML pa
 | **Brief** | Morning debrief: risk tone, index/futures posture, leaders/laggards, top headlines, today's events. Rule-based, or an AI-written narrative if an Anthropic key is set. |
 | **Markets** | Live index / futures / macro grid + heat tiles (SPY, QQQ, IWM, DIA, VIX, ES, NQ, RTY, CL, GC, US10Y, DXY). |
 | **News** | Market news auto-categorized (Fed, Inflation, Jobs, Earnings, M&A, …) with bullish/bearish sentiment + impact bars. |
-| **Calendar** | Earnings (next 7d) and, where your data plan allows, economic events. |
+| **Calendar** | Economic events (CPI, NFP, FOMC, GDP…) with forecast/previous/actual + surprise %, plus earnings (next 7d). |
 | **Screener** | Type a watchlist → fundamentals (P/E, market cap, margins, growth, 52w position, beta) + heuristic Bull/Bear/Momentum/Risk scores. |
 
 > Data comes from Finnhub (free tier covers quotes, news, earnings, fundamentals).
-> Economic-calendar data needs a paid Finnhub plan; it degrades gracefully when absent.
+> Economic events come from a free, keyless weekly feed (FairEconomy / ForexFactory)
+> — filter currencies with `CALENDAR_COUNTRIES` (default `USD,EUR,GBP,JPY,CNY,CAD`).
 > The AI brief is optional — set an `anthropic` key to enable it.
 
 ## Run it

@@ -323,41 +323,92 @@ def _date_range(days_ahead=7):
     return today.isoformat(), (today + dt.timedelta(days=days_ahead)).isoformat()
 
 
+# Economic events: free, keyless weekly feed (FairEconomy / ForexFactory JSON).
+# Fields per event: title, country (currency code), date (ISO w/ TZ), impact
+# (High|Medium|Low|Holiday), forecast, previous, actual.
+FAIRECONOMY_FEEDS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+]
+# Filter to these currencies/countries (set CALENDAR_COUNTRIES="" for all).
+CALENDAR_COUNTRIES = set(c.strip().upper() for c in os.environ.get(
+    "CALENDAR_COUNTRIES", "USD,EUR,GBP,JPY,CNY,CAD").split(",") if c.strip())
+
+
+def _parse_num(s):
+    """Best-effort numeric parse of values like '3.2%', '-0.1', '210K', '1.5M'."""
+    if s is None:
+        return None
+    t = str(s).strip().replace(",", "")
+    if t in ("", "-"):
+        return None
+    mult = 1.0
+    if t and t[-1] in "KkMmBbTt":
+        mult = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[t[-1].lower()]
+        t = t[:-1]
+    neg = t.startswith("-")
+    num = "".join(ch for ch in t if ch.isdigit() or ch == ".")
+    if num in ("", "."):
+        return None
+    try:
+        v = float(num) * mult
+        return -v if neg else v
+    except ValueError:
+        return None
+
+
+def fetch_economic():
+    """Pull the free weekly economic calendar and normalize + compute surprise %."""
+    events = []
+    for url in FAIRECONOMY_FEEDS:
+        try:
+            data = http_get_json(url)
+        except Exception:
+            continue
+        for e in data:
+            country = (e.get("country") or "").upper()
+            if CALENDAR_COUNTRIES and country not in CALENDAR_COUNTRIES:
+                continue
+            ts = e.get("date", "") or ""
+            fc, prev, act = e.get("forecast", ""), e.get("previous", ""), e.get("actual", "")
+            f, a = _parse_num(fc), _parse_num(act)
+            surprise = round((a - f) / abs(f) * 100, 1) if (f is not None and a is not None and f != 0) else None
+            events.append({
+                "date": ts[:10], "time": ts, "country": country, "event": e.get("title", ""),
+                "impact": e.get("impact", ""), "estimate": fc, "prev": prev,
+                "actual": act, "surprise": surprise,
+            })
+    events.sort(key=lambda x: x["time"])
+    return events
+
+
 def fetch_calendar():
     out = {"earnings": [], "economic": [], "notes": []}
-    if not API_KEYS.get("finnhub"):
-        out["notes"].append("Finnhub key required for calendar data.")
-        return out
-    frm, to = _date_range(7)
-    tok = urllib.parse.quote(API_KEYS["finnhub"])
-    # Earnings
+    # Economic events — free keyless feed (no API key needed).
     try:
-        url = "%s/calendar/earnings?from=%s&to=%s&token=%s" % (FINNHUB, frm, to, tok)
-        ec = http_get_json(url).get("earningsCalendar", []) or []
-        for e in ec[:80]:
-            out["earnings"].append({
-                "date": e.get("date"), "symbol": e.get("symbol"),
-                "hour": e.get("hour", ""), "epsEstimate": e.get("epsEstimate"),
-                "epsActual": e.get("epsActual"), "revenueEstimate": e.get("revenueEstimate"),
-                "revenueActual": e.get("revenueActual"),
-            })
+        out["economic"] = fetch_economic()
+        if not out["economic"]:
+            out["notes"].append("No economic events for the current window.")
     except Exception as e:
-        out["notes"].append("Earnings calendar unavailable (%s)." % e)
-    # Economic (premium on many plans → degrade gracefully)
-    try:
-        url = "%s/calendar/economic?token=%s" % (FINNHUB, tok)
-        ev = http_get_json(url).get("economicCalendar", []) or []
-        for x in ev:
-            d = x.get("time", "")[:10]
-            if frm <= d <= to:
-                out["economic"].append({
-                    "date": d, "time": x.get("time", ""), "country": x.get("country", ""),
-                    "event": x.get("event", ""), "impact": x.get("impact", ""),
-                    "actual": x.get("actual"), "estimate": x.get("estimate"), "prev": x.get("prev"),
+        out["notes"].append("Economic feed unavailable (%s)." % e)
+    # Earnings — Finnhub (needs a key).
+    if API_KEYS.get("finnhub"):
+        frm, to = _date_range(7)
+        tok = urllib.parse.quote(API_KEYS["finnhub"])
+        try:
+            url = "%s/calendar/earnings?from=%s&to=%s&token=%s" % (FINNHUB, frm, to, tok)
+            ec = http_get_json(url).get("earningsCalendar", []) or []
+            for e in ec[:100]:
+                out["earnings"].append({
+                    "date": e.get("date"), "symbol": e.get("symbol"),
+                    "hour": e.get("hour", ""), "epsEstimate": e.get("epsEstimate"),
+                    "epsActual": e.get("epsActual"), "revenueEstimate": e.get("revenueEstimate"),
+                    "revenueActual": e.get("revenueActual"),
                 })
-        out["economic"].sort(key=lambda r: r["time"])
-    except Exception:
-        out["notes"].append("Economic calendar needs a paid Finnhub plan — showing earnings only.")
+        except Exception as e:
+            out["notes"].append("Earnings calendar unavailable (%s)." % e)
+    else:
+        out["notes"].append("Set a Finnhub key to see the earnings calendar.")
     return out
 
 
@@ -467,7 +518,8 @@ def build_brief():
         "movers": {"up": up, "down": dn},
         "headlines": [{"headline": n["headline"], "category": n["category"],
                        "sentiment": n["sentiment"]} for n in news],
-        "events": cal.get("economic", [])[:6] or cal.get("earnings", [])[:6],
+        "events": ([e for e in cal.get("economic", []) if e.get("impact") in ("High", "Medium")][:6]
+                   or cal.get("economic", [])[:6] or cal.get("earnings", [])[:6]),
         "summary": rule_text, "ai": False,
     }
 
@@ -484,8 +536,11 @@ def build_brief():
 def ai_brief(quotes, news, cal):
     snap = "\n".join("%s: %.2f (%+.2f%%)" % (q["symbol"], q["last"], q["changePercent"]) for q in quotes)
     heads = "\n".join("- [%s/%s] %s" % (n["category"], n["sentiment"], n["headline"]) for n in news[:8])
-    events = "\n".join("- %s %s %s" % (e.get("date", ""), e.get("event", e.get("symbol", "")),
-                                       e.get("country", "")) for e in (cal.get("economic") or cal.get("earnings") or [])[:8])
+    econ = [e for e in cal.get("economic", []) if e.get("impact") in ("High", "Medium")] or cal.get("economic", [])
+    events = "\n".join("- %s [%s] %s %s (est %s, prev %s%s)" % (
+        e.get("date", ""), e.get("impact", ""), e.get("country", ""), e.get("event", ""),
+        e.get("estimate") or "—", e.get("prev") or "—",
+        ", actual %s" % e["actual"] if e.get("actual") else "") for e in econ[:8])
     prompt = (
         "You are a markets desk analyst writing a concise pre-market morning brief for an "
         "active retail trader who also uses ThinkOrSwim. Use ONLY the data below. 120-180 words, "
