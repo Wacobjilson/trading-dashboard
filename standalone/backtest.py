@@ -66,7 +66,7 @@ def align_spy_weekly(sym_weekly, spy_weekly):
     return out
 
 
-def simulate(bars, spy_closes, sym, tf):
+def simulate(bars, spy_closes, sym, tf, params):
     """Walk forward; return list of completed trades."""
     trades = []
     maxhold = MAXHOLD[tf]
@@ -74,8 +74,8 @@ def simulate(bars, spy_closes, sym, tf):
     prev_ready = False
     n = len(bars)
     while i < n - 1:
-        a = q.analyze_bars(bars[:i + 1], sym, tf, spy_closes[:i + 1])
-        ready = a.get("ok") and a["status"] == "Ready" and a["score"] >= MIN_SCORE
+        a = q.analyze_bars(bars[:i + 1], sym, tf, spy_closes[:i + 1], params)
+        ready = a.get("ok") and a["status"] == "Ready"
         if ready and a["direction"] in (("long", "short") if DIR_FILTER == "both" else (DIR_FILTER,)) \
            and (not WITH_TREND or a["bias"] == "with-trend") and not prev_ready:
             direction, entry, stop, target = a["direction"], bars[i]["c"], a["stop"], a["target"]
@@ -156,13 +156,26 @@ def fmt_stats(label, s):
                s["avg_win"], s["avg_loss"], s["max_dd_R"], s["max_loss_streak"], s["avg_hold"]))
 
 
+def collect(bars, syms, params):
+    """Run the walk-forward across all timeframes/sectors for one param set."""
+    trades = []
+    for tf in [t.strip() for t in TFS if t.strip() in WARMUP]:
+        spy_bars = q.resample_weekly(bars[q.BENCH]) if tf == "weekly" else bars[q.BENCH]
+        for s in syms:
+            sb = q.resample_weekly(bars[s]) if tf == "weekly" else bars[s]
+            if len(sb) <= WARMUP[tf] + 5:
+                continue
+            spy_aligned = align_spy_weekly(sb, spy_bars) if tf == "weekly" else align_spy_daily(sb, bars[q.BENCH])
+            trades += simulate(sb, spy_aligned, s, tf, params)
+    return trades
+
+
 def main():
     syms = [s for s, _ in q.SECTORS]
     universe = [q.BENCH] + syms
     print("Loading bars for %d symbols (%s)…" % (len(universe),
           "synthetic" if (q.FORCE_SYNTH or not q.API_KEYS.get("polygon")) else "polygon"))
-    bars = {}
-    src = "synth"
+    bars, src = {}, "synth"
     for s in universe:
         b, src = q.load_bars(s)
         bars[s] = b
@@ -170,22 +183,40 @@ def main():
             time.sleep(13)  # respect 5 req/min free tier
     print("  source=%s, bars/symbol≈%d\n" % (src, len(bars[q.BENCH])))
 
-    all_trades = []
-    for tf in TFS:
-        tf = tf.strip()
-        if tf not in WARMUP:
-            continue
-        spy_bars = q.resample_weekly(bars[q.BENCH]) if tf == "weekly" else bars[q.BENCH]
-        for s in syms:
-            sb = q.resample_weekly(bars[s]) if tf == "weekly" else bars[s]
-            if len(sb) <= WARMUP[tf] + 5:
-                continue
-            spy_aligned = align_spy_weekly(sb, spy_bars) if tf == "weekly" else align_spy_daily(sb, bars[q.BENCH])
-            all_trades += simulate(sb, spy_aligned, s, tf)
+    # ── Parameter sweep mode ──
+    if q._envbool("BT_SWEEP", False):
+        grid = [(sm, tm, ms)
+                for sm in ("fib618", "fib786", "swinglow")
+                for tm in ("ext1272", "ext1618", "prior")
+                for ms in (45, 55, 65)]
+        print("SWEEP — %d configs (stop × target × min_score), dir=%s, with_trend=%s\n"
+              % (len(grid), DIR_FILTER, WITH_TREND))
+        results = []
+        for sm, tm, ms in grid:
+            params = {"stop_mode": sm, "stop_buf": 0.25, "target_mode": tm, "min_score": ms}
+            results.append(((sm, tm, ms), stats(collect(bars, syms, params))))
+        results.sort(key=lambda r: (r[1]["expectancy_R"] if r[1] else -9, r[1]["total_R"] if r[1] else -9), reverse=True)
+        print("%-9s %-8s %-4s | %-5s %-7s %-9s %-6s %-8s %-7s" %
+              ("stop", "target", "ms", "n", "win%", "exp(R)", "PF", "totalR", "maxDD"))
+        print("-" * 78)
+        for (sm, tm, ms), s in results:
+            if not s:
+                print("%-9s %-8s %-4d | no trades" % (sm, tm, ms)); continue
+            pf = "inf" if s["profit_factor"] == float("inf") else "%.2f" % s["profit_factor"]
+            print("%-9s %-8s %-4d | %-5d %-7s %-+9.3f %-6s %-+8.1f %-+7.1f" %
+                  (sm, tm, ms, s["n"], s["win%"], s["expectancy_R"], pf, s["total_R"], s["max_dd_R"]))
+        print("\nTop config by expectancy is the first row. Re-run without BT_SWEEP using "
+              "BT_STOP/BT_TGT/BT_MIN_SCORE to see its full per-sector report.")
+        return
+
+    # ── Single run (defaults = your style: stop just outside 61.8%, target 1.272 ext) ──
+    params = {"stop_mode": os.environ.get("BT_STOP", "fib618"), "stop_buf": 0.25,
+              "target_mode": os.environ.get("BT_TGT", "ext1272"), "min_score": int(MIN_SCORE)}
+    all_trades = collect(bars, syms, params)
 
     print("=" * 96)
-    print("QUANTA ENTRY BACKTEST  —  dir=%s  with_trend=%s  min_score=%g  (R = 1 unit of risk)"
-          % (DIR_FILTER, WITH_TREND, MIN_SCORE))
+    print("QUANTA ENTRY BACKTEST  —  entry=50%%  stop=%s(+%.2fATR)  target=%s  min_score=%d  dir=%s  (R=risk)"
+          % (params["stop_mode"], params["stop_buf"], params["target_mode"], params["min_score"], DIR_FILTER))
     print("=" * 96)
     for tf in [t.strip() for t in TFS if t.strip() in WARMUP]:
         print(fmt_stats("OVERALL %s" % tf, stats([t for t in all_trades if t["tf"] == tf])))

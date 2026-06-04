@@ -35,12 +35,15 @@ future bars (stop vs target first; same-bar = stop; else exit after a max hold).
 python backtest.py                       # daily + weekly, both directions (Polygon bars)
 QUANTA_SYNTH_BARS=1 python backtest.py   # synthetic bars (no API, instant)
 BT_DIR=long BT_WITH_TREND=1 python backtest.py   # only with-trend longs
+BT_SWEEP=1 python backtest.py            # grid-search stop × target × min_score, ranked by expectancy
+BT_STOP=fib786 BT_TGT=ext1618 python backtest.py # try a specific level scheme
 ```
 
 Results are in **R-multiples** (R = 1 unit of initial risk): win %, expectancy,
 profit factor, total R, max drawdown, streaks, plus per-timeframe / per-direction /
 per-sector breakdowns and a sample of trades. Knobs: `BT_TF`, `BT_DIR`,
-`BT_WITH_TREND`, `BT_MIN_SCORE`.
+`BT_WITH_TREND`, `BT_MIN_SCORE`, `BT_STOP` (`fib618`|`fib786`|`swinglow`),
+`BT_TGT` (`ext1272`|`ext1618`|`prior`), and `BT_SWEEP`.
 
 > Idealized fills (no slippage/commission), bar-high/low touch logic, conservative
 > same-bar resolution. It validates the logic's *edge*, not live performance.
@@ -50,9 +53,11 @@ per-sector breakdowns and a sample of trades. Knobs: `BT_TF`, `BT_DIR`,
 - **Swing detection:** an ATR-scaled **ZigZag** identifies real pivot highs/lows
   (the reversal threshold adapts to each ETF's volatility), then the most recent
   confirmed pivot defines the active impulse leg and its direction.
-- **50% retracement:** entry = the leg's 50% Fib; the zone is the 38.2–61.8% golden
-  pocket. Stop = swing extreme buffered by 0.5×ATR; targets = prior swing (T1) and a
-  1.272 extension (T2).
+- **50% retracement (default scheme):** entry = the leg's 50% Fib; **stop just
+  outside the 61.8% fib** (0.25×ATR beyond); **target = 1.272 extension**. This is
+  configurable (`DEFAULT_PARAMS` in quanta.py / `BT_STOP`,`BT_TGT` in the backtest) —
+  the backtest sweep showed extension targets give a far better R:R than targeting
+  the prior swing.
 - **Confluence score (0–100)** = weighted blend of: location in the pocket (.26),
   trend alignment vs SMA20/50/200 + slope (.18), RSI posture (.12), MACD momentum
   (.10), relative strength vs SPY (.14), pullback volume (.06), reversal candle (.06),

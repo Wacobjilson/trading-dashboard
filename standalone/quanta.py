@@ -344,6 +344,27 @@ def clamp(x, lo=0.0, hi=100.0):
 
 FIB = [0.236, 0.382, 0.5, 0.618, 0.786]
 
+# Default trade-level scheme: enter at the 50% retracement, stop just outside the
+# 61.8% fib, target the 1.272 extension. (Backtest can sweep these.)
+DEFAULT_PARAMS = {"stop_mode": "fib618", "stop_buf": 0.25, "target_mode": "ext1272", "min_score": 55}
+
+
+def trade_levels(direction, levels, HH, LL, rng, av, p):
+    """Compute (entry, stop, target) for a 50%-entry setup given a level scheme.
+
+    stop_mode: 'fib618' | 'fib786' | 'swinglow'  (stop_buf = ATR multiple beyond it)
+    target_mode: 'ext1272' | 'ext1618' | 'prior' (prior = the swing extreme)"""
+    fibkey = {"fib618": "0.618", "fib786": "0.786"}.get(p["stop_mode"], "0.618")
+    buf = p.get("stop_buf", 0.25) * av
+    entry = levels["0.5"]
+    if direction == "long":
+        stop = (LL if p["stop_mode"] == "swinglow" else levels[fibkey]) - buf
+        target = HH if p["target_mode"] == "prior" else LL + (1.618 if p["target_mode"] == "ext1618" else 1.272) * rng
+    else:
+        stop = (HH if p["stop_mode"] == "swinglow" else levels[fibkey]) + buf
+        target = LL if p["target_mode"] == "prior" else HH - (1.618 if p["target_mode"] == "ext1618" else 1.272) * rng
+    return round(entry, 2), round(stop, 2), round(target, 2)
+
 
 # ── Indicators ───────────────────────────────────────────────────────────────
 def ema_series(vals, n):
@@ -471,14 +492,16 @@ def pivots_for(symbol, tf="daily"):
     return bars, zigzag(bars, zigzag_pct(bars, tf))
 
 
-def analyze_bars(bars, symbol="", tf="daily", spy_closes=None):
+def analyze_bars(bars, symbol="", tf="daily", spy_closes=None, params=None):
     """PURE setup analysis on a given bar list (no global state, no lookahead) —
     used by both the live endpoints and the backtester.
 
-    ATR-scaled ZigZag finds real swing pivots; the entry zone is the 38.2–61.8%
-    'golden pocket' of the most recent impulse leg. The confluence score blends
-    pocket location, trend alignment, RSI, MACD momentum, relative strength vs SPY,
-    pullback volume, a reversal-candle check, and reward:risk (ATR-buffered stop)."""
+    ATR-scaled ZigZag finds real swing pivots; entry is the 50% retracement of the
+    most recent impulse leg; stop/target follow `params` (default: stop just outside
+    the 61.8% fib, target the 1.272 extension). The confluence score blends pocket
+    location, trend alignment, RSI, MACD momentum, relative strength vs SPY, pullback
+    volume, a reversal-candle check, and reward:risk."""
+    p = params or DEFAULT_PARAMS
     if not bars or len(bars) < 40:
         return {"symbol": symbol, "tf": tf, "ok": False, "reason": "not enough bars"}
 
@@ -521,10 +544,8 @@ def analyze_bars(bars, symbol="", tf="daily", spy_closes=None):
     avg20 = sum(vols[-20:]) / 20 if len(vols) >= 20 else (sum(vols) / len(vols) if vols else 0)
     avg5 = sum(vols[-5:]) / 5 if len(vols) >= 5 else avg20
 
-    if direction == "long":
-        entry, stop, target, target2 = fib50, round(LL - 0.5 * av, 2), round(HH, 2), round(LL + 1.272 * rng, 2)
-    else:
-        entry, stop, target, target2 = fib50, round(HH + 0.5 * av, 2), round(LL, 2), round(HH - 1.272 * rng, 2)
+    entry, stop, target = trade_levels(direction, levels, HH, LL, rng, av, p)
+    target2 = round(HH if direction == "long" else LL, 2)   # prior swing, for reference
     risk = abs(entry - stop)
     rr = round(abs(target - entry) / risk, 2) if risk > 0 else None
 
@@ -553,7 +574,7 @@ def analyze_bars(bars, symbol="", tf="daily", spy_closes=None):
     score = round(clamp(100 * sum(weights[k] * subs[k] for k in weights)), 1)
 
     in_pocket = 0.382 <= depth <= 0.618
-    status = "Ready" if (in_pocket and score >= 55) else ("Approaching" if 0.25 <= depth <= 0.75 else "Extended")
+    status = "Ready" if (in_pocket and score >= p["min_score"]) else ("Approaching" if 0.25 <= depth <= 0.75 else "Extended")
     bias = "with-trend" if (direction == "long" and trend == "up") or (direction == "short" and trend == "down") else "counter-trend"
     label = "%s %s pullback to 50%%%s" % (("Bullish" if direction == "long" else "Bearish"), bias,
                                           " · RS+" if (rs3m or 0) > 0 else " · RS-")
