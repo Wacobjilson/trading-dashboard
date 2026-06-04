@@ -24,6 +24,27 @@ Python 3 (standard library only) serving one HTML page.
 > **No Polygon key?** Set `QUANTA_SYNTH_BARS=1` (or just leave it unset) to run the
 > rotation/entries/chart features on **synthetic bars** so you can explore the UI.
 
+## Backtesting
+
+`backtest.py` replays the **exact** entry logic (`analyze_bars`) bar-by-bar over
+history with **no lookahead** — at each bar it only sees data up to that bar. On a
+fresh "Ready" signal it enters at that bar's close, then resolves the trade against
+future bars (stop vs target first; same-bar = stop; else exit after a max hold).
+
+```bash
+python backtest.py                       # daily + weekly, both directions (Polygon bars)
+QUANTA_SYNTH_BARS=1 python backtest.py   # synthetic bars (no API, instant)
+BT_DIR=long BT_WITH_TREND=1 python backtest.py   # only with-trend longs
+```
+
+Results are in **R-multiples** (R = 1 unit of initial risk): win %, expectancy,
+profit factor, total R, max drawdown, streaks, plus per-timeframe / per-direction /
+per-sector breakdowns and a sample of trades. Knobs: `BT_TF`, `BT_DIR`,
+`BT_WITH_TREND`, `BT_MIN_SCORE`.
+
+> Idealized fills (no slippage/commission), bar-high/low touch logic, conservative
+> same-bar resolution. It validates the logic's *edge*, not live performance.
+
 ## Entry algorithm (transparent — not advice)
 
 - **Swing detection:** an ATR-scaled **ZigZag** identifies real pivot highs/lows

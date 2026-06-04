@@ -458,31 +458,34 @@ def _gauss(x, mu, w):
     return math.exp(-((x - mu) / w) ** 2)
 
 
+def zigzag_pct(bars, tf):
+    av = atr(bars, 14) or (bars[-1]["c"] * 0.02)
+    return min(0.15, max(0.02, (av / bars[-1]["c"]) * (3.0 if tf == "daily" else 4.0)))
+
+
 def pivots_for(symbol, tf="daily"):
     daily = get_bars(symbol)
     if not daily:
         return [], []
     bars = resample_weekly(daily) if tf == "weekly" else daily
-    av = atr(bars, 14) or (bars[-1]["c"] * 0.02)
-    pct = min(0.15, max(0.02, (av / bars[-1]["c"]) * (3.0 if tf == "daily" else 4.0)))
-    return bars, zigzag(bars, pct)
+    return bars, zigzag(bars, zigzag_pct(bars, tf))
 
 
-def analyze(symbol, tf="daily"):
-    """Sophisticated 50% retracement setup with multi-factor confluence scoring.
+def analyze_bars(bars, symbol="", tf="daily", spy_closes=None):
+    """PURE setup analysis on a given bar list (no global state, no lookahead) —
+    used by both the live endpoints and the backtester.
 
-    Swing structure is found with an ATR-scaled ZigZag (real pivots, not window
-    max/min). The entry zone is the 38.2–61.8% 'golden pocket' of the most recent
-    impulse leg. The score blends: location in the pocket, trend alignment,
-    RSI posture, MACD momentum, relative strength vs SPY, pullback volume, a
-    reversal-candle check, and reward:risk (ATR-based stop)."""
-    bars, pivots = pivots_for(symbol, tf)
+    ATR-scaled ZigZag finds real swing pivots; the entry zone is the 38.2–61.8%
+    'golden pocket' of the most recent impulse leg. The confluence score blends
+    pocket location, trend alignment, RSI, MACD momentum, relative strength vs SPY,
+    pullback volume, a reversal-candle check, and reward:risk (ATR-buffered stop)."""
     if not bars or len(bars) < 40:
-        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up / no data"}
+        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "not enough bars"}
 
     closes = [b["c"] for b in bars]
     vols = [b.get("v", 0) for b in bars]
     close = closes[-1]
+    pivots = zigzag(bars, zigzag_pct(bars, tf))
 
     LL, HH, _lo_i, _hi_i, direction = active_leg(bars, pivots)
     rng = max(HH - LL, 1e-9)
@@ -507,26 +510,24 @@ def analyze(symbol, tf="daily"):
     av = atr(bars, 14) or rng * 0.05
     rs_val = rsi(closes, 14)
     hist, hist_prev = macd_hist(closes)
-    rs3m = rs_vs_spy(symbol, 63)
-    rs1m = rs_vs_spy(symbol, 21)
+    n3, n1 = (63, 21) if tf == "daily" else (13, 4)
+
+    def _rs(n):
+        a = pct_return(closes, n)
+        b = pct_return(spy_closes, n) if spy_closes else None
+        return round(a - b, 2) if (a is not None and b is not None) else None
+
+    rs3m, rs1m = _rs(n3), _rs(n1)
     avg20 = sum(vols[-20:]) / 20 if len(vols) >= 20 else (sum(vols) / len(vols) if vols else 0)
     avg5 = sum(vols[-5:]) / 5 if len(vols) >= 5 else avg20
 
-    # ── trade levels (ATR-buffered structural stop, fib-extension T2) ──
     if direction == "long":
-        entry = fib50
-        stop = round(LL - 0.5 * av, 2)
-        target = round(HH, 2)
-        target2 = round(LL + 1.272 * rng, 2)
+        entry, stop, target, target2 = fib50, round(LL - 0.5 * av, 2), round(HH, 2), round(LL + 1.272 * rng, 2)
     else:
-        entry = fib50
-        stop = round(HH + 0.5 * av, 2)
-        target = round(LL, 2)
-        target2 = round(HH - 1.272 * rng, 2)
+        entry, stop, target, target2 = fib50, round(HH + 0.5 * av, 2), round(LL, 2), round(HH - 1.272 * rng, 2)
     risk = abs(entry - stop)
     rr = round(abs(target - entry) / risk, 2) if risk > 0 else None
 
-    # ── confluence sub-scores (0..1) ──
     loc = max(0.0, 1 - abs(depth - 0.5) / 0.5)
     if direction == "long":
         tr = sum([close > (s20 or close), close > (s50 or close), (s50 or 0) > (s200 or 0),
@@ -542,7 +543,7 @@ def analyze(symbol, tf="daily"):
         mac = (0.6 if (hist is not None and hist_prev is not None and hist < hist_prev) else 0.0) + (0.4 if (hist is not None and hist < 0) else 0.0)
         rsc = clamp((0.5 - (rs3m or 0) / 12.0), 0, 1)
         candle = 1.0 if bars[-1]["c"] <= bars[-1]["o"] else 0.4
-    volsc = 1.0 if (avg20 and avg5 < avg20) else 0.4   # healthy pullbacks come on lighter volume
+    volsc = 1.0 if (avg20 and avg5 < avg20) else 0.4
     rrsc = min(1.0, (rr or 0) / 3.0)
 
     weights = {"location": 0.26, "trend": 0.18, "momentum": 0.12, "macd": 0.10,
@@ -550,15 +551,12 @@ def analyze(symbol, tf="daily"):
     subs = {"location": loc, "trend": tr, "momentum": mom, "macd": mac,
             "rs": rsc, "volume": volsc, "candle": candle, "rr": rrsc}
     score = round(clamp(100 * sum(weights[k] * subs[k] for k in weights)), 1)
-    sub_scores = {k: round(subs[k] * 100) for k in subs}
 
     in_pocket = 0.382 <= depth <= 0.618
     status = "Ready" if (in_pocket and score >= 55) else ("Approaching" if 0.25 <= depth <= 0.75 else "Extended")
     bias = "with-trend" if (direction == "long" and trend == "up") or (direction == "short" and trend == "down") else "counter-trend"
-    label = "%s %s pullback to 50%%%s" % (
-        ("Bullish" if direction == "long" else "Bearish"), bias,
-        " · RS+" if (rs3m or 0) > 0 else " · RS-")
-
+    label = "%s %s pullback to 50%%%s" % (("Bullish" if direction == "long" else "Bearish"), bias,
+                                          " · RS+" if (rs3m or 0) > 0 else " · RS-")
     return {
         "symbol": symbol, "name": SECTOR_NAME.get(symbol, ""), "tf": tf, "ok": True,
         "direction": direction, "trend": trend, "status": status, "bias": bias, "label": label,
@@ -566,7 +564,7 @@ def analyze(symbol, tf="daily"):
         "fib50": fib50, "depth": round(depth, 3), "dist50": round(dist50, 2),
         "entry": round(entry, 2), "zoneHi": levels["0.382"], "zoneLo": levels["0.618"],
         "stop": stop, "target": target, "target2": target2, "rr": rr,
-        "score": score, "subScores": sub_scores,
+        "score": score, "subScores": {k: round(subs[k] * 100) for k in subs},
         "rsi": round(rs_val, 1) if rs_val is not None else None,
         "macdHist": round(hist, 3) if hist is not None else None,
         "atr": round(av, 2), "rs3m": rs3m, "rs1m": rs1m,
@@ -576,13 +574,21 @@ def analyze(symbol, tf="daily"):
     }
 
 
-def rs_vs_spy(symbol, n=63):
-    a, b = get_bars(symbol), get_bars(BENCH)
-    if not a or not b:
+def _tf_closes(symbol, tf):
+    daily = get_bars(symbol)
+    if not daily:
         return None
-    ca, cb = [x["c"] for x in a], [x["c"] for x in b]
-    ra, rb = pct_return(ca, n), pct_return(cb, n)
-    return round(ra - rb, 2) if (ra is not None and rb is not None) else None
+    bars = resample_weekly(daily) if tf == "weekly" else daily
+    return [b["c"] for b in bars]
+
+
+def analyze(symbol, tf="daily"):
+    """Live wrapper: pull cached bars for symbol + SPY, then run analyze_bars."""
+    daily = get_bars(symbol)
+    if not daily:
+        return {"symbol": symbol, "tf": tf, "ok": False, "reason": "warming up / no data"}
+    bars = resample_weekly(daily) if tf == "weekly" else daily
+    return analyze_bars(bars, symbol, tf, _tf_closes(BENCH, tf))
 
 
 def build_entries(symbols, tf="daily"):
