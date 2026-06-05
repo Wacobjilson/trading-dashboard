@@ -675,7 +675,8 @@ def chart_data(symbol, tf="daily", n=120):
     # pivots within the shown window (x = index in show)
     pv = [{"x": i - offset, "price": round(p, 2), "type": t} for (i, p, t) in pivots if i >= offset]
     return {"symbol": symbol, "tf": tf, "ok": a.get("ok", False), "setup": a,
-            "bars": show, "sma20": sma_series(20), "sma50": sma_series(50), "pivots": pv}
+            "bars": show, "sma20": sma_series(20), "sma50": sma_series(50), "pivots": pv,
+            "source": _bars_meta.get(symbol, {}).get("source", "?")}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

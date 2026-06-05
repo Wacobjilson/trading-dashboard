@@ -165,6 +165,7 @@ const dir=n=>(n==null||n===0)?"muted":(n>0?"up":"down");
 const ago=ts=>{if(!ts)return"";const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+"s ago";if(s<3600)return(s/60|0)+"m ago";if(s<86400)return(s/3600|0)+"h ago";return(s/86400|0)+"d ago";};
 const sentBadge=s=>`<span class="badge ${s==="bullish"?"b-bull":s==="bearish"?"b-bear":"b-neu"}">${s}</span>`;
 const statusBadge=s=>`<span class="badge ${s==="Ready"?"b-ready":s==="Approaching"?"b-appr":"b-ext"}">${s}</span>`;
+const srcBadge=s=>s==="polygon"?'<span class="badge b-ready">POLYGON · real bars</span>':s==="synth"?'<span class="badge b-appr">SYNTHETIC · demo bars</span>':`<span class="badge b-neu">bars: ${s||'?'}</span>`;
 
 // ── tabs ──
 document.querySelectorAll("#nav button").forEach(b=>b.onclick=()=>{
@@ -191,7 +192,7 @@ async function loadRotation(){
     if(secs.length){
       const lead=(d.leaders||[]).join(", "),lag=(d.laggards||[]).join(", ");
       document.getElementById("rot-summary").innerHTML=
-        `<b>Money flow (3-mo RS vs SPY):</b> leaders → <span class="up">${lead||"—"}</span> · laggards → <span class="down">${lag||"—"}</span>.
+        `${srcBadge(d.warm&&d.warm.source)} &nbsp;<b>Money flow (3-mo RS vs SPY):</b> leaders → <span class="up">${lead||"—"}</span> · laggards → <span class="down">${lag||"—"}</span>.
          <span class="muted">Rotate toward Leading/Improving; trim Weakening/Lagging.</span>`;
     }
     drawRRG(secs); renderRotTable(secs);
@@ -297,7 +298,7 @@ async function loadChart(){
     if(!d.ok){document.getElementById("ch-svg").innerHTML=`<div class="loading">${d.reason||"no data"} for ${sym}.</div>`;document.getElementById("ch-setup").textContent="";return;}
     drawChart(d); const s=d.setup;
     document.getElementById("ch-setup").innerHTML=
-      `${s.tf} · <span class="badge ${s.direction==='long'?'b-long':'b-short'}">${s.direction}</span> ${statusBadge(s.status)}
+      `${srcBadge(d.source)} ${s.tf} · <span class="badge ${s.direction==='long'?'b-long':'b-short'}">${s.direction}</span> ${statusBadge(s.status)}
        entry <b class="amber mono">${fmt(s.fib50)}</b> · stop <span class="down mono">${fmt(s.stop)}</span> · target <span class="up mono">${fmt(s.target)}</span> · R:R <b>${s.rr||"—"}</b> · score <b>${s.score}</b>`;
   }catch(e){document.getElementById("ch-svg").innerHTML='<div class="loading">Chart failed.</div>';}
 }
