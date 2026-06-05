@@ -72,6 +72,7 @@
   <button data-tab="rotation">Rotation</button>
   <button data-tab="entries">Entries</button>
   <button data-tab="chart">Chart</button>
+  <button data-tab="futures">Futures 15m</button>
   <button data-tab="markets">Markets</button>
   <button data-tab="news">News</button>
   <button data-tab="calendar">Calendar</button>
@@ -134,6 +135,23 @@
     </div>
   </section>
 
+  <!-- FUTURES 15-min -->
+  <section class="tab" id="tab-futures">
+    <div class="card" style="font-size:13px">
+      <span class="badge b-appr">ETF PROXIES</span> &nbsp;Intraday <b>context</b> for ES/NQ/RTY/YM via SPY/QQQ/IWM/DIA
+      15-min bars (real ES/NQ need a paid futures feed). VWAP · opening range · EMAs · RSI(2).
+      <b class="amber">This is context, NOT a backtested signal</b> like the daily Signals tab — bias shows
+      where price sits vs VWAP and the opening range. Data is delayed.
+    </div>
+    <div class="card"><h2>Intraday snapshot</h2><div id="fut-table"><div class="loading">Loading…</div></div></div>
+    <div class="card">
+      <div class="ctl"><span class="seg" id="fut-sel"></span></div>
+      <div id="fut-chart"><div class="loading">Pick an instrument…</div></div>
+      <div class="note">15-min candles · <span class="amber">VWAP</span> (amber) · EMA9 (blue) / EMA20 (purple) ·
+        opening-range hi/lo (dashed) · prior-day hi/lo (dotted) · vertical line = new session.</div>
+    </div>
+  </section>
+
   <!-- MARKETS -->
   <section class="tab" id="tab-markets">
     <h2>Macro Overview</h2>
@@ -191,6 +209,7 @@ function activate(t){
   if(t==="rotation")loadRotation();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
+  if(t==="futures"){loadFutures();}
   if(t==="markets"&&!loaded.markets){loadQuotes();loaded.markets=true;}
   if(t==="news"&&!loaded.news){loadNews();loaded.news=true;}
   if(t==="calendar"){ if(!loaded.calendar){loadCalendarData();loaded.calendar=true;} else renderCalendar(); }
@@ -382,6 +401,64 @@ function drawChart(d){
   g+=`<text x="${padL+2}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+54}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text><text x="${padL+106}" y="${H-6}" fill="#8893a3" font-size="10">ZigZag swings</text>`;
   g+=`</svg>`;
   document.getElementById("ch-svg").innerHTML=g;
+}
+
+// ── FUTURES 15-min ──
+let futSym="ES", futSelBuilt=false;
+const biasBadge=b=>{const c=/^Long/.test(b)?"b-ready":/^Short/.test(b)?"b-bear":/Bull/.test(b)?"b-appr":"b-neu";return `<span class="badge ${c}">${b}</span>`;};
+async function loadFutures(){
+  try{
+    const d=await(await fetch(`${API}/api/futures`)).json();
+    const ins=(d.instruments||[]).filter(i=>!i.warming);
+    if(!futSelBuilt&&ins.length){
+      document.getElementById("fut-sel").innerHTML=ins.map((i,k)=>`<button data-s="${i.symbol}" class="${k===0?'on':''}">${i.symbol}</button>`).join("");
+      document.querySelectorAll("#fut-sel button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#fut-sel button").forEach(x=>x.classList.remove("on"));b.classList.add("on");futSym=b.dataset.s;loadFuturesChart();});
+      futSelBuilt=true; loadFuturesChart();
+    }
+    const head="<thead><tr><th>Inst</th><th>Price</th><th>vs VWAP</th><th>ORB</th><th>OR Hi/Lo</th><th>Prior H/L</th><th>EMA</th><th>RSI2</th><th>Bias</th></tr></thead>";
+    const body="<tbody>"+ins.map(i=>`<tr>
+      <td><b>${i.symbol}</b> <span class="muted" style="font-size:11px">${i.proxy}</span></td>
+      <td class="mono">${fmt(i.price)}</td>
+      <td class="mono ${i.aboveVwap?'up':'down'}">${i.aboveVwap?'▲':'▼'} ${pct(i.vwapDist)}</td>
+      <td><span class="${i.orbStatus==='above'?'up':i.orbStatus==='below'?'down':'muted'}">${i.orbStatus}</span></td>
+      <td class="mono muted">${fmt(i.orh)}/${fmt(i.orl)}</td>
+      <td class="mono muted">${i.priorHigh==null?'—':fmt(i.priorHigh)+'/'+fmt(i.priorLow)}</td>
+      <td><span class="${i.emaTrend==='up'?'up':'down'}">${i.emaTrend}</span></td>
+      <td class="mono ${i.rsi2==null?'muted':i.rsi2<10?'up':i.rsi2>90?'down':'muted'}">${i.rsi2==null?'—':i.rsi2.toFixed(0)}</td>
+      <td>${biasBadge(i.bias)}</td></tr>`).join("")+"</tbody>";
+    document.getElementById("fut-table").innerHTML=ins.length?"<table>"+head+body+"</table>":'<div class="loading">Warming intraday bars…</div>';
+  }catch(e){document.getElementById("fut-table").innerHTML='<div class="loading">Futures failed to load.</div>';}
+}
+async function loadFuturesChart(){
+  document.getElementById("fut-chart").innerHTML='<div class="loading">Loading 15-min chart…</div>';
+  try{
+    const d=await(await fetch(`${API}/api/futures_chart?symbol=${futSym}`)).json();
+    if(!d.ok){document.getElementById("fut-chart").innerHTML=`<div class="loading">${d.reason||'no data'}</div>`;return;}
+    drawFuturesChart(d);
+  }catch(e){document.getElementById("fut-chart").innerHTML='<div class="loading">Chart failed.</div>';}
+}
+function drawFuturesChart(d){
+  const bars=d.bars,W=960,H=420,padL=8,padR=64,padT=14,padB=18;
+  const n=bars.length, iw=(W-padL-padR)/Math.max(n,1), bw=Math.max(1.2,iw*0.6);
+  let lo=Infinity,hi=-Infinity;
+  bars.forEach(b=>{lo=Math.min(lo,b.l);hi=Math.max(hi,b.h);});
+  [d.orh,d.orl,d.priorHigh,d.priorLow,...(d.vwap||[])].forEach(v=>{if(v){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
+  const pad=(hi-lo)*0.04;lo-=pad;hi+=pad;const span=Math.max(hi-lo,1e-6);
+  const Y=v=>padT+(hi-v)/span*(H-padT-padB), X=i=>padL+i*iw+iw/2;
+  let g=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="background:#0c1219;border:1px solid var(--border);border-radius:6px">`;
+  for(let k=0;k<=4;k++){const v=lo+span*k/4,y=Y(v);g+=`<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}" stroke="#15202c"/><text x="${W-padR+4}" y="${(y+3).toFixed(1)}" fill="var(--muted)" font-size="10">${v.toFixed(2)}</text>`;}
+  const hline=(v,col,dash,lbl)=>v?`<line x1="${padL}" y1="${Y(v).toFixed(1)}" x2="${W-padR}" y2="${Y(v).toFixed(1)}" stroke="${col}" stroke-dasharray="${dash}" stroke-width="1"/><text x="${padL+2}" y="${(Y(v)-2).toFixed(1)}" fill="${col}" font-size="9">${lbl} ${v.toFixed(2)}</text>`:"";
+  g+=hline(d.orh,"#e0b050","4 3","OR-H");g+=hline(d.orl,"#e0b050","4 3","OR-L");
+  g+=hline(d.priorHigh,"#7b8794","1 3","pH");g+=hline(d.priorLow,"#7b8794","1 3","pL");
+  (d.newSession||[]).forEach(i=>{g+=`<line x1="${X(i).toFixed(1)}" y1="${padT}" x2="${X(i).toFixed(1)}" y2="${H-padB}" stroke="#2a3645" stroke-dasharray="2 4"/>`;});
+  bars.forEach((b,i)=>{const up=b.c>=b.o,col=up?"var(--up)":"var(--down)",x=X(i);
+    g+=`<line x1="${x.toFixed(1)}" y1="${Y(b.h).toFixed(1)}" x2="${x.toFixed(1)}" y2="${Y(b.l).toFixed(1)}" stroke="${col}" stroke-width="1"/>`;
+    const yo=Y(b.o),yc=Y(b.c);g+=`<rect x="${(x-bw/2).toFixed(1)}" y="${Math.min(yo,yc).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(1,Math.abs(yc-yo)).toFixed(1)}" fill="${col}"/>`;});
+  const poly=(arr,col,wd)=>{let p=(arr||[]).map((v,i)=>v==null?null:`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean).join(" ");return p?`<polyline points="${p}" fill="none" stroke="${col}" stroke-width="${wd}"/>`:"";};
+  g+=poly(d.vwap,"var(--amber)",1.5);g+=poly(d.ema9,"#3b82f6",1);g+=poly(d.ema20,"#a855f7",1);
+  g+=`<text x="${padL+2}" y="${H-5}" fill="var(--amber)" font-size="10">VWAP</text><text x="${padL+44}" y="${H-5}" fill="#3b82f6" font-size="10">EMA9</text><text x="${padL+86}" y="${H-5}" fill="#a855f7" font-size="10">EMA20</text>`;
+  g+=`</svg>`;
+  document.getElementById("fut-chart").innerHTML=g;
 }
 
 // ── MARKETS ──

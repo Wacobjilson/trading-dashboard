@@ -723,6 +723,174 @@ def chart_data(symbol, tf="daily", n=120):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Futures (15-min) via liquid ETF proxies — intraday CONTEXT (VWAP / ORB / EMAs).
+# NOTE: real ES/NQ/etc. need a paid futures feed; these proxies are RTH-only and a
+# reasonable stand-in for intraday structure, not a substitute for true futures data.
+# The bias here is context, NOT an out-of-sample-validated signal like the daily tab.
+# ─────────────────────────────────────────────────────────────────────────────
+FUTURES = [("ES", "S&P 500 e-mini", "SPY"), ("NQ", "Nasdaq 100 e-mini", "QQQ"),
+           ("RTY", "Russell 2000 e-mini", "IWM"), ("YM", "Dow e-mini", "DIA")]
+
+
+def _us_dst(d):
+    mar = dt.date(d.year, 3, 1)
+    start = mar + dt.timedelta(days=(6 - mar.weekday()) % 7 + 7)   # 2nd Sun of March
+    nov = dt.date(d.year, 11, 1)
+    end = nov + dt.timedelta(days=(6 - nov.weekday()) % 7)         # 1st Sun of Nov
+    return start <= d < end
+
+
+def _et(ms):
+    """Epoch ms -> naive US-Eastern datetime (DST-aware, no tzdata dependency)."""
+    u = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
+    return (u + dt.timedelta(hours=(-4 if _us_dst(u.date()) else -5))).replace(tzinfo=None)
+
+
+def fetch_intraday(proxy, mult=15, days=20):
+    if FORCE_SYNTH or not API_KEYS.get("polygon"):
+        return synth_intraday(proxy, days)
+    to = dt.date.today()
+    frm = to - dt.timedelta(days=days)
+    url = ("https://api.polygon.io/v2/aggs/ticker/%s/range/%d/minute/%s/%s?adjusted=true&sort=asc&limit=50000&apiKey=%s"
+           % (urllib.parse.quote(proxy), mult, frm.isoformat(), to.isoformat(), urllib.parse.quote(API_KEYS["polygon"])))
+    try:
+        res = http_get_json(url).get("results") or []
+        if res:
+            return [{"t": r["t"], "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r.get("v", 0)} for r in res]
+    except Exception:
+        pass
+    return synth_intraday(proxy, days)
+
+
+def synth_intraday(proxy, days=20):
+    rnd = random.Random(hash(proxy) & 0xffffff)
+    price = SEED_PRICES.get(proxy, 400)
+    bars = []
+    today = dt.datetime.now(dt.timezone.utc)
+    for back in range(days, 0, -1):
+        day = (today - dt.timedelta(days=back)).date()
+        if day.weekday() >= 5:
+            continue
+        for slot in range(26):  # ~6.5h RTH in 15-min slots, anchored mid-session in UTC
+            ts = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc) + dt.timedelta(minutes=14 * 60 + 30 + slot * 15)
+            ret = (rnd.random() - 0.5) * 0.004
+            o = price; c = max(1.0, price * (1 + ret))
+            h = max(o, c) * (1 + rnd.random() * 0.0012); l = min(o, c) * (1 - rnd.random() * 0.0012)
+            bars.append({"t": int(ts.timestamp() * 1000), "o": round(o, 2), "h": round(h, 2),
+                         "l": round(l, 2), "c": round(c, 2), "v": rnd.randint(1000, 9000)})
+            price = c
+    return bars
+
+
+def get_intraday(proxy):
+    c = cache_get("intra:" + proxy, 300)
+    if c is not None:
+        return c
+    b = fetch_intraday(proxy)
+    cache_set("intra:" + proxy, b)
+    return b
+
+
+def _rth_sessions(bars):
+    """Group bars into RTH (09:30–16:00 ET) sessions, ordered oldest→newest."""
+    sess = {}
+    order = []
+    for b in bars:
+        et = _et(b["t"])
+        mins = et.hour * 60 + et.minute
+        if mins < 9 * 60 + 30 or mins >= 16 * 60:
+            continue
+        key = et.date()
+        if key not in sess:
+            sess[key] = []
+            order.append(key)
+        sess[key].append(b)
+    return [(k, sess[k]) for k in order]
+
+
+def _session_levels(sb):
+    cum_pv = cum_v = 0.0
+    for b in sb:
+        tp = (b["h"] + b["l"] + b["c"]) / 3
+        cum_pv += tp * b["v"]; cum_v += b["v"]
+    vwap = cum_pv / cum_v if cum_v else sb[-1]["c"]
+    orb = sb[:2] if len(sb) >= 2 else sb           # first 30 min = opening range
+    return vwap, max(b["h"] for b in orb), min(b["l"] for b in orb)
+
+
+def futures_state(fut):
+    sym, name, proxy = fut
+    bars = get_intraday(proxy)
+    sess = _rth_sessions(bars)
+    if not sess:
+        return {"symbol": sym, "name": name, "proxy": proxy, "warming": True}
+    _date, sb = sess[-1]
+    closes_all = [b["c"] for b in bars]
+    closes = [b["c"] for b in sb]
+    vwap, orh, orl = _session_levels(sb)
+    prior = sess[-2][1] if len(sess) >= 2 else None
+    e9 = ema_series(closes_all, 9)[-1]
+    e20 = ema_series(closes_all, 20)[-1]
+    r2 = rsi(closes_all, 2)
+    price = closes[-1]
+    above_vwap = price > vwap
+    if price > orh and above_vwap:
+        bias, rank = "Long — ORB up · >VWAP", 0
+    elif price < orl and not above_vwap:
+        bias, rank = "Short — ORB dn · <VWAP", 0
+    elif above_vwap:
+        bias, rank = "Bullish (>VWAP, inside)", 1
+    else:
+        bias, rank = "Bearish (<VWAP, inside)", 1
+    return {
+        "symbol": sym, "name": name, "proxy": proxy, "price": round(price, 2),
+        "vwap": round(vwap, 2), "aboveVwap": above_vwap, "vwapDist": round((price / vwap - 1) * 100, 2),
+        "orh": round(orh, 2), "orl": round(orl, 2),
+        "orbStatus": "above" if price > orh else "below" if price < orl else "inside",
+        "priorHigh": round(max(b["h"] for b in prior), 2) if prior else None,
+        "priorLow": round(min(b["l"] for b in prior), 2) if prior else None,
+        "priorClose": round(prior[-1]["c"], 2) if prior else None,
+        "ema9": round(e9, 2) if e9 else None, "ema20": round(e20, 2) if e20 else None,
+        "emaTrend": "up" if (e9 and e20 and e9 > e20) else "down",
+        "rsi2": round(r2, 1) if r2 is not None else None, "bias": bias, "rank": rank,
+        "source": "polygon" if (API_KEYS.get("polygon") and not FORCE_SYNTH) else "synth",
+    }
+
+
+def futures_summary():
+    return {"instruments": [futures_state(f) for f in FUTURES]}
+
+
+def futures_chart(sym, nsess=2):
+    fut = next((f for f in FUTURES if f[0] == sym.upper()), FUTURES[0])
+    proxy = fut[2]
+    bars = get_intraday(proxy)
+    sess = _rth_sessions(bars)
+    if not sess:
+        return {"symbol": sym, "ok": False, "reason": "warming"}
+    show_sess = sess[-nsess:]
+    flat, vwap_series, new_session = [], [], []
+    for si, (_d, sb) in enumerate(show_sess):
+        cum_pv = cum_v = 0.0
+        for j, b in enumerate(sb):
+            tp = (b["h"] + b["l"] + b["c"]) / 3
+            cum_pv += tp * b["v"]; cum_v += b["v"]
+            vwap_series.append(round(cum_pv / cum_v, 2) if cum_v else b["c"])
+            if j == 0 and si > 0:
+                new_session.append(len(flat))
+            flat.append(b)
+    st = futures_state(fut)
+    closes = [b["c"] for b in flat]
+    e9 = ema_series([b["c"] for b in bars], 9)
+    e20 = ema_series([b["c"] for b in bars], 20)
+    tail = len(flat)
+    return {"symbol": sym, "proxy": proxy, "ok": True, "bars": flat, "vwap": vwap_series,
+            "newSession": new_session, "ema9": e9[-tail:], "ema20": e20[-tail:],
+            "orh": st.get("orh"), "orl": st.get("orl"),
+            "priorHigh": st.get("priorHigh"), "priorLow": st.get("priorLow"), "state": st}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # News (Finnhub) + classification
 # ─────────────────────────────────────────────────────────────────────────────
 CATEGORY_RULES = [
@@ -902,6 +1070,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/chart":
             sym = (qs.get("symbol", ["SPY"])[0]).upper()
             self._json(chart_data(sym, tf))
+        elif path == "/api/futures":
+            self._json(cache_get("futures", 60) or _cache_and_return("futures", futures_summary))
+        elif path == "/api/futures_chart":
+            self._json(futures_chart((qs.get("symbol", ["ES"])[0]).upper()))
         elif path == "/api/news":
             self._json(cache_get("news", 1e9) or fetch_news())
         elif path == "/api/calendar":

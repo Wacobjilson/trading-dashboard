@@ -13,6 +13,7 @@ Python 3 (standard library only) serving one HTML page.
 | **Rotation** | The 11 SPDR sector ETFs ranked by relative strength vs SPY (1w/1m/3m) with an RRG-style scatter (Leading / Weakening / Lagging / Improving) — *where the money is moving*. |
 | **Entries** | A **sector-ETF-only** scanner for **50% retracement setups** (daily & weekly). Swings come from an ATR-scaled **ZigZag** (real pivots). Each candidate gets a multi-factor **confluence score** (hover it for the breakdown), entry zone, ATR-buffered stop, prior-swing + 1.272-extension targets, R:R, RSI and RS-vs-SPY. |
 | **Chart** | Per-symbol SVG candlestick: SMA20/50, the ZigZag swing pivots, swing high/low, Fib 38.2/50/61.8 and the shaded entry zone. Click any Rotation/Entries row to chart it. |
+| **Futures 15m** | Intraday **context** for ES/NQ/RTY/YM via 15-min ETF proxies (SPY/QQQ/IWM/DIA): session VWAP, opening range, prior-day H/L, EMA9/20, RSI(2), and a 15-min chart. Real ES/NQ need a paid futures feed; this is RTH-proxy context, **not** a backtested signal. |
 | **Markets** | Macro overview grid (SPY, QQQ, IWM, DIA, VIX, CL, GC, US10Y, DXY). |
 | **News** | Market news in chronological order (newest first), auto-categorized (Fed, Inflation, Jobs, Earnings, M&A…) with sentiment + impact. |
 | **Calendar** | Economic events with **forecast / previous / actual + surprise %**, filterable by impact and currency, plus a live **countdown** to the next high-impact release. Earnings too. |
