@@ -46,6 +46,23 @@ win, big drawdown). That out-of-sample RSI(2) result is what the **Signals** tab
 Caveats: returns are pre-slippage (idealized close fills); 2 years is a mostly-bullish
 sample, so the 200-SMA regime filter stays on as the crash guardrail.
 
+### Intraday research (`research_futures.py`) — honest negative result
+
+Same discipline applied to **15-min** ETF-proxy data (ORB, VWAP-reversion, intraday
+RSI(2), EMA-cross), net of a 0.02% slippage cost, train/test split:
+
+```bash
+python research_futures.py
+```
+
+**No robust intraday edge was found.** The systems that "won" out-of-sample had *lost*
+in-sample (sign-flipped between windows = noise), and the one that won in-sample
+(intraday RSI2) died out-of-sample. A real edge must be positive in **both** windows —
+none was. Free-tier intraday history is also short (~60 sessions), so it's a small
+sample. **Conclusion:** the Futures tab stays as **context** (VWAP/ORB/EMA levels),
+**not** a signal. This negative result is the point of the harness — it stops us from
+shipping a curve-fit "signal."
+
 ## Backtesting
 
 `backtest.py` replays the **exact** entry logic (`analyze_bars`) bar-by-bar over
