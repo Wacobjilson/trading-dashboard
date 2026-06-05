@@ -37,7 +37,14 @@ QUANTA_SYNTH_BARS=1 python backtest.py   # synthetic bars (no API, instant)
 BT_DIR=long BT_WITH_TREND=1 python backtest.py   # only with-trend longs
 BT_SWEEP=1 python backtest.py            # grid-search stop × target × min_score, ranked by expectancy
 BT_STOP=fib786 BT_TGT=ext1618 python backtest.py # try a specific level scheme
+BT_WF=1 BT_DIR=long python backtest.py   # walk-forward: optimize on train (first 60%), test out-of-sample
 ```
+
+**Walk-forward** is the honest test: it optimizes the param grid on the first
+`BT_WF_FRAC` (default 0.6) of history, locks the winner, then measures it on the
+held-out remainder it never saw — alongside the default scheme as a baseline. If the
+"optimized" params don't beat the default out-of-sample, the sweep was curve-fitting.
+(2 years of daily bars is a small sample, so treat this as directional evidence.)
 
 Results are in **R-multiples** (R = 1 unit of initial risk): win %, expectancy,
 profit factor, total R, max drawdown, streaks, plus per-timeframe / per-direction /

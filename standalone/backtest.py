@@ -20,6 +20,8 @@ Usage:
   python backtest.py                       # daily + weekly, both directions
   QUANTA_SYNTH_BARS=1 python backtest.py   # run on synthetic bars (no API)
   BT_DIR=long BT_WITH_TREND=1 python backtest.py
+  BT_SWEEP=1 python backtest.py            # grid-search stop × target × min_score
+  BT_WF=1 BT_DIR=long python backtest.py   # walk-forward: optimize on train, test out-of-sample
 
 Caveats (read these): fills are idealized (no slippage/commission); same-bar
 stop+target is resolved as a loss; intrabar path is unknown so touches use bar
@@ -29,9 +31,16 @@ on the *logic's* edge, not a promise of live performance.
 
 import datetime as dt
 import os
+import sys
 import time
 
 import quanta as q
+
+# Force UTF-8 output so unicode glyphs don't crash on a cp1252 Windows console.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 WARMUP = {"daily": 210, "weekly": 60}
 MAXHOLD = {"daily": 40, "weekly": 16}
@@ -66,14 +75,17 @@ def align_spy_weekly(sym_weekly, spy_weekly):
     return out
 
 
-def simulate(bars, spy_closes, sym, tf, params):
-    """Walk forward; return list of completed trades."""
+def simulate(bars, spy_closes, sym, tf, params, start=None, end=None):
+    """Walk forward; return completed trades whose ENTRY bar is in [start, end).
+    History before `start` is still used for analysis (no truncation of context)."""
     trades = []
     maxhold = MAXHOLD[tf]
-    i = WARMUP[tf]
-    prev_ready = False
     n = len(bars)
-    while i < n - 1:
+    start = WARMUP[tf] if start is None else max(WARMUP[tf], start)
+    end = (n - 1) if end is None else min(n - 1, end)
+    i = start
+    prev_ready = False
+    while i < end:
         a = q.analyze_bars(bars[:i + 1], sym, tf, spy_closes[:i + 1], params)
         ready = a.get("ok") and a["status"] == "Ready"
         if ready and a["direction"] in (("long", "short") if DIR_FILTER == "both" else (DIR_FILTER,)) \
@@ -156,18 +168,90 @@ def fmt_stats(label, s):
                s["avg_win"], s["avg_loss"], s["max_dd_R"], s["max_loss_streak"], s["avg_hold"]))
 
 
-def collect(bars, syms, params):
-    """Run the walk-forward across all timeframes/sectors for one param set."""
+def collect(bars, syms, params, mode="all", frac=0.6, tfs=None):
+    """Run the walk-forward across timeframes/sectors for one param set.
+
+    mode: 'all' = whole history; 'train' = entries in the first `frac` of bars;
+    'test' = entries in the held-out remainder. History before the split is still
+    used as analysis context (only the ENTRY date is gated)."""
     trades = []
-    for tf in [t.strip() for t in TFS if t.strip() in WARMUP]:
+    use_tfs = tfs if tfs is not None else [t.strip() for t in TFS if t.strip() in WARMUP]
+    for tf in use_tfs:
         spy_bars = q.resample_weekly(bars[q.BENCH]) if tf == "weekly" else bars[q.BENCH]
         for s in syms:
             sb = q.resample_weekly(bars[s]) if tf == "weekly" else bars[s]
             if len(sb) <= WARMUP[tf] + 5:
                 continue
             spy_aligned = align_spy_weekly(sb, spy_bars) if tf == "weekly" else align_spy_daily(sb, bars[q.BENCH])
-            trades += simulate(sb, spy_aligned, s, tf, params)
+            split = int(len(sb) * frac)
+            start, end = (None, split) if mode == "train" else (split, None) if mode == "test" else (None, None)
+            trades += simulate(sb, spy_aligned, s, tf, params, start, end)
     return trades
+
+
+def walkforward(bars, syms):
+    """Optimize the param grid on the first `frac` of history (train), lock the
+    winner, then measure it on the held-out remainder (test) it never saw. Also
+    runs the user's current scheme on the same test set as a baseline.
+
+    Daily only — 2 years of weekly bars is too few to split. The honest test of
+    whether the sweep found real edge or just curve-fit the past."""
+    frac = float(os.environ.get("BT_WF_FRAC", "0.6"))
+    min_train = int(os.environ.get("BT_WF_MINTRADES", "20"))
+    grid = [(sm, tm, ms)
+            for sm in ("fib618", "fib786", "swinglow")
+            for tm in ("ext1272", "ext1618", "prior")
+            for ms in (45, 55, 65)]
+
+    print("=" * 92)
+    print("WALK-FORWARD  —  train=first %.0f%% / test=last %.0f%%  (daily, dir=%s, with_trend=%s)"
+          % (frac * 100, (1 - frac) * 100, DIR_FILTER, WITH_TREND))
+    print("  Optimize on TRAIN, then evaluate the winner on the unseen TEST. min train trades=%d" % min_train)
+    print("=" * 92)
+
+    ranked = []
+    for sm, tm, ms in grid:
+        p = {"stop_mode": sm, "stop_buf": 0.25, "target_mode": tm, "min_score": ms}
+        s = stats(collect(bars, syms, p, mode="train", frac=frac, tfs=["daily"]))
+        if s and s["n"] >= min_train:
+            ranked.append(((sm, tm, ms), p, s))
+    if not ranked:
+        print("Not enough train trades to optimize (try a smaller BT_WF_MINTRADES).")
+        return
+    ranked.sort(key=lambda r: (r[2]["expectancy_R"], r[2]["total_R"]), reverse=True)
+
+    print("\nTRAIN leaderboard (top 6 of %d eligible configs):" % len(ranked))
+    for (sm, tm, ms), _p, s in ranked[:6]:
+        print(fmt_stats("  %s/%s/%d" % (sm, tm, ms), s))
+
+    best_key, best_p, best_train = ranked[0]
+    test = stats(collect(bars, syms, best_p, mode="test", frac=frac, tfs=["daily"]))
+    base_p = {"stop_mode": "fib618", "stop_buf": 0.25, "target_mode": "ext1272", "min_score": 55}
+    base_test = stats(collect(bars, syms, base_p, mode="test", frac=frac, tfs=["daily"]))
+    full_best = stats(collect(bars, syms, best_p, mode="all", frac=frac, tfs=["daily"]))
+
+    print("\n" + "-" * 92)
+    print("CHOSEN by TRAIN: stop=%s target=%s min_score=%d" % best_key)
+    print(fmt_stats("  TRAIN (in-sample)", best_train))
+    print(fmt_stats("  TEST  (OUT-of-sample)", test))
+    print(fmt_stats("  baseline your-style TEST", base_test))
+    print(fmt_stats("  chosen over FULL period", full_best))
+
+    print("-" * 92)
+    if not test:
+        verdict = "INCONCLUSIVE — no test trades."
+    else:
+        held = test["expectancy_R"] > 0 and test["profit_factor"] >= 1.2
+        degrade = (best_train["expectancy_R"] - test["expectancy_R"])
+        if held and test["expectancy_R"] >= 0.5 * best_train["expectancy_R"]:
+            verdict = "HOLDS OUT-OF-SAMPLE — edge survived on unseen data (kept %.0f%% of train expectancy)." % (
+                100 * test["expectancy_R"] / best_train["expectancy_R"] if best_train["expectancy_R"] else 0)
+        elif test["expectancy_R"] > 0:
+            verdict = "MARGINAL — still positive out-of-sample but expectancy decayed %.3fR (likely some overfit)." % degrade
+        else:
+            verdict = "FAILS — the train winner did NOT carry out-of-sample (overfit / regime-dependent). Trust robust defaults, not the top sweep cell."
+    print("VERDICT: " + verdict)
+    print("(Single 60/40 split, daily, ~%d test trades — directional evidence, not proof.)" % (test["n"] if test else 0))
 
 
 def main():
@@ -182,6 +266,11 @@ def main():
         if src == "polygon":
             time.sleep(13)  # respect 5 req/min free tier
     print("  source=%s, bars/symbol≈%d\n" % (src, len(bars[q.BENCH])))
+
+    # ── Walk-forward / out-of-sample validation ──
+    if q._envbool("BT_WF", False):
+        walkforward(bars, syms)
+        return
 
     # ── Parameter sweep mode ──
     if q._envbool("BT_SWEEP", False):
