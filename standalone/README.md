@@ -9,6 +9,7 @@ Python 3 (standard library only) serving one HTML page.
 
 | Tab | What it shows |
 |-----|---------------|
+| **Signals** | The **out-of-sample-validated edge**: Connors **RSI(2) mean-reversion** on the sector ETFs. BUY when a sector is above its 200-day SMA and RSI(2) < 10; exit when price closes back above the 5-day SMA. Live per-sector state (BUY / Arming / Flat / Bear), RSI(2), the exit level, and distance to exit. |
 | **Rotation** | The 11 SPDR sector ETFs ranked by relative strength vs SPY (1w/1m/3m) with an RRG-style scatter (Leading / Weakening / Lagging / Improving) — *where the money is moving*. |
 | **Entries** | A **sector-ETF-only** scanner for **50% retracement setups** (daily & weekly). Swings come from an ATR-scaled **ZigZag** (real pivots). Each candidate gets a multi-factor **confluence score** (hover it for the breakdown), entry zone, ATR-buffered stop, prior-swing + 1.272-extension targets, R:R, RSI and RS-vs-SPY. |
 | **Chart** | Per-symbol SVG candlestick: SMA20/50, the ZigZag swing pivots, swing high/low, Fib 38.2/50/61.8 and the shaded entry zone. Click any Rotation/Entries row to chart it. |
@@ -23,6 +24,26 @@ Python 3 (standard library only) serving one HTML page.
 >
 > **No Polygon key?** Set `QUANTA_SYNTH_BARS=1` (or just leave it unset) to run the
 > rotation/entries/chart features on **synthetic bars** so you can explore the UI.
+
+## Strategy research (`research.py`)
+
+`research.py` is how the Signals edge was found. It fetches the sector daily bars
+once, then tests a battery of documented long-only systems — Connors **RSI(2)**
+mean-reversion variants (with/without the 200-SMA regime filter, different exits,
+a stop), an SMA-10 pullback, and a 20-day momentum **breakout** — each split into
+**TRAIN (first 60%)** and **TEST (held-out 40%)**, reported in per-trade % with PF,
+win%, drawdown and per-trade Sharpe, against an equal-weight buy-&-hold benchmark.
+
+```bash
+python research.py                       # real Polygon bars (~2.5 min to fetch)
+QUANTA_SYNTH_BARS=1 python research.py   # synthetic (machinery only)
+```
+
+**Result on 2yr Polygon data:** the RSI(2) family held up out-of-sample (~73% win,
+PF ~2.0, ~+0.5%/trade across variants); momentum/breakout did **not** (PF 1.6, 33%
+win, big drawdown). That out-of-sample RSI(2) result is what the **Signals** tab serves.
+Caveats: returns are pre-slippage (idealized close fills); 2 years is a mostly-bullish
+sample, so the 200-SMA regime filter stays on as the crash guardrail.
 
 ## Backtesting
 

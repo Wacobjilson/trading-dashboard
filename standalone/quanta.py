@@ -659,6 +659,49 @@ def rotation():
     return out
 
 
+# Out-of-sample validated stats for the RSI(2) mean-reversion edge (from research.py
+# on 2yr Polygon daily bars; TEST = held-out last 40%). Shown in the UI for honesty.
+RSI2_EDGE = {"win": 74.7, "pf": 2.05, "avg": 0.48, "trades": 87,
+             "rule": "Buy when sector > 200-day SMA and RSI(2) < 10; exit when close > 5-day SMA."}
+
+
+def signals():
+    """RSI(2) mean-reversion signals per sector ETF (the out-of-sample-validated edge).
+
+    BUY  = bull regime (close > SMA200) AND RSI(2) < 10  → enter near the close.
+    EXIT = close > SMA5  → take the bounce.
+    """
+    out = {"warm": warm_status(), "edge": RSI2_EDGE, "sectors": []}
+    for sym, name in SECTORS:
+        bars = get_bars(sym)
+        if not bars or len(bars) < 200:
+            out["sectors"].append({"symbol": sym, "name": name, "warming": True})
+            continue
+        c = [b["c"] for b in bars]
+        close = c[-1]
+        s5, s200 = sma(c, 5), sma(c, 200)
+        r2 = rsi(c, 2)
+        bull = bool(s200 and close > s200)
+        below5 = bool(s5 and close < s5)
+        if bull and r2 is not None and r2 < 10:
+            sig, rank = "BUY", 0
+        elif bull and r2 is not None and r2 < 20 and below5:
+            sig, rank = "Arming", 1
+        elif not bull:
+            sig, rank = "Bear — stand aside", 3
+        else:
+            sig, rank = "Flat", 2
+        out["sectors"].append({
+            "symbol": sym, "name": name, "price": round(close, 2),
+            "rsi2": round(r2, 1) if r2 is not None else None,
+            "sma5": round(s5, 2) if s5 else None, "sma200": round(s200, 2) if s200 else None,
+            "regime": "bull" if bull else "bear", "signal": sig, "rank": rank,
+            "distExit": round((close / s5 - 1) * 100, 2) if s5 else None,
+        })
+    out["sectors"].sort(key=lambda r: (r.get("rank", 9), r.get("rsi2") if r.get("rsi2") is not None else 999))
+    return out
+
+
 def chart_data(symbol, tf="daily", n=120):
     bars, pivots = pivots_for(symbol, tf)
     if not bars:
@@ -849,6 +892,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"provider": _status["provider"], "updated": _status["updated"], "quotes": list(_quotes_cache)})
         elif path == "/api/sectors":
             self._json(cache_get("sectors", 120) or _cache_and_return("sectors", rotation))
+        elif path == "/api/signals":
+            self._json(cache_get("signals", 120) or _cache_and_return("signals", signals))
         elif path == "/api/entries":
             syms = [s.strip().upper() for s in (qs.get("symbols", [""])[0]).split(",") if s.strip()] \
                    or [s for s, _ in SECTORS]   # sector ETFs only by default

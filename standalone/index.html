@@ -68,7 +68,8 @@
   <div class="status" id="status">connecting…</div>
 </header>
 <nav id="nav">
-  <button data-tab="rotation" class="active">Rotation</button>
+  <button data-tab="signals" class="active">Signals</button>
+  <button data-tab="rotation">Rotation</button>
   <button data-tab="entries">Entries</button>
   <button data-tab="chart">Chart</button>
   <button data-tab="markets">Markets</button>
@@ -77,8 +78,20 @@
 </nav>
 <div id="countdown" class="cd-bar cd-hidden"></div>
 <main>
+  <!-- SIGNALS (RSI2 mean-reversion — the out-of-sample validated edge) -->
+  <section class="tab active" id="tab-signals">
+    <div id="sig-edge" class="card" style="font-size:13px">Loading signals…</div>
+    <div class="card"><h2>RSI(2) mean-reversion signals — sector ETFs</h2>
+      <div id="sig-table"></div>
+      <div class="note">Validated edge (held out-of-sample). <b>BUY</b> = sector above its 200-day SMA
+        and RSI(2) below 10 — enter near the close. <b>Exit</b> when price closes back above the 5-day SMA
+        (the "Exit&nbsp;5SMA" column; "to exit" is how far price is from that trigger). Daily signals — act on the close.
+        Mean-reversion: works in bull/range markets, vulnerable in crashes (the 200-SMA filter is the guardrail).
+        Not advice; size small.</div></div>
+  </section>
+
   <!-- ROTATION -->
-  <section class="tab active" id="tab-rotation">
+  <section class="tab" id="tab-rotation">
     <div id="rot-summary" class="card" style="font-size:14px">Loading sector rotation…</div>
     <div class="cols cols2">
       <div class="card"><h2>Relative Rotation (vs SPY)</h2><div id="rrg"></div>
@@ -174,12 +187,39 @@ document.querySelectorAll("#nav button").forEach(b=>b.onclick=()=>{
   b.classList.add("active"); document.getElementById("tab-"+b.dataset.tab).classList.add("active"); activate(b.dataset.tab);
 });
 function activate(t){
+  if(t==="signals")loadSignals();
   if(t==="rotation")loadRotation();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
   if(t==="markets"&&!loaded.markets){loadQuotes();loaded.markets=true;}
   if(t==="news"&&!loaded.news){loadNews();loaded.news=true;}
   if(t==="calendar"){ if(!loaded.calendar){loadCalendarData();loaded.calendar=true;} else renderCalendar(); }
+}
+
+// ── SIGNALS (RSI2 mean-reversion) ──
+const sigBadge=s=>{const c=s==="BUY"?"b-ready":s==="Arming"?"b-appr":"b-neu";return `<span class="badge ${c}">${s}</span>`;};
+async function loadSignals(){
+  try{
+    const d=await(await fetch(`${API}/api/signals`)).json();
+    const e=d.edge||{};
+    document.getElementById("sig-edge").innerHTML=
+      `${srcBadge(d.warm&&d.warm.source)} &nbsp;<b>Edge (out-of-sample):</b> <span class="up">${e.win}% win</span> ·
+       PF <b>${e.pf}</b> · avg <span class="up">+${e.avg}%</span>/trade · ${e.trades} test trades.
+       <span class="muted">${e.rule}</span>`;
+    const secs=(d.sectors||[]).filter(s=>!s.warming);
+    if(!secs.length){document.getElementById("sig-table").innerHTML=`<div class="loading">Warming bars ${d.warm?d.warm.have:0}/${d.warm?d.warm.total:'?'}…</div>`;return;}
+    const buys=secs.filter(s=>s.signal==="BUY").map(s=>s.symbol);
+    const head="<thead><tr><th>Signal</th><th>Sector</th><th>Regime</th><th>RSI(2)</th><th>Price</th><th>Exit 5SMA</th><th>to exit</th></tr></thead>";
+    const body="<tbody>"+secs.map(s=>`<tr class="clk" onclick="openChart('${s.symbol}')">
+      <td>${sigBadge(s.signal)}</td>
+      <td><b>${s.symbol}</b> <span class="muted" style="font-size:11px">${s.name}</span></td>
+      <td><span class="${s.regime==='bull'?'up':'down'}">${s.regime}</span></td>
+      <td><span class="mono ${s.rsi2==null?'muted':s.rsi2<10?'up':s.rsi2>70?'down':'muted'}">${s.rsi2==null?'—':s.rsi2.toFixed(1)}</span></td>
+      <td class="mono">${fmt(s.price)}</td>
+      <td class="mono muted">${fmt(s.sma5)}</td>
+      <td class="mono ${s.distExit!=null&&s.distExit<0?'amber':'muted'}">${s.distExit==null?'—':pct(s.distExit)}</td></tr>`).join("")+"</tbody>";
+    document.getElementById("sig-table").innerHTML="<table>"+head+body+"</table>";
+  }catch(e){document.getElementById("sig-table").innerHTML='<div class="loading">Signals failed to load.</div>';}
 }
 
 // ── ROTATION ──
@@ -451,9 +491,12 @@ function tickCountdown(){
 setInterval(tickCountdown,1000);
 
 // ── boot ──
-loadRotation(); loadQuotes(); loadCalendarData();   // calendar at boot so the countdown runs from any tab
+loadSignals(); loadQuotes(); loadCalendarData();   // signals is the default tab; calendar at boot so the countdown runs anywhere
 setInterval(loadQuotes,5000);
-setInterval(()=>{if(document.getElementById("tab-rotation").classList.contains("active"))loadRotation();},60000);
+setInterval(()=>{
+  if(document.getElementById("tab-signals").classList.contains("active"))loadSignals();
+  if(document.getElementById("tab-rotation").classList.contains("active"))loadRotation();
+},60000);
 setInterval(loadCalendarData,300000);   // refresh calendar (and actuals) every 5 min
 </script>
 </body>
