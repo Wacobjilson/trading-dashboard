@@ -1,0 +1,9 @@
+# Never bake real keys into the image — they come from env vars at runtime.
+keys.local.json
+__pycache__/
+*.pyc
+.env
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml

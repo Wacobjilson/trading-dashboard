@@ -131,6 +131,39 @@ Running it on another machine (e.g. your k3s node)? Browse to
 You can also just **double-click `index.html`** — it falls back to calling
 `http://localhost:8000` (the server sends permissive CORS headers so that works).
 
+## Run with Docker
+
+Self-contained — stdlib-only Python, so the image is ~80 MB and needs no `pip install`.
+
+```bash
+cd standalone
+cp .env.example .env        # optional — add your API keys (runs in demo mode without)
+docker compose up -d --build
+# open http://localhost:8000
+```
+
+Or without compose:
+
+```bash
+docker build -t quanta-standalone ./standalone
+docker run -d -p 8000:8000 \
+  -e POLYGON_API_KEY=xxxx -e FINNHUB_API_KEY=xxxx \
+  --name quanta --restart unless-stopped quanta-standalone
+```
+
+Keys come from **environment variables** (never baked into the image — `keys.local.json`
+is in `.dockerignore`). With no keys it runs in synthetic/mock demo mode. The container
+has a healthcheck and `restart: unless-stopped`, so it survives reboots.
+
+Run a backtest inside the running container:
+
+```bash
+docker exec -it quanta python research.py     # or backtest.py / research_futures.py
+```
+
+Deploy anywhere that runs containers (a VPS, your Proxmox/k3s box, etc.) — just publish
+port 8000 (put it behind a reverse proxy / Tailscale for remote access).
+
 ## Configure
 
 **Keys (recommended — keeps them out of git):** copy the example file and fill it in:

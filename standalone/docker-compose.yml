@@ -1,0 +1,16 @@
+# Quanta standalone — one-command build & deploy.
+#   cp .env.example .env   # (optional) add your API keys
+#   docker compose up -d --build
+#   open http://localhost:8000
+services:
+  quanta:
+    build: .
+    image: quanta-standalone:latest
+    container_name: quanta
+    ports:
+      - "8000:8000"
+    # .env is optional — without keys it runs in synthetic/mock demo mode.
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
