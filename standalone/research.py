@@ -21,6 +21,12 @@ Candidates:
   pull_sma10      close>SMA200 and a fresh cross below SMA10, exit close>SMA10
   breakout20      20-day high close + close>SMA50 (momentum), exit close<SMA20
 
+Rotation portfolios (cross-sectional momentum — hold the top-k sectors by trailing
+relative strength vs SPY, rebalance every `hold` bars):
+  rot_top1_3m / rot_top3_1m / rot_top3_3m / rot_top3_6m   (k × lookback grid)
+  rot_top3_3m_reg   same but a sector must also be above its 200-SMA (else cash)
+  rot_lag3_3m       buys the 3 *weakest* (sector mean-reversion, the contra test)
+
 Run:  python research.py        (uses your Polygon key; ~2.5 min to fetch)
       QUANTA_SYNTH_BARS=1 python research.py   (synthetic, instant — machinery only)
 """
@@ -154,6 +160,71 @@ STRATS = {
 }
 
 
+# ── cross-sectional rotation portfolios ──────────────────────────────────────
+def _align_by_date(bars_map, spy_bars):
+    """Align every symbol's closes on the intersection of trading dates."""
+    import datetime as dtm
+
+    def dates(bars):
+        return [dtm.datetime.fromtimestamp(b["t"] / 1000, dtm.timezone.utc).date() for b in bars]
+
+    sets = [set(dates(b)) for b in bars_map.values()] + [set(dates(spy_bars))]
+    common = sorted(set.intersection(*sets))
+    idx = {d: i for i, d in enumerate(common)}
+    out = {}
+    for s, bars in bars_map.items():
+        col = [None] * len(common)
+        for b, d in zip(bars, dates(bars)):
+            if d in idx:
+                col[idx[d]] = b["c"]
+        out[s] = col
+    spy = [None] * len(common)
+    for b, d in zip(spy_bars, dates(spy_bars)):
+        if d in idx:
+            spy[idx[d]] = b["c"]
+    return out, spy
+
+
+def rotation_trades(bars_map, spy_bars, k=3, lb=63, hold=21, regime=False, worst=False):
+    """Every `hold` bars, rank sectors by trailing `lb`-day return minus SPY's and
+    hold the top-k (or bottom-k if worst) until the next rebalance. No lookahead:
+    the rank at bar i uses returns up to bar i; the position runs i -> i+hold."""
+    C, spy = _align_by_date(bars_map, spy_bars)
+    n = len(spy)
+    trades = []
+    i = max(WARMUP, lb)
+    while i < n - 1:
+        j = min(i + hold, n - 1)
+        scored = []
+        for s, c in C.items():
+            if not (c[i] and c[i - lb] and c[j]):
+                continue
+            r = c[i] / c[i - lb] - 1
+            if spy[i] and spy[i - lb]:
+                r -= spy[i] / spy[i - lb] - 1
+            if regime:
+                win = [x for x in c[i - 200:i] if x is not None]
+                if len(win) < 150 or c[i] <= sum(win) / len(win):
+                    continue
+            scored.append((r, s))
+        scored.sort(reverse=not worst)
+        for r, s in scored[:k]:
+            trades.append({"sym": s, "entry_i": i, "exit_i": j, "ret": C[s][j] / C[s][i] - 1,
+                           "hold": j - i, "tt": _tt(i, n)})
+        i = j
+    return trades
+
+
+ROT_STRATS = {
+    "rot_top1_3m":     dict(k=1, lb=63),
+    "rot_top3_1m":     dict(k=3, lb=21),
+    "rot_top3_3m":     dict(k=3, lb=63),
+    "rot_top3_6m":     dict(k=3, lb=126),
+    "rot_top3_3m_reg": dict(k=3, lb=63, regime=True),
+    "rot_lag3_3m":     dict(k=3, lb=63, worst=True),
+}
+
+
 # ── performance ──────────────────────────────────────────────────────────────
 def perf(trades):
     rets = [t["ret"] for t in trades]
@@ -214,6 +285,7 @@ def main():
         bars_map[s] = b
         if src == "polygon":
             time.sleep(13)
+    spy_bars, src_spy = q.load_bars("SPY")
     print("  source=%s, bars/symbol≈%d, train=%.0f%%/test=%.0f%%\n"
           % (src, len(bars_map[syms[0]]), TRAIN_FRAC * 100, (1 - TRAIN_FRAC) * 100))
 
@@ -226,6 +298,8 @@ def main():
         ix = _ind(bars)
         for name, fn in STRATS.items():
             all_tr[name] += fn(bars, ix, s)
+    for name, kw in ROT_STRATS.items():
+        all_tr[name] = rotation_trades(bars_map, spy_bars, **kw)
 
     print("=" * 110)
     print("SECTOR-ETF STRATEGY RESEARCH  —  long-only, per-trade %% returns, no lookahead")
@@ -234,7 +308,7 @@ def main():
         print("\n### %s window ###  (buy&hold benchmark first)" % mode.upper())
         print(row("buy&hold (eq-weight)", bench_buyhold(bars_map, syms, mode)))
         scored = []
-        for name in STRATS:
+        for name in all_tr:
             sub = [t for t in all_tr[name] if mode == "all" or t["tt"] == mode]
             p = perf(sub)
             scored.append((name, p))
@@ -247,10 +321,11 @@ def main():
     print("\n" + "=" * 110)
     print("ROBUSTNESS (survives out-of-sample?):")
     cand = []
-    for name in STRATS:
+    for name in all_tr:
         tr = perf([t for t in all_tr[name] if t["tt"] == "train"])
         te = perf([t for t in all_tr[name] if t["tt"] == "test"])
-        if te and tr and te["n"] >= 15 and te["avg"] > 0 and te["pf"] > 1.1:
+        # a real edge must be positive in BOTH windows (sign-flips are noise)
+        if te and tr and te["n"] >= 15 and tr["avg"] > 0 and te["avg"] > 0 and te["pf"] > 1.1:
             cand.append((name, tr, te))
     cand.sort(key=lambda x: x[2]["sharpe"], reverse=True)
     if not cand:

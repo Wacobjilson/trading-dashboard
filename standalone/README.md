@@ -9,10 +9,11 @@ Python 3 (standard library only) serving one HTML page.
 
 | Tab | What it shows |
 |-----|---------------|
-| **Signals** | The **out-of-sample-validated edge**: Connors **RSI(2) mean-reversion** on the sector ETFs. BUY when a sector is above its 200-day SMA and RSI(2) < 10; exit when price closes back above the 5-day SMA. Live per-sector state (BUY / Arming / Flat / Bear), RSI(2), the exit level, and distance to exit. |
-| **Rotation** | The 11 SPDR sector ETFs ranked by relative strength vs SPY (1w/1m/3m) with an RRG-style scatter (Leading / Weakening / Lagging / Improving) — *where the money is moving*. |
-| **Entries** | A **sector-ETF-only** scanner for **50% retracement setups** (daily & weekly). Swings come from an ATR-scaled **ZigZag** (real pivots). Each candidate gets a multi-factor **confluence score** (hover it for the breakdown), entry zone, ATR-buffered stop, prior-swing + 1.272-extension targets, R:R, RSI and RS-vs-SPY. |
-| **Chart** | Per-symbol SVG candlestick: SMA20/50, the ZigZag swing pivots, swing high/low, Fib 38.2/50/61.8 and the shaded entry zone. Click any Rotation/Entries row to chart it. |
+| **Signals** | The **out-of-sample-validated edge**: Connors **RSI(2) mean-reversion** on the sector ETFs. BUY when a sector is above its 200-day SMA and RSI(2) < 10; exit when price closes back above the 5-day SMA. Live per-sector state (BUY / Arming / Flat / Bear), RSI(2) on the last close **plus a live provisional RSI(2)** ("if today closed right now" — watch it into the last hour), the exit level, and distance to exit. |
+| **Rotation** | The 11 SPDR sector ETFs ranked by relative strength vs SPY (**1d/1w/1m/3m/6m/1y**) with an RRG-style scatter (Leading / Weakening / Lagging / Improving), plus **breadth**: sectors above their 20/50/200-day SMAs, quadrant counts, and the equal-weight-vs-SPY 1-month spread (broadening vs narrowing leadership). Also σ-adjusted 3-month return and relative volume — *where the money is moving, and how broad the move is*. |
+| **Entries** | A **sector-ETF-only** scanner for **50% retracement setups** (daily & weekly). Swings come from an ATR-scaled **ZigZag** (real pivots). Each candidate gets a multi-factor **confluence score** (hover it for the breakdown), entry zone, ATR-buffered stop, prior-swing + 1.272-extension targets, R:R, RSI and RS-vs-SPY. **“＋track”** sends the plan straight to the Portfolio tab. |
+| **Portfolio** | Open positions with **live P&L, R-multiples and progress-to-target bars**, sector allocation, and realized P&L. Persists across restarts (`quanta_state.json`). The alert engine watches every position automatically. |
+| **Chart** | Per-symbol SVG candlestick: SMA20/50, the ZigZag swing pivots, swing high/low, Fib 38.2/50/61.8 and the shaded entry zone — **live**: the forming bar updates from live quotes every few seconds with an amber live-price tag (toggleable). Click any Rotation/Entries row to chart it. |
 | **Futures 15m** | Intraday **context** for ES/NQ/RTY/YM via 15-min ETF proxies (SPY/QQQ/IWM/DIA): session VWAP, opening range, prior-day H/L, EMA9/20, RSI(2), and a 15-min chart. Real ES/NQ need a paid futures feed; this is RTH-proxy context, **not** a backtested signal. |
 | **Markets** | Macro overview grid (SPY, QQQ, IWM, DIA, VIX, CL, GC, US10Y, DXY). |
 | **News** | Market news in chronological order (newest first), auto-categorized (Fed, Inflation, Jobs, Earnings, M&A…) with sentiment + impact. |
@@ -25,6 +26,23 @@ Python 3 (standard library only) serving one HTML page.
 >
 > **No Polygon key?** Set `QUANTA_SYNTH_BARS=1` (or just leave it unset) to run the
 > rotation/entries/chart features on **synthetic bars** so you can explore the UI.
+
+## Alerts (🔔 in the header)
+
+A server-side alert engine re-evaluates everything after every live-quote sweep (~30s):
+
+* **Signals** — a sector's RSI(2) state *changes*: BUY triggered, Arming, or the exit
+  trigger (close back above the 5-SMA) fires while you're in a bounce.
+* **Setups** — an Entries candidate goes **Ready**, or price comes within 0.75×ATR of
+  the 50% entry.
+* **Positions** — price reaches **85% of the move to your target**, uses **75% of your
+  planned risk**, or actually **hits the stop/target**.
+* **Price levels** — your own custom `SYM ≥/≤ price` alerts (set them in the bell panel).
+
+Alerts appear in the bell panel, and (optionally) as **browser notifications + a beep** —
+click "enable notifications" in the panel. Everything is deduped so one condition
+alerts once, not every 30 seconds. Live quotes cover the 11 sector ETFs, SPY/QQQ/IWM,
+and any symbol you hold or have an alert on.
 
 ## Strategy research (`research.py`)
 
@@ -45,6 +63,15 @@ PF ~2.0, ~+0.5%/trade across variants); momentum/breakout did **not** (PF 1.6, 3
 win, big drawdown). That out-of-sample RSI(2) result is what the **Signals** tab serves.
 Caveats: returns are pre-slippage (idealized close fills); 2 years is a mostly-bullish
 sample, so the 200-SMA regime filter stays on as the crash guardrail.
+
+**Rotation portfolios (added later):** cross-sectional momentum — hold the top-k
+sectors by trailing RS vs SPY, rebalance every 21 bars — tested over a k × lookback
+grid. **`rot_top3_1m` (top-3 by 1-month RS) survived out-of-sample**: TRAIN
++1.40%/trade PF 2.88 → TEST +2.51%/trade PF 2.92, 67% win, n=30. The 3m and 6m
+lookbacks decayed out-of-sample (PF 1.47 / 1.06), which is a multiple-comparisons
+warning: with only 30 test trades, treat the 1-month version as a **candidate** edge,
+not a proven one. It's shown in the **Rotation** tab as the model portfolio (with these
+stats attached), and an alert fires whenever its top-3 composition changes.
 
 ### Intraday research (`research_futures.py`) — honest negative result
 
@@ -153,7 +180,9 @@ docker run -d -p 8000:8000 \
 
 Keys come from **environment variables** (never baked into the image — `keys.local.json`
 is in `.dockerignore`). With no keys it runs in synthetic/mock demo mode. The container
-has a healthcheck and `restart: unless-stopped`, so it survives reboots.
+has a healthcheck and `restart: unless-stopped`, so it survives reboots. Your positions
+and price alerts persist in `./data/quanta_state.json` (bind-mounted to `/data`,
+gitignored).
 
 Run a backtest inside the running container:
 

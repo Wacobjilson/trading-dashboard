@@ -7,3 +7,5 @@ README.md
 Dockerfile
 .dockerignore
 docker-compose.yml
+data/
+quanta_state.json

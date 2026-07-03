@@ -39,3 +39,7 @@ Thumbs.db
 # Build artifacts
 dist/
 *.tgz
+
+# Quanta runtime state (positions/price alerts) — user data, never commit
+standalone/data/
+quanta_state.json

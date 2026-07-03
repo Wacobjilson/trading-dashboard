@@ -15,4 +15,9 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # open positions + custom price alerts persist here (bind-mounted below)
+      QUANTA_DATA: /data
+    volumes:
+      - ./data:/data
     restart: unless-stopped

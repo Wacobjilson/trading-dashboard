@@ -342,6 +342,14 @@ def clamp(x, lo=0.0, hi=100.0):
     return max(lo, min(hi, x))
 
 
+def _stdev(xs):
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    m = sum(xs) / n
+    return (sum((x - m) ** 2 for x in xs) / (n - 1)) ** 0.5
+
+
 FIB = [0.236, 0.382, 0.5, 0.618, 0.786]
 
 # Default trade-level scheme: enter at the 50% retracement, stop just outside the
@@ -640,22 +648,63 @@ def rotation():
             continue
         c = [b["c"] for b in bars]
         r1w, r1m, r3m = rel(c, 5), rel(c, 21), rel(c, 63)
+        r6m, r1y = rel(c, 126), rel(c, 252)
         ratio = r3m if r3m is not None else 0.0     # x-axis: 3-month relative strength
         mom = r1m if r1m is not None else 0.0        # y-axis: 1-month relative momentum
         quad = ("Leading" if ratio >= 0 and mom >= 0 else "Weakening" if ratio >= 0 and mom < 0
                 else "Improving" if ratio < 0 and mom >= 0 else "Lagging")
-        s50 = sma(c, 50)
+        s20, s50, s200 = sma(c, 20), sma(c, 50), sma(c, 200)
+        # volatility-adjusted 3-month return (Sharpe-ish: abs return / annualized vol)
+        rets = [c[i] / c[i - 1] - 1 for i in range(max(1, len(c) - 63), len(c))]
+        vol_ann = _stdev(rets) * (252 ** 0.5)
+        abs3m = pct_return(c, 63)
+        vol_adj = round((abs3m / 100) / vol_ann, 2) if (vol_ann and abs3m is not None) else None
+        vols = [b.get("v", 0) for b in bars]
+        v20 = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else None
+        rel_vol = round(vols[-1] / v20, 2) if v20 else None
         out["sectors"].append({
             "symbol": sym, "name": name, "price": round(c[-1], 2),
             "chg1d": round(pct_return(c, 1) or 0, 2), "rs1w": r1w, "rs1m": r1m, "rs3m": r3m,
+            "rs6m": r6m, "rs1y": r1y,
             "rsRatio": round(ratio, 2), "rsMom": round(mom, 2), "quadrant": quad,
             "trend": "up" if (s50 and c[-1] > s50) else "down",
+            "above20": bool(s20 and c[-1] > s20), "above50": bool(s50 and c[-1] > s50),
+            "above200": bool(s200 and c[-1] > s200), "volAdj": vol_adj, "relVol": rel_vol,
         })
     ranked = [s for s in out["sectors"] if s.get("rs3m") is not None]
     ranked.sort(key=lambda s: s["rs3m"], reverse=True)
     out["sectors"] = ranked + [s for s in out["sectors"] if s.get("rs3m") is None]
     out["leaders"] = [s["symbol"] for s in ranked[:3]]
     out["laggards"] = [s["symbol"] for s in ranked[-3:]][::-1]
+    # Rotation model portfolio (research.py, out-of-sample survivor): hold the top-3
+    # sectors by 1-MONTH RS vs SPY, rebalance monthly. TRAIN +1.40%/trade PF 2.88 |
+    # TEST +2.51%/trade PF 2.92, 67% win, n=30 — but a small sample: candidate edge,
+    # weaker statistical footing than the RSI(2) signal. Longer lookbacks (3m/6m)
+    # decayed out-of-sample, so this stays honest-labeled.
+    by_1m = sorted([s for s in out["sectors"] if s.get("rs1m") is not None],
+                   key=lambda s: s["rs1m"], reverse=True)
+    if by_1m:
+        out["model"] = {
+            "holdings": [s["symbol"] for s in by_1m[:3]],
+            "rule": "Hold the top-3 sectors by 1-month RS vs SPY; rebalance monthly.",
+            "stats": {"win": 66.7, "pf": 2.92, "avg": 2.51, "trades": 30},
+            "caveat": "out-of-sample survivor, but only 30 test trades — candidate edge, size accordingly",
+        }
+    if ranked:
+        quads = {}
+        for s in ranked:
+            quads[s["quadrant"]] = quads.get(s["quadrant"], 0) + 1
+        rs1ms = [s["rs1m"] for s in ranked if s.get("rs1m") is not None]
+        # ewMinusSpy1m = avg sector 1m return minus SPY's (equal-weight vs cap-weight
+        # proxy at the sector level): positive = broad participation, negative = narrow.
+        out["breadth"] = {
+            "n": len(ranked),
+            "above20": sum(1 for s in ranked if s["above20"]),
+            "above50": sum(1 for s in ranked if s["above50"]),
+            "above200": sum(1 for s in ranked if s["above200"]),
+            "quadrants": quads,
+            "ewMinusSpy1m": round(sum(rs1ms) / len(rs1ms), 2) if rs1ms else None,
+        }
     return out
 
 
@@ -691,9 +740,21 @@ def signals():
             sig, rank = "Bear — stand aside", 3
         else:
             sig, rank = "Flat", 2
+        # Live overlay: provisional RSI(2) "if today closed right now" from the live
+        # quote (replaces today's partial bar if the cached daily bars already have it).
+        lp = get_live(sym, 300)
+        live_px = chg_live = r2_live = None
+        if lp and lp.get("last"):
+            live_px, chg_live = lp["last"], lp.get("changePercent")
+            last_day = dt.datetime.fromtimestamp(bars[-1]["t"] / 1000, dt.timezone.utc).date()
+            base = c[:-1] if last_day >= dt.date.today() else c
+            r2_live = rsi(base + [live_px], 2)
         out["sectors"].append({
             "symbol": sym, "name": name, "price": round(close, 2),
             "rsi2": round(r2, 1) if r2 is not None else None,
+            "priceLive": round(live_px, 2) if live_px else None,
+            "chgLive": round(chg_live, 2) if chg_live is not None else None,
+            "rsi2Live": round(r2_live, 1) if r2_live is not None else None,
             "sma5": round(s5, 2) if s5 else None, "sma200": round(s200, 2) if s200 else None,
             "regime": "bull" if bull else "bear", "signal": sig, "rank": rank,
             "distExit": round((close / s5 - 1) * 100, 2) if s5 else None,
@@ -1031,6 +1092,398 @@ def calendar_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Persistent state — open positions + custom price alerts (survives restarts).
+# Lives in QUANTA_DATA (mount a volume in Docker) or next to quanta.py.
+# ─────────────────────────────────────────────────────────────────────────────
+DATA_DIR = os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__))
+STATE_PATH = os.path.join(DATA_DIR, "quanta_state.json")
+_state_lock = threading.Lock()
+_state = {"positions": [], "closed": [], "price_alerts": [], "next_id": 1}
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            d = json.load(f)
+        with _state_lock:
+            for k in _state:
+                if k in d:
+                    _state[k] = d[k]
+    except (FileNotFoundError, ValueError):
+        pass
+
+
+def save_state():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with _state_lock:
+            body = json.dumps(_state, indent=1)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(body)
+        os.replace(tmp, STATE_PATH)
+    except OSError as e:
+        print("warn: could not persist state (%s) — positions/alerts won't survive restart" % e)
+
+
+def _next_id():
+    with _state_lock:
+        i = _state["next_id"]
+        _state["next_id"] = i + 1
+    return i
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live quotes for the alert/chart universe (sector ETFs + index ETFs + anything
+# you hold or have a price alert on). Separate from the Markets-tab loop so the
+# free-tier rate limits stay comfortable.
+# ─────────────────────────────────────────────────────────────────────────────
+_live_lock, _live = threading.Lock(), {}    # sym -> {last, change, changePercent, ts, source}
+
+
+def live_universe():
+    syms = [s for s, _ in SECTORS] + [BENCH, "QQQ", "IWM"]
+    with _state_lock:
+        syms += [p["symbol"] for p in _state["positions"]]
+        syms += [a["symbol"] for a in _state["price_alerts"] if not a.get("fired")]
+    out = []
+    for s in syms:
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def get_live(sym, max_age=120):
+    with _live_lock:
+        d = _live.get(sym)
+    return d if d and (time.time() - d["ts"]) <= max_age else None
+
+
+def _seed_mock_from_bars(sym):
+    """In demo mode, start the mock random-walk at the synthetic bars' last close so
+    live prices, charts and alerts stay coherent with each other."""
+    if sym in _mock_q:
+        return
+    b = get_bars(sym)
+    if b:
+        base = b[-1]["c"]
+        _mock_q[sym] = {"last": base, "pc": b[-2]["c"] if len(b) > 1 else base,
+                        "o": base, "h": base, "l": base, "v": 10_000_000}
+
+
+def live_loop():
+    provider = active_provider()
+    fn = QUOTE_FNS[provider]
+    while True:
+        for sym in live_universe():
+            try:
+                if provider == "mock":
+                    _seed_mock_from_bars(sym)
+                q = fn(sym, sym)
+                src = provider
+            except Exception:
+                _seed_mock_from_bars(sym)
+                q = quote_mock(sym, sym)
+                src = "mock"
+            with _live_lock:
+                _live[sym] = {"last": q["last"], "change": q.get("change"),
+                              "changePercent": q.get("changePercent"),
+                              "ts": time.time(), "source": src}
+            if provider == "alphavantage":
+                time.sleep(13)
+        check_alerts()
+        time.sleep(30)
+
+
+def _live_px(sym):
+    d = get_live(sym, max_age=300)
+    if d and d.get("last"):
+        return d["last"]
+    b = get_bars(sym)
+    return b[-1]["c"] if b else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Portfolio — open positions with live P&L, R-multiples and progress-to-target.
+# ─────────────────────────────────────────────────────────────────────────────
+def _fnum(v):
+    if v in (None, ""):
+        return None
+    return float(v)
+
+
+def position_add(d):
+    sym = str(d.get("symbol", "")).upper().strip()
+    entry = _fnum(d.get("entry"))
+    if not sym or entry is None or entry <= 0:
+        return {"ok": False, "error": "symbol and entry price are required"}
+    p = {"id": _next_id(), "symbol": sym,
+         "dir": "short" if d.get("dir") == "short" else "long",
+         "qty": _fnum(d.get("qty")) or 1,
+         "entry": entry, "stop": _fnum(d.get("stop")), "target": _fnum(d.get("target")),
+         "note": str(d.get("note", ""))[:120], "opened": time.time()}
+    with _state_lock:
+        _state["positions"].append(p)
+    save_state()
+    push_alert("position", sym, "position opened: %s %g @ %.2f (stop %s · target %s)"
+               % (p["dir"], p["qty"], p["entry"],
+                  ("%.2f" % p["stop"]) if p["stop"] else "—",
+                  ("%.2f" % p["target"]) if p["target"] else "—"), "info", entry, dedupe_hours=0)
+    return {"ok": True, "position": p}
+
+
+def position_close(d):
+    pid = int(d.get("id", 0))
+    with _state_lock:
+        p = next((x for x in _state["positions"] if x["id"] == pid), None)
+    if not p:
+        return {"ok": False, "error": "position not found"}
+    exit_px = _fnum(d.get("price")) or _live_px(p["symbol"]) or p["entry"]
+    sgn = 1 if p["dir"] == "long" else -1
+    pl = (exit_px - p["entry"]) * sgn * (p.get("qty") or 1)
+    with _state_lock:
+        _state["positions"] = [x for x in _state["positions"] if x["id"] != pid]
+        _state["closed"].append({**p, "exit": round(exit_px, 4), "pl": round(pl, 2), "closedAt": time.time()})
+        del _state["closed"][:-200]
+    save_state()
+    return {"ok": True, "pl": round(pl, 2), "exit": round(exit_px, 2)}
+
+
+def position_delete(d):
+    pid = int(d.get("id", 0))
+    with _state_lock:
+        n0 = len(_state["positions"])
+        _state["positions"] = [x for x in _state["positions"] if x["id"] != pid]
+        changed = len(_state["positions"]) != n0
+    if changed:
+        save_state()
+    return {"ok": changed}
+
+
+def positions_view():
+    with _state_lock:
+        open_p = [dict(p) for p in _state["positions"]]
+        closed = [dict(p) for p in _state["closed"][-50:]]
+    rows, tot_val, tot_pl, alloc = [], 0.0, 0.0, {}
+    for p in open_p:
+        px = _live_px(p["symbol"])
+        sgn = 1 if p["dir"] == "long" else -1
+        qty = p.get("qty") or 1
+        pl = plpct = rmult = prog = None
+        if px:
+            pl = (px - p["entry"]) * sgn * qty
+            plpct = (px / p["entry"] - 1) * 100 * sgn
+            risk = abs(p["entry"] - p["stop"]) if p.get("stop") else None
+            if risk:
+                rmult = (px - p["entry"]) * sgn / risk
+            if p.get("target") and p["target"] != p["entry"]:
+                prog = (px - p["entry"]) / (p["target"] - p["entry"]) * 100
+            val = px * qty
+            tot_val += val
+            tot_pl += pl
+            alloc[p["symbol"]] = alloc.get(p["symbol"], 0) + val
+        live = get_live(p["symbol"], 300)
+        rows.append({**p, "last": round(px, 2) if px else None,
+                     "liveSource": live.get("source") if live else "bars",
+                     "pl": round(pl, 2) if pl is not None else None,
+                     "plPct": round(plpct, 2) if plpct is not None else None,
+                     "rMult": round(rmult, 2) if rmult is not None else None,
+                     "progress": round(prog, 1) if prog is not None else None,
+                     "distStop": round((px / p["stop"] - 1) * 100, 2) if (px and p.get("stop")) else None,
+                     "distTarget": round((px / p["target"] - 1) * 100, 2) if (px and p.get("target")) else None})
+    by_sym = {}
+    for c in closed:
+        by_sym.setdefault(c["symbol"], 0.0)
+        by_sym[c["symbol"]] += c.get("pl") or 0
+    return {"open": rows, "closed": closed[::-1],
+            "totalValue": round(tot_val, 2), "openPL": round(tot_pl, 2),
+            "realizedPL": round(sum(by_sym.values()), 2),
+            "realizedBySymbol": [{"symbol": k, "pl": round(v, 2)} for k, v in
+                                 sorted(by_sym.items(), key=lambda kv: -kv[1])],
+            "alloc": [{"symbol": k, "value": round(v, 2),
+                       "pct": round(v / tot_val * 100, 1) if tot_val else 0}
+                      for k, v in sorted(alloc.items(), key=lambda kv: -kv[1])]}
+
+
+def price_alert_add(d):
+    sym = str(d.get("symbol", "")).upper().strip()
+    px = _fnum(d.get("price"))
+    op = ">=" if d.get("op") != "<=" else "<="
+    if not sym or px is None or px <= 0:
+        return {"ok": False, "error": "symbol and price are required"}
+    a = {"id": _next_id(), "symbol": sym, "op": op, "price": px,
+         "note": str(d.get("note", ""))[:120], "fired": False, "created": time.time()}
+    with _state_lock:
+        _state["price_alerts"].append(a)
+    save_state()
+    return {"ok": True, "alert": a}
+
+
+def price_alert_delete(d):
+    aid = int(d.get("id", 0))
+    with _state_lock:
+        n0 = len(_state["price_alerts"])
+        _state["price_alerts"] = [x for x in _state["price_alerts"] if x["id"] != aid]
+        changed = len(_state["price_alerts"]) != n0
+    if changed:
+        save_state()
+    return {"ok": changed}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert engine — evaluated after every live-quote sweep (~30s). Alerts fire for:
+#   * RSI(2) signal changes (BUY triggered / arming / exit trigger)
+#   * 50%-retracement setups going Ready, or price approaching the entry zone
+#   * open positions approaching (or hitting) their stop / target
+#   * custom price alerts
+# Everything is deduped so the feed doesn't spam the same message all day.
+# ─────────────────────────────────────────────────────────────────────────────
+_alerts_lock = threading.Lock()
+_alerts = []              # newest first, capped
+_alert_seen = {}          # dedupe key -> last fired ts
+_alert_seq = [0]
+_ALERTS_MAX = 200
+
+
+def push_alert(kind, symbol, msg, level="info", price=None, dedupe_hours=12.0, key=None):
+    # Dedupe on `key` when the message embeds a moving price (else on the message).
+    key = "%s|%s|%s" % (kind, symbol, key or msg)
+    now = time.time()
+    with _alerts_lock:
+        if dedupe_hours and now - _alert_seen.get(key, 0) < dedupe_hours * 3600:
+            return False
+        _alert_seen[key] = now
+        _alert_seq[0] += 1
+        _alerts.insert(0, {"id": _alert_seq[0], "ts": now, "kind": kind, "symbol": symbol,
+                           "msg": msg, "level": level,
+                           "price": round(price, 2) if price else None})
+        del _alerts[_ALERTS_MAX:]
+    return True
+
+
+_prev_signal = {}
+
+
+def _check_signal_alerts():
+    d = signals()
+    for s in d.get("sectors", []):
+        if s.get("warming"):
+            continue
+        sym, sig = s["symbol"], s["signal"]
+        prev = _prev_signal.get(sym)
+        if prev is not None and sig != prev:
+            if sig == "BUY":
+                push_alert("signal", sym, "RSI(2) BUY triggered — RSI2 %.1f; enter near the close, exit close > 5-SMA"
+                           % (s.get("rsi2") or 0), "buy", s.get("priceLive") or s.get("price"))
+            elif sig == "Arming":
+                push_alert("signal", sym, "RSI(2) arming — RSI2 %.1f and under the 5-SMA; a BUY may set up"
+                           % (s.get("rsi2") or 0), "info", s.get("priceLive") or s.get("price"))
+            elif prev == "BUY" and (s.get("distExit") or 0) > 0:
+                push_alert("signal", sym, "RSI(2) exit trigger — close back above the 5-day SMA; take the bounce",
+                           "sell", s.get("priceLive") or s.get("price"))
+        _prev_signal[sym] = sig
+
+
+def _check_setup_alerts():
+    for sym, _name in SECTORS:
+        a = analyze(sym)
+        if not a.get("ok"):
+            continue
+        px = _live_px(sym) or a["price"]
+        av = a.get("atr") or 0
+        if a["status"] == "Ready":
+            push_alert("setup", sym, "50%% pullback READY (%s, score %s) — entry %.2f · stop %.2f · target %.2f"
+                       % (a["direction"], a["score"], a["entry"], a["stop"], a["target"]),
+                       "setup", px, dedupe_hours=24, key="ready-" + a["direction"])
+        elif a["status"] == "Approaching" and av and abs(px - a["entry"]) <= 0.75 * av:
+            push_alert("setup", sym, "approaching the 50%% entry %.2f (now %.2f, %+.1f%% away · %s)"
+                       % (a["entry"], px, (px / a["entry"] - 1) * 100, a["direction"]),
+                       "info", px, dedupe_hours=24, key="near-entry-" + a["direction"])
+
+
+def _check_position_alerts():
+    with _state_lock:
+        positions = [dict(p) for p in _state["positions"]]
+    for p in positions:
+        px = _live_px(p["symbol"])
+        if not px:
+            continue
+        sgn = 1 if p["dir"] == "long" else -1
+        ent, stp, tgt = p["entry"], p.get("stop"), p.get("target")
+        if tgt:
+            if (px - tgt) * sgn >= 0:
+                push_alert("position", p["symbol"], "TARGET HIT — now %.2f vs target %.2f; consider taking profit"
+                           % (px, tgt), "target", px, dedupe_hours=24, key="target-hit-%d" % p["id"])
+            else:
+                total = abs(tgt - ent)
+                done = (px - ent) * sgn
+                if total and done / total >= 0.85:
+                    push_alert("position", p["symbol"], "approaching target %.2f — %.0f%% of the move done (now %.2f)"
+                               % (tgt, done / total * 100, px), "warn", px, key="near-target-%d" % p["id"])
+        if stp:
+            if (stp - px) * sgn >= 0:
+                push_alert("position", p["symbol"], "STOP HIT — now %.2f vs stop %.2f; exit per plan"
+                           % (px, stp), "stop", px, dedupe_hours=24, key="stop-hit-%d" % p["id"])
+            else:
+                risk = abs(ent - stp)
+                adverse = (ent - px) * sgn
+                if risk and adverse / risk >= 0.75:
+                    push_alert("position", p["symbol"], "approaching stop %.2f — %.0f%% of planned risk used (now %.2f)"
+                               % (stp, adverse / risk * 100, px), "warn", px, key="near-stop-%d" % p["id"])
+
+
+_prev_model = []
+
+
+def _check_rotation_alerts():
+    global _prev_model
+    m = rotation().get("model")
+    if not m:
+        return
+    hold = m["holdings"]
+    if _prev_model and set(hold) != set(_prev_model):
+        added = [s for s in hold if s not in _prev_model]
+        dropped = [s for s in _prev_model if s not in hold]
+        push_alert("rotation", ", ".join(added) or "SECTORS",
+                   "rotation model change — in: %s · out: %s (top-3 by 1-month RS vs SPY)"
+                   % (", ".join(added) or "—", ", ".join(dropped) or "—"), "setup", dedupe_hours=12)
+    _prev_model = hold
+
+
+def _check_price_alerts():
+    fired = False
+    with _state_lock:
+        pending = [dict(a) for a in _state["price_alerts"] if not a.get("fired")]
+    for a in pending:
+        px = _live_px(a["symbol"])
+        if not px:
+            continue
+        hit = px >= a["price"] if a["op"] == ">=" else px <= a["price"]
+        if hit:
+            push_alert("price", a["symbol"], "price alert hit: %s %s %.2f (now %.2f)%s"
+                       % (a["symbol"], a["op"], a["price"], px,
+                          (" — " + a["note"]) if a.get("note") else ""), "price", px, dedupe_hours=0)
+            with _state_lock:
+                a2 = next((x for x in _state["price_alerts"] if x["id"] == a["id"]), None)
+                if a2:
+                    a2["fired"] = True
+                    a2["firedAt"] = time.time()
+                    a2["firedPx"] = round(px, 2)
+            fired = True
+    if fired:
+        save_state()
+
+
+def check_alerts():
+    for fn in (_check_signal_alerts, _check_setup_alerts, _check_rotation_alerts,
+               _check_position_alerts, _check_price_alerts):
+        try:
+            fn()
+        except Exception as e:
+            print("warn: alert check %s failed: %s" % (fn.__name__, e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP server
 # ─────────────────────────────────────────────────────────────────────────────
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1043,6 +1496,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1078,6 +1533,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("news", 1e9) or fetch_news())
         elif path == "/api/calendar":
             self._json(cache_get("calendar", 1e9) or fetch_calendar())
+        elif path == "/api/live":
+            with _live_lock:
+                self._json({"quotes": {k: dict(v) for k, v in _live.items()}, "serverTime": time.time()})
+        elif path == "/api/alerts":
+            with _alerts_lock:
+                items = [dict(a) for a in _alerts]
+            with _state_lock:
+                pending = [dict(a) for a in _state["price_alerts"]]
+            self._json({"alerts": items, "priceAlerts": pending, "serverTime": time.time()})
+        elif path == "/api/portfolio":
+            self._json(positions_view())
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -1086,6 +1552,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, b"index.html not found next to quanta.py", "text/plain")
         else:
             self._send(404, b"not found", "text/plain")
+
+    POST_ROUTES = {
+        "/api/portfolio/add": position_add,
+        "/api/portfolio/close": position_close,
+        "/api/portfolio/delete": position_delete,
+        "/api/alert/add": price_alert_add,
+        "/api/alert/delete": price_alert_delete,
+    }
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        fn = self.POST_ROUTES.get(path)
+        if not fn:
+            self._send(404, b"not found", "text/plain")
+            return
+        try:
+            ln = int(self.headers.get("Content-Length") or 0)
+            d = json.loads(self.rfile.read(ln).decode("utf-8")) if ln else {}
+            if not isinstance(d, dict):
+                raise ValueError("expected a JSON object")
+        except (ValueError, UnicodeDecodeError) as e:
+            self._json({"ok": False, "error": "bad request: %s" % e}, 400)
+            return
+        try:
+            self._json(fn(d))
+        except (KeyError, TypeError, ValueError) as e:
+            self._json({"ok": False, "error": str(e)}, 400)
+
+    def do_OPTIONS(self):
+        self._send(204, b"", "text/plain")
 
     def log_message(self, *args):
         pass
@@ -1098,12 +1594,17 @@ def _cache_and_return(key, fn):
 def main():
     prov = active_provider()
     bars_src = "synthetic (demo)" if (FORCE_SYNTH or not API_KEYS.get("polygon")) else "polygon (daily aggregates)"
+    load_state()
+    with _state_lock:
+        n_pos, n_pa = len(_state["positions"]), len([a for a in _state["price_alerts"] if not a.get("fired")])
     print("Quanta — quant swing companion")
     print("  quotes   : %s%s" % (prov, "  (no API key)" if prov == "mock" else ""))
     print("  bars     : %s — warming %d symbols in the background" % (bars_src, len(BAR_UNIVERSE)))
     print("  sectors  : %s" % ", ".join(s for s, _ in SECTORS))
+    print("  state    : %s (%d open positions, %d price alerts)" % (STATE_PATH, n_pos, n_pa))
+    print("  alerts   : signals · setups · position stop/target · price levels (checked ~30s)")
     print("  open     : http://localhost:%d/" % PORT)
-    for fn in (quotes_loop, bars_loop, news_loop, calendar_loop):
+    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop):
         threading.Thread(target=fn, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
