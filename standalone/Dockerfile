@@ -7,7 +7,8 @@ RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 WORKDIR /app
 # App = the server + the dashboard page. Research/backtest scripts included so you
 # can `docker exec` into the container and run them.
-COPY quanta.py index.html backtest.py research.py research_futures.py ./
+# *.md docs are the AI analyst's RAG knowledge base (see RAG_ARCHITECTURE.md)
+COPY quanta.py index.html backtest.py research.py research_futures.py *.md ./
 
 USER app
 EXPOSE 8000

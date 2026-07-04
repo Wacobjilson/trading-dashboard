@@ -1,5 +1,20 @@
 # Changelog (standalone platform)
 
+## 2026-07-04 · Phase 13 — local AI research analyst (Ollama)
+- Provider-modular AI layer (ollama default, anthropic adapter; config-only
+  switching, runtime model swap via /api/ai/config). Frontend never calls
+  Ollama — backend grounds every prompt in live platform payloads + TF-IDF
+  RAG over the local docs, with a safety preamble on every request.
+- Drawer UI (✨ AI): 12 modes (ask/morning/market/sector/company/portfolio/
+  government/critique/journal/models/experiment/explain) + 8-voice investment
+  committee + 5 structured debates, streamed with cancel, conversation
+  history, telemetry (latency/tokens), prompt cache; ✨ explain buttons on
+  gov brief / exposure profiles / chart setups.
+- Hard boundary: AI output has no code path into trades, weights, allocation
+  or research state — explain/critique only. Degrades gracefully when Ollama
+  is off. New docs: AI_ARCHITECTURE, OLLAMA_INTEGRATION, PROMPT_LIBRARY,
+  RAG_ARCHITECTURE, AI_LIMITATIONS.
+
 ## 2026-07-04 · Phase 11 — policy research workstation
 - **Morning brief** at the top of the Government tab (overnight items,
   changes vs snapshot history, sectors to watch, approaching catalysts,

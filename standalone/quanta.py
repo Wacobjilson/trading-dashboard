@@ -4904,6 +4904,533 @@ def government_view():
             "generatedAt": time.time()}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Research Analyst — local Ollama, provider-modular. The AI explains,
+# summarizes, critiques, questions; it NEVER decides. There is no code path
+# from AI output to trades, weights, allocation, experiments or registry
+# state — endpoints only read platform payloads and return text.
+# See AI_ARCHITECTURE.md / AI_LIMITATIONS.md.
+# ─────────────────────────────────────────────────────────────────────────────
+def _default_ollama_host():
+    # inside the container the host's Ollama is host.docker.internal (Docker
+    # Desktop proxies this to host loopback); outside it's plain localhost
+    return "http://host.docker.internal:11434" if os.path.exists("/.dockerenv") else "http://localhost:11434"
+
+
+AI_CFG = {
+    "enabled": _envbool("AI_ENABLED", True),
+    "provider": os.environ.get("AI_PROVIDER", "ollama"),
+    "host": (os.environ.get("OLLAMA_HOST") or _default_ollama_host()).rstrip("/"),
+    "model": os.environ.get("OLLAMA_MODEL", "qwen3:14b"),
+    "temperature": float(os.environ.get("AI_TEMPERATURE") or 0.4),
+    "numCtx": int(os.environ.get("AI_NUM_CTX") or 8192),
+    "maxTokens": int(os.environ.get("AI_MAX_TOKENS") or 1200),
+    "timeoutS": int(os.environ.get("AI_TIMEOUT") or 240),
+    "retries": int(os.environ.get("AI_RETRIES") or 1),
+    # qwen3-style reasoning: off by default — analyst notes don't need visible
+    # CoT and thinking tokens burn the num_predict budget (empty answers)
+    "think": _envbool("AI_THINK", False),
+}
+_ai_lock = threading.Lock()
+_ai_log = []          # telemetry: last 60 calls (mode, latency, tokens)
+_ai_cache = {}        # prompt-hash -> {"text","ts"} (10-min TTL)
+
+
+def _ollama_chat(messages, opts, stream_cb=None):
+    def call(with_think_param):
+        body = {"model": opts["model"], "messages": messages, "stream": stream_cb is not None,
+                "options": {"temperature": opts["temperature"], "num_ctx": opts["numCtx"],
+                            "num_predict": opts["maxTokens"]}}
+        if with_think_param:
+            body["think"] = bool(opts.get("think"))
+        req = urllib.request.Request(opts["host"] + "/api/chat", data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=opts["timeoutS"]) as r:
+            if stream_cb is None:
+                d = json.loads(r.read().decode("utf-8"))
+                if d.get("error"):
+                    raise RuntimeError("ollama: %s" % d["error"])
+                return {"text": (d.get("message") or {}).get("content", ""),
+                        "promptTokens": d.get("prompt_eval_count"), "outputTokens": d.get("eval_count"),
+                        "latencyMs": int((time.time() - t0) * 1000)}
+            out, ptk, otk = [], None, None
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line.decode("utf-8"))
+                if d.get("error"):
+                    raise RuntimeError("ollama: %s" % d["error"])
+                c = (d.get("message") or {}).get("content", "")
+                if c:
+                    out.append(c)
+                    stream_cb(c)
+                if d.get("done"):
+                    ptk, otk = d.get("prompt_eval_count"), d.get("eval_count")
+            return {"text": "".join(out), "promptTokens": ptk, "outputTokens": otk,
+                    "latencyMs": int((time.time() - t0) * 1000)}
+    try:
+        return call(True)
+    except urllib.error.HTTPError as e:
+        # older Ollama without the `think` parameter → retry without it
+        if e.code == 400:
+            return call(False)
+        raise
+
+
+def _anthropic_chat(messages, opts, stream_cb=None):
+    """Config-only provider switch (AI_PROVIDER=anthropic + ANTHROPIC_API_KEY)."""
+    key = _key("anthropic")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    sys_txt = "\n".join(m["content"] for m in messages if m["role"] == "system")
+    body = {"model": os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+            "max_tokens": opts["maxTokens"], "temperature": opts["temperature"],
+            "system": sys_txt, "messages": [m for m in messages if m["role"] != "system"]}
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "x-api-key": key,
+                                          "anthropic-version": "2023-06-01"}, method="POST")
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=opts["timeoutS"]) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    txt = "".join(b.get("text", "") for b in d.get("content", []))
+    if stream_cb:
+        stream_cb(txt)
+    u = d.get("usage", {})
+    return {"text": txt, "promptTokens": u.get("input_tokens"), "outputTokens": u.get("output_tokens"),
+            "latencyMs": int((time.time() - t0) * 1000)}
+
+
+AI_PROVIDERS = {"ollama": _ollama_chat, "anthropic": _anthropic_chat}
+
+
+def ai_chat(messages, mode="ask", stream_cb=None):
+    with _ai_lock:
+        opts = dict(AI_CFG)
+    if not opts["enabled"]:
+        raise RuntimeError("AI disabled (set AI_ENABLED=1)")
+    fn = AI_PROVIDERS.get(opts["provider"])
+    if not fn:
+        raise RuntimeError("unknown AI provider %r" % opts["provider"])
+    last = None
+    for attempt in range(opts["retries"] + 1):
+        try:
+            res = fn(messages, opts, stream_cb)
+            with _ai_lock:
+                _ai_log.append({"ts": int(time.time()), "mode": mode, "model": opts["model"],
+                                "latencyMs": res["latencyMs"], "promptTokens": res["promptTokens"],
+                                "outputTokens": res["outputTokens"]})
+                del _ai_log[:-60]
+            return res
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            raise                     # client cancelled — don't retry
+        except Exception as e:
+            last = e
+            if stream_cb is not None and attempt == 0 and "refused" not in str(e).lower():
+                break                 # partial output may already be streamed
+    raise RuntimeError("AI call failed (%s attempt(s)): %s" % (opts["retries"] + 1, last))
+
+
+# ── grounding: compact platform snapshots (cache-only — never block on heavy
+# computation; missing data is stated, not fabricated) ────────────────────────
+def _j(x, cap=1800):
+    try:
+        s = json.dumps(x, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        s = str(x)
+    return s if len(s) <= cap else s[:cap] + "…[truncated]"
+
+
+def _part_scores():
+    sc = cache_get("scores", 900)
+    if not sc:
+        return None
+    return {"alphaStatus": (sc.get("alphaStatus") or "")[:200], "weights": sc.get("weights"),
+            "sectors": [{"sym": r.get("symbol"), "score": r.get("score"), "d1": r.get("delta1d")}
+                        for r in sc.get("sectors", [])]}
+
+
+def _part_regime():
+    r = cache_get("regime", 900)
+    return None if not r or r.get("error") else {"current": r.get("current"), "confidence": r.get("confidence")}
+
+
+def _part_gov():
+    g = cache_get("government", 900)
+    if not g:
+        return None
+    return {"brief": g.get("brief"),
+            "events": [{"kind": b["kind"], "date": b.get("date"), "title": b["title"]} for b in g.get("briefings", [])],
+            "pipeline": [{"id": p["id"], "stage": p.get("stage"),
+                          "status": p.get("status") or (p.get("study") or {}).get("status")}
+                         for p in g.get("pipeline", [])]}
+
+
+def _part_options():
+    o = get_options(BENCH)
+    if not o or o.get("error"):
+        return None
+    keep = ("symbol", "spot", "netGEX", "netDEX", "pcr", "pcrZ", "maxPain", "ivRank", "expectedMovePct",
+            "gexFlip", "callWall", "putWall", "skew")
+    return {k: o.get(k) for k in keep if o.get(k) is not None}
+
+
+def _part_portfolio():
+    try:
+        pv = positions_view()
+    except Exception:
+        return None
+    return {"open": [{k: p.get(k) for k in ("symbol", "side", "entry", "stop", "target", "plPct", "r", "regime")}
+                     for p in pv.get("open", [])],
+            "analytics": pv.get("analytics"), "closedTrades": len(pv.get("closed", []))}
+
+
+def _part_journal():
+    try:
+        pv = positions_view()
+    except Exception:
+        return None
+    return {"closed": pv.get("closed", [])[:40], "journal": pv.get("journal"),
+            "note": "closed trades, newest first; entry tags (regime/RS group) recorded at entry"}
+
+
+def _part_alerts():
+    with _alerts_lock:
+        items = [dict(a) for a in _alerts][-12:]
+    return [{"ts": a.get("ts"), "kind": a.get("kind"), "symbol": a.get("symbol"),
+             "text": (a.get("text") or "")[:140]} for a in items] or None
+
+
+def _cached_part(key, ttl=900):
+    return lambda: cache_get(key, ttl)
+
+
+AI_PARTS = {
+    "scores": ("Sector composite scores (DESCRIPTIVE ranking — RS alpha claim rejected in EXP-11)", _part_scores),
+    "regime": ("Market regime (rule-based, backward-looking)", _part_regime),
+    "government": ("Government & policy intelligence (all context-only)", _part_gov),
+    "options": ("SPY options positioning (CBOE delayed)", _part_options),
+    "portfolio": ("Portfolio (open positions + analytics)", _part_portfolio),
+    "journal": ("Trade journal (closed trades)", _part_journal),
+    "alerts": ("Recent platform alerts", _part_alerts),
+    "macro": ("Macro proxies", _cached_part("macro", 900)),
+    "factors": ("Factor attribution (partial-corr SPY-controlled)", _cached_part("factors", 1200)),
+    "opportunities": ("Opportunity ranking (score+probability+regime fit)", _cached_part("opps", 900)),
+    "allocation": ("Allocation engine output (gated)", _cached_part("alloc", 900)),
+    "calibration": ("Confidence calibration", _cached_part("calib", 1200)),
+    "scorecard": ("Model scorecards (replayed health)", _cached_part("scorecard", 1200)),
+    "registry": ("Model registry (stages, degradation flags)", _cached_part("registry", 900)),
+    "integrity": ("Belief register (confidence evolution)", _cached_part("integrity", 1200)),
+    "assumptions": ("Assumption monitor", _cached_part("assumptions", 1200)),
+    "priorities": ("Research priorities backlog", _cached_part("priorities", 1200)),
+    "hypotheses": ("Auto-generated hypotheses", _cached_part("hypotheses", 1200)),
+    "probabilities": ("Empirical base rates (Wilson CIs)", _cached_part("probs", 1200)),
+}
+
+# ── RAG: local knowledge base over the platform's own documents ──────────────
+_rag = {"chunks": [], "df": {}, "built": 0.0}
+
+
+def _rag_tokens(s):
+    import re
+    return re.findall(r"[a-z0-9]{3,}", (s or "").lower())
+
+
+def _rag_build():
+    import glob as _glob
+    raw = []
+    for p in sorted(_glob.glob(os.path.join(HERE, "*.md"))):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        name, buf = os.path.basename(p), []
+        for ln in lines:
+            buf.append(ln)
+            if len(buf) >= 36:
+                raw.append((name, "\n".join(buf)))
+                buf = buf[-4:]        # overlap keeps section context
+        if len(buf) > 4:
+            raw.append((name, "\n".join(buf)))
+    with _congress_lock:
+        evs = sorted(_congress.get("events", {}).values(), key=lambda e: e.get("date") or "", reverse=True)
+    for i in range(0, min(len(evs), 300), 30):
+        raw.append(("gov-event-archive", "\n".join("%s %s [%s] %s" % (e.get("date"), e.get("kind"),
+                    e.get("policyArea"), e.get("title")) for e in evs[i:i + 30])))
+    df, idx = {}, []
+    for name, txt in raw:
+        tf = {}
+        for t in _rag_tokens(txt):
+            tf[t] = tf.get(t, 0) + 1
+        for t in tf:
+            df[t] = df.get(t, 0) + 1
+        idx.append({"doc": name, "text": txt, "tf": tf, "len": max(1, sum(tf.values()))})
+    _rag.update({"chunks": idx, "df": df, "built": time.time()})
+
+
+def rag_search(q, k=3):
+    if time.time() - _rag["built"] > 1800:
+        try:
+            _rag_build()
+        except Exception:
+            pass
+    toks, n = _rag_tokens(q), max(1, len(_rag["chunks"]))
+    scored = []
+    for c in _rag["chunks"]:
+        s = sum((c["tf"][t] / c["len"]) * math.log(1 + n / (1 + _rag["df"].get(t, 0)))
+                for t in toks if t in c["tf"])
+        if s > 0:
+            scored.append((s, c))
+    scored.sort(key=lambda x: -x[0])
+    return [{"doc": c["doc"], "score": round(s, 4), "text": c["text"][:1500]} for s, c in scored[:k]]
+
+
+# ── prompt library ────────────────────────────────────────────────────────────
+AI_SAFETY = (
+    "You are the embedded AI research analyst inside Quanta, a personal quantitative research platform for "
+    "swing-trading SPDR sector ETFs. HARD RULES:\n"
+    "1. Never give buy/sell instructions, position sizes, entries/exits or allocation changes — decisions belong "
+    "to the platform's evidence-based governance process, never to you.\n"
+    "2. Ground every claim in the DATA/DOCS sections below and name the section you used.\n"
+    "3. If something needed is absent, write 'not in the provided data' — never estimate, guess, or fill gaps "
+    "from your general knowledge.\n"
+    "4. The platform's own validated findings override your priors: RS cross-sectional alpha was REJECTED "
+    "(EXP-11); RSI(2) mean-reversion is the only replicated edge; composite scores are DESCRIPTIVE; "
+    "congressional/government data is context-only.\n"
+    "5. Be concise, structured, and explicit about uncertainty. You are an analyst who explains, critiques and "
+    "questions — not a decision-maker and not a chatbot.")
+
+AI_MODES = {
+    "ask": {"title": "Ask the analyst", "rag": True,
+            "parts": ["regime", "scores", "opportunities", "portfolio", "government", "macro", "integrity"],
+            "system": "Answer the user's question using only the provided data and docs."},
+    "morning": {"title": "Morning brief", "rag": True, "ragQuery": "morning brief regime edge validation priorities",
+                "parts": ["regime", "scores", "opportunities", "government", "macro", "options", "portfolio",
+                          "alerts", "priorities", "registry"],
+                "system": "Write a pre-market institutional morning brief for the PM. Use exactly these sections: "
+                          "FACTS (only from data, cite sections) / INTERPRETATION (label as interpretation) / "
+                          "UNCERTAINTY (what the data cannot tell us) / OPEN QUESTIONS (what to check today).",
+                "user": "Generate today's morning research brief."},
+    "market": {"title": "Market summary", "parts": ["regime", "scores", "macro", "options", "opportunities"],
+               "system": "Summarize the current market picture strictly from the data: regime, breadth of the "
+                         "sector table, options positioning, macro proxies. Flag data gaps explicitly."},
+    "sector": {"title": "Sector analysis", "needs": "symbol", "rag": True,
+               "parts": ["regime", "scores", "opportunities", "factors", "government", "probabilities"],
+               "system": "Analyze the requested sector ETF using only the data: its composite score components, "
+                         "factor drivers, government exposure, base rates. State what is descriptive vs validated."},
+    "company": {"title": "Company analysis", "needs": "symbol", "rag": True,
+                "parts": ["government", "scores", "regime"],
+                "system": "Analyze the requested ticker's government/policy profile and sector context from the "
+                          "data. Company fundamentals are NOT in this platform — say so rather than reciting "
+                          "remembered facts about the company."},
+    "portfolio": {"title": "Portfolio review", "parts": ["portfolio", "regime", "scores", "allocation", "options",
+                                                         "government", "alerts"],
+                  "system": "Review the portfolio: exposures, R-multiples, concentration, regime fit, what the "
+                            "allocation engine says vs what is held. Point at risks and questions, never at trades."},
+    "government": {"title": "Government analysis", "rag": True, "ragQuery": "government policy congressional disclosure",
+                   "parts": ["government", "scores", "regime", "portfolio"],
+                   "system": "Interpret the government/policy picture: what happened, why it matters, who is "
+                             "affected, what history shows (FOMC study is the only measured event type), what "
+                             "remains untested (EXP-13/GOV-02/03/04 statuses)."},
+    "critique": {"title": "Research critique", "rag": True, "ragQuery": "experiment validation assumptions research debt",
+                 "parts": ["registry", "integrity", "assumptions", "scorecard", "calibration", "priorities",
+                           "hypotheses"],
+                 "system": "Act as an independent methodological reviewer: weak assumptions, duplicate or missing "
+                           "experiments, data-quality risks, prioritization critique. Only propose tests that the "
+                           "platform's data could actually run; justify each suggestion from the evidence shown."},
+    "journal": {"title": "Trade journal review", "parts": ["journal", "portfolio", "regime"],
+                "system": "Review the closed trades: recurring strengths, recurring mistakes, execution and "
+                          "risk-management issues, regime/sector tendencies. Support every conclusion with "
+                          "specific trades from the journal data (symbol, date, R). If the sample is too small "
+                          "for a pattern, say so."},
+    "models": {"title": "Model review", "rag": True, "ragQuery": "model registry scorecard replication",
+               "parts": ["registry", "scorecard", "integrity", "calibration", "assumptions"],
+               "system": "Review model health from scorecards and the registry: which models are degrading, which "
+                         "beliefs have weakening evidence, where calibration is unproven. Recommendations may "
+                         "only be 'investigate/monitor' — promotion/retirement is the governance process's call."},
+    "experiment": {"title": "Experiment design", "rag": True, "ragQuery": "pre-registered experiment gate train test",
+                   "parts": ["hypotheses", "priorities", "registry", "integrity"],
+                   "system": "Help design a pre-registered experiment for the user's idea: hypothesis, exact test "
+                             "spec on the platform's available data, acceptance gate fixed in advance, sample-size "
+                             "reality check, known pitfalls (overlap, multiple testing, post-hoc flips). Follow the "
+                             "platform's rule: positive in BOTH train and test, no post-hoc sign changes."},
+    "explain": {"title": "Explain this", "rag": True,
+                "parts": ["regime", "scores"],
+                "system": "Explain the attached platform payload to the user: what each number means, how it is "
+                          "computed (from docs if retrieved), what it does and does not imply. Use only the "
+                          "attached payload and DATA/DOCS sections."},
+}
+
+AI_ROLES = [
+    ("Bull Analyst", "Make the strongest EVIDENCE-BASED constructive case from the data. No invented facts."),
+    ("Bear Analyst", "Make the strongest evidence-based cautionary case from the same data. No invented facts."),
+    ("Macro Strategist", "Read only the macro/regime/factor sections; what do they imply and not imply?"),
+    ("Risk Manager", "Concentration, regime risk, stop discipline, event risk (FOMC study), sample-size traps."),
+    ("Options Strategist", "Read only the options positioning; explain dealer-flow context and its limits (delayed data)."),
+    ("Government Policy Analyst", "Read only the government sections; policy catalysts and their unvalidated status."),
+    ("Research Director", "Which claims here are validated vs descriptive? What experiment would settle the open arguments?"),
+]
+
+AI_DEBATES = {
+    "bull-bear": ("Bull Analyst", "Bear Analyst", "the current market and sector picture"),
+    "trend-meanrev": ("Trend-following advocate", "Mean-reversion advocate",
+                      "which discipline this platform's evidence actually supports right now"),
+    "macro-technicals": ("Macro-driven strategist", "Price-action-only technician",
+                         "what should drive sector selection decisions"),
+    "gov-market": ("Government-policy-matters advocate", "Markets-ignore-politics advocate",
+                   "whether government intelligence deserves research budget"),
+    "growth-value": ("Growth-sectors advocate", "Defensive-value advocate",
+                     "cyclical vs defensive positioning in the current regime"),
+}
+
+
+def _ai_build_messages(mode_def, q, symbol, topic, history, extra_data=None):
+    blocks = []
+    for pname in mode_def.get("parts", []):
+        label, fn = AI_PARTS[pname]
+        try:
+            v = fn()
+        except Exception as e:
+            v = {"unavailable": str(e)}
+        blocks.append("### DATA: %s\n%s" % (label, _j(v) if v is not None else
+                                            "UNAVAILABLE — not computed yet (engine warming or tab not opened)"))
+    if extra_data:
+        blocks.append("### DATA: attached payload (subject of the request)\n%s" % _j(extra_data, 3500))
+    if mode_def.get("rag"):
+        for d in rag_search("%s %s %s" % (q or mode_def.get("ragQuery") or "", symbol or "", topic or "")):
+            blocks.append("### DOCS: %s (relevance %s)\n%s" % (d["doc"], d["score"], d["text"]))
+    user = q or mode_def.get("user") or "Proceed with this mode's task."
+    if symbol:
+        user += "\nSubject symbol: %s" % symbol
+    if topic:
+        user += "\nTopic: %s" % topic
+    msgs = [{"role": "system", "content": AI_SAFETY + "\n\nMODE: " + mode_def["system"]}]
+    for h in (history or [])[-6:]:
+        if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
+            msgs.append({"role": h["role"], "content": str(h["content"])[:2000]})
+    msgs.append({"role": "user", "content": ("\n\n".join(blocks))[:12000] + "\n\n---\nREQUEST: " + user[:2000]})
+    return msgs
+
+
+def ai_run(req, emit):
+    """Execute one AI request, streaming text through emit(). Multi-voice modes
+    (committee/debate) run sequential role calls over identical data."""
+    import hashlib
+    mode = (req.get("mode") or "ask").strip()
+    q, symbol, topic = (req.get("q") or "").strip(), (req.get("symbol") or "").strip().upper() or None, \
+        (req.get("topic") or "").strip() or None
+    history, extra = req.get("history") or [], req.get("data")
+
+    if mode == "committee":
+        parts = ["regime", "scores", "opportunities", "options", "macro", "government", "portfolio", "registry"]
+        base = _ai_build_messages({"parts": parts, "system": ""}, None, None, None, [])
+        data_block = base[-1]["content"]
+        outputs = []
+        for role, charge in AI_ROLES:
+            emit("\n\n## %s\n" % role)
+            sysmsg = (AI_SAFETY + "\n\nROLE: You are the %s on the platform's investment committee. %s "
+                      "Maximum ~150 words. Only the data below." % (role, charge))
+            res = ai_chat([{"role": "system", "content": sysmsg},
+                           {"role": "user", "content": data_block}], mode="committee:" + role, stream_cb=emit)
+            outputs.append("%s said:\n%s" % (role, res["text"]))
+        emit("\n\n## Chief Investment Officer — synthesis\n")
+        cio = (AI_SAFETY + "\n\nROLE: You are the CIO. Synthesize the committee: CONSENSUS / DISAGREEMENTS / "
+               "EVIDENCE (cite which analyst used which data) / UNKNOWNS / RESEARCH REQUIRED. "
+               "No trade instructions. ~250 words.")
+        ai_chat([{"role": "system", "content": cio},
+                 {"role": "user", "content": "\n\n".join(outputs)[:9000]}], mode="committee:CIO", stream_cb=emit)
+        return
+
+    if mode == "debate":
+        key = (topic or "bull-bear").lower()
+        a, b, subject = AI_DEBATES.get(key, AI_DEBATES["bull-bear"])
+        parts = ["regime", "scores", "opportunities", "options", "macro", "government", "integrity"]
+        base = _ai_build_messages({"parts": parts, "system": ""}, None, None, None, [])
+        data_block = base[-1]["content"]
+        transcript = []
+
+        def turn(name, charge, label):
+            emit("\n\n## %s\n" % label)
+            res = ai_chat([{"role": "system", "content": AI_SAFETY + "\n\nROLE: You are the %s in a structured "
+                            "debate about %s. %s Only the shared data. ~120 words." % (name, subject, charge)},
+                           {"role": "user", "content": data_block +
+                            ("\n\nTRANSCRIPT SO FAR:\n" + "\n".join(transcript) if transcript else "")}],
+                          mode="debate:" + name, stream_cb=emit)
+            transcript.append("%s: %s" % (name, res["text"]))
+        turn(a, "Open with your strongest evidence-based argument.", a + " — opening")
+        turn(b, "Open with your strongest evidence-based argument.", b + " — opening")
+        turn(a, "Rebut your opponent using only the data.", a + " — rebuttal")
+        turn(b, "Rebut your opponent using only the data.", b + " — rebuttal")
+        emit("\n\n## Moderator — evidence summary\n")
+        ai_chat([{"role": "system", "content": AI_SAFETY + "\n\nROLE: Neutral moderator. Summarize: which claims "
+                  "were grounded in the data, which were rhetoric, where the evidence is genuinely insufficient, "
+                  "and what test would settle it. ~150 words."},
+                 {"role": "user", "content": "\n".join(transcript)[:9000]}], mode="debate:moderator", stream_cb=emit)
+        return
+
+    mode_def = AI_MODES.get(mode)
+    if not mode_def:
+        raise ValueError("unknown mode %r (available: %s, committee, debate)" % (mode, ", ".join(AI_MODES)))
+    if mode_def.get("needs") == "symbol" and not symbol:
+        raise ValueError("mode %r needs a symbol" % mode)
+    msgs = _ai_build_messages(mode_def, q, symbol, topic, history, extra)
+    ck = hashlib.sha1(json.dumps([mode, msgs], default=str).encode()).hexdigest()
+    if not history:
+        with _ai_lock:
+            hit = _ai_cache.get(ck)
+        if hit and time.time() - hit["ts"] < 600:
+            emit(hit["text"] + "\n\n_[cached response — repeated within 10 min]_")
+            return
+    res = ai_chat(msgs, mode=mode, stream_cb=emit)
+    if not history:
+        with _ai_lock:
+            _ai_cache[ck] = {"text": res["text"], "ts": time.time()}
+            for k in list(_ai_cache):
+                if time.time() - _ai_cache[k]["ts"] > 1200:
+                    del _ai_cache[k]
+
+
+def ai_status():
+    with _ai_lock:
+        cfg = dict(AI_CFG)
+        tel = list(_ai_log[-15:])
+    reachable, models, err = False, [], None
+    if cfg["enabled"] and cfg["provider"] == "ollama":
+        try:
+            d = http_get_json(cfg["host"] + "/api/tags", timeout=4)
+            models = [m.get("name") for m in d.get("models", [])]
+            reachable = True
+        except Exception as e:
+            err = str(e)
+    elif cfg["provider"] == "anthropic":
+        reachable, err = bool(_key("anthropic")), None if _key("anthropic") else "ANTHROPIC_API_KEY not set"
+    return {"config": cfg, "reachable": reachable, "models": models, "error": err,
+            "modes": {k: v["title"] for k, v in AI_MODES.items()},
+            "debates": {k: v[2] for k, v in AI_DEBATES.items()},
+            "telemetry": tel, "ragChunks": len(_rag["chunks"]),
+            "safety": "The AI explains/summarizes/critiques only. It has no code path to trades, weights, "
+                      "allocation, experiments or registry state, and its output is never parsed back into "
+                      "any model. Platform continues fully without it."}
+
+
+def ai_config_update(d):
+    allowed = {"model": str, "temperature": float, "maxTokens": int, "numCtx": int, "timeoutS": int,
+               "retries": int, "enabled": bool, "provider": str, "host": str, "think": bool}
+    changed = {}
+    with _ai_lock:
+        for k, cast in allowed.items():
+            if k in d and d[k] is not None:
+                try:
+                    AI_CFG[k] = cast(d[k]) if not isinstance(d[k], bool) or cast is bool else cast(d[k])
+                    changed[k] = AI_CFG[k]
+                except (TypeError, ValueError):
+                    pass
+        _ai_cache.clear()
+    return {"ok": True, "changed": changed, "note": "runtime only — set the same values in .env to persist"}
+
+
 _congress_seen = set()
 
 
@@ -5821,6 +6348,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("congress_reg", 3600) or _cache_and_return("congress_reg", congress_reg_view))
         elif path == "/api/government":
             self._json(cache_get("government", 900) or _cache_and_return("government", government_view))
+        elif path == "/api/ai/status":
+            self._json(ai_status())
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -5841,7 +6370,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         fn = self.POST_ROUTES.get(path)
-        if not fn:
+        if not fn and path not in ("/api/ai/ask", "/api/ai/config"):
             self._send(404, b"not found", "text/plain")
             return
         try:
@@ -5852,10 +6381,46 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError) as e:
             self._json({"ok": False, "error": "bad request: %s" % e}, 400)
             return
+        if path == "/api/ai/config":
+            self._json(ai_config_update(d))
+            return
+        if path == "/api/ai/ask":
+            self._ai_ask(d)
+            return
         try:
             self._json(fn(d))
         except (KeyError, TypeError, ValueError) as e:
             self._json({"ok": False, "error": str(e)}, 400)
+
+    def _ai_ask(self, d):
+        """Streams plain text (HTTP/1.0, close-delimited). Client cancellation =
+        closed socket, which stops the Ollama generation too."""
+        if not d.get("stream", True):
+            out = []
+            try:
+                ai_run(d, out.append)
+                self._json({"ok": True, "text": "".join(out)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def emit(txt):
+            self.wfile.write(txt.encode("utf-8"))
+            self.wfile.flush()
+        try:
+            ai_run(d, emit)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass                                   # user cancelled
+        except Exception as e:
+            try:
+                emit("\n\n[AI unavailable: %s — the platform keeps working without it; see /api/ai/status]" % e)
+            except OSError:
+                pass
 
     def do_OPTIONS(self):
         self._send(204, b"", "text/plain")

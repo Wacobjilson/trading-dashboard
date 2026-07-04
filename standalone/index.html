@@ -89,9 +89,27 @@
   <div><span class="brand">QUANTA</span><span class="sub">SWING COMPANION · sector intelligence · rotation · options · <kbd>1</kbd>–<kbd>0</kbd> tabs · <kbd>/</kbd> chart</span></div>
   <div style="display:flex;align-items:center">
     <div class="status" id="status">connecting…</div>
+    <button id="ai-btn" title="AI research analyst (local Ollama)" style="background:none;border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;padding:2px 8px;margin-right:6px;font-size:12px">✨ AI</button>
     <button id="al-bell" title="Alerts">🔔<span id="al-count" class="al-count al-hide"></span></button>
   </div>
 </header>
+<div id="ai-drawer" style="display:none;position:fixed;top:0;right:0;bottom:0;width:min(560px,95vw);background:var(--panel);border-left:1px solid var(--border);z-index:60;flex-direction:column">
+  <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+    <b>AI Research Analyst</b>
+    <span style="font-size:11px" class="muted"><span id="ai-dot">●</span> <span id="ai-model">…</span>
+      <span class="clk" style="margin-left:10px" onclick="document.getElementById('ai-drawer').style.display='none'">✕ close</span></span></div>
+  <div style="padding:8px 14px;border-bottom:1px solid var(--border);font-size:12px">
+    <select id="ai-mode" class="ipt" style="max-width:200px"></select>
+    <input id="ai-sym" class="ipt" placeholder="SYM" style="width:64px;text-transform:uppercase;display:none">
+    <select id="ai-topic" class="ipt" style="max-width:210px;display:none"></select>
+    <select id="ai-modelsel" class="ipt" style="max-width:130px" title="switch Ollama model (runtime)"></select>
+    <div style="margin-top:6px;display:flex;gap:6px">
+      <input id="ai-q" class="ipt" placeholder="ask a question about the platform, the market, your research…" style="flex:1">
+      <button class="go" id="ai-run">Run</button><button class="mini" id="ai-stop" style="display:none">■ stop</button></div>
+    <div class="muted" id="ai-note" style="font-size:10px;margin-top:4px">Grounded in live platform data + local docs (RAG). The AI explains and critiques — it never generates trades or changes any model. Degrades gracefully if Ollama is off.</div></div>
+  <div id="ai-out" style="flex:1;overflow-y:auto;padding:12px 16px;font-size:12.5px;line-height:1.5"></div>
+  <div id="ai-tel" class="muted" style="padding:6px 14px;border-top:1px solid var(--border);font-size:10px"></div>
+</div>
 <div id="al-panel" class="al-panel al-hide">
   <div class="al-head"><b>Alerts</b>
     <span>
@@ -652,7 +670,8 @@ async function loadChart(){
     chData=d; chLastPx=null; drawChart(d); if(chLive)chartLiveTick(); const s=d.setup;
     document.getElementById("ch-setup").innerHTML=
       `${srcBadge(d.source)} ${s.tf} · <span class="badge ${s.direction==='long'?'b-long':'b-short'}">${s.direction}</span> ${statusBadge(s.status)}
-       entry <b class="amber mono">${fmt(s.fib50)}</b> · stop <span class="down mono">${fmt(s.stop)}</span> · target <span class="up mono">${fmt(s.target)}</span> · R:R <b>${s.rr||"—"}</b> · score <b>${s.score}</b>`;
+       entry <b class="amber mono">${fmt(s.fib50)}</b> · stop <span class="down mono">${fmt(s.stop)}</span> · target <span class="up mono">${fmt(s.target)}</span> · R:R <b>${s.rr||"—"}</b> · score <b>${s.score}</b>
+       <button class="mini" onclick='aiExplain("Explain this ${sym} chart setup — the levels and what the platform does/does not claim about it",chData&&chData.setup)'>✨ AI</button>`;
   }catch(e){document.getElementById("ch-svg").innerHTML='<div class="loading">Chart failed.</div>';}
 }
 function drawChart(d,livePx){
@@ -1440,11 +1459,11 @@ function showExpoDetail(sym){
        ${Object.entries(all).map(([k,v])=>`<span class="badge ${v>=3?'b-bear':v===2?'b-appr':'b-neu'}" title="${LBL[k]||k}">${LBL[k]||k}: ${["—","low","med","HIGH"][v]||"—"}</span>`).join("")}</div>
      <div class="muted" style="font-size:11px"><b>Rationale:</b> ${e.why}</div>
      <div class="muted" style="font-size:11px"><b>Live activity:</b> ${e.live.regDocs90d} reg docs 90d · ${e.live.cgBuys90d}/${e.live.cgSells90d} congressional buys/sells 90d · ${e.live.activeBills} mapped bills</div>
-     <div class="note">Ratings are curated analyst judgments about structural sensitivity — not measured coefficients. Rates sensitivity has independent measured support (factor library). <span class="clk" style="color:var(--text)" onclick="openChart('${e.sector}')">Open ${e.sector} chart →</span></div></div>`;
+     <div class="note">Ratings are curated analyst judgments about structural sensitivity — not measured coefficients. Rates sensitivity has independent measured support (factor library). <span class="clk" style="color:var(--text)" onclick="openChart('${e.sector}')">Open ${e.sector} chart →</span> <button class="mini" onclick='aiExplain("Explain ${e.sector} government exposure profile",(_gv.exposure||[]).find(x=>x.sector==="${e.sector}"))'>✨ AI</button></div></div>`;
 }
 function renderGovBrief(gv){
   const b=gv.brief||{};
-  document.getElementById("gv-brief-asof").textContent=`as of ${b.asOf} · regime: ${b.regime}`;
+  document.getElementById("gv-brief-asof").innerHTML=`as of ${b.asOf} · regime: ${b.regime} <button class="mini" onclick='aiExplain("Government morning brief — interpret and challenge it",_gv&&_gv.brief)'>✨ AI</button>`;
   const li=xs=>(xs||[]).map(x=>`<li>${typeof x==="string"?x:JSON.stringify(x)}</li>`).join("");
   document.getElementById("gv-brief").innerHTML=
     `<div class="cols cols2" style="font-size:12px">
@@ -1593,6 +1612,98 @@ async function loadCongress(){
       :'<div class="loading">Calendar unavailable.</div>';
   }catch(e){document.getElementById("cg-heat").innerHTML='<div class="loading">Congressional module failed to load.</div>';}
 }
+
+// ── AI RESEARCH ANALYST (local Ollama via backend — frontend never calls Ollama) ──
+let _aiStatus=null,_aiAbort=null,_aiHist=[],_aiConv="";
+const aiEl=id=>document.getElementById(id);
+function mdLite(s){
+  const esc=t=>t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  let out=[],inList=false;
+  for(const ln of esc(s).split("\n")){
+    let l=ln;
+    if(/^#{1,4}\s/.test(l)){if(inList){out.push("</ul>");inList=false;}out.push(`<div style="font-weight:bold;margin:8px 0 3px;color:var(--amber)">${l.replace(/^#+\s*/,"")}</div>`);continue;}
+    l=l.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>").replace(/`([^`]+)`/g,"<code>$1</code>");
+    if(/^\s*[-*•]\s+/.test(l)){if(!inList){out.push("<ul style='margin:2px 0 2px 18px'>");inList=true;}out.push("<li>"+l.replace(/^\s*[-*•]\s+/,"")+"</li>");continue;}
+    if(inList){out.push("</ul>");inList=false;}
+    out.push(l.trim()?"<div>"+l+"</div>":"<div style='height:5px'></div>");
+  }
+  if(inList)out.push("</ul>");
+  return out.join("");
+}
+function aiStripThink(raw){return raw.replace(/<think>[\s\S]*?<\/think>/g,"").trim();}
+function aiRenderStream(raw){
+  let t=raw.replace(/<think>[\s\S]*?<\/think>/g,"");
+  const open=t.indexOf("<think>");let tail="";
+  if(open>=0){t=t.slice(0,open);tail="<div class='muted' style='font-style:italic'>… model reasoning …</div>";}
+  aiEl("ai-out").innerHTML=_aiConv+mdLite(t)+tail;
+  aiEl("ai-out").scrollTop=aiEl("ai-out").scrollHeight;
+}
+async function aiLoadStatus(){
+  try{
+    const d=await(await fetch(`${API}/api/ai/status`)).json();_aiStatus=d;
+    aiEl("ai-dot").style.color=d.reachable?"var(--up)":"var(--down)";
+    aiEl("ai-model").textContent=(d.config.provider==="ollama"?d.config.model:d.config.provider)+(d.reachable?"":" — offline");
+    const ms=aiEl("ai-mode");
+    if(!ms.options.length){
+      for(const[k,v]of Object.entries(d.modes||{}))ms.add(new Option(v,k));
+      ms.add(new Option("Investment committee","committee"));ms.add(new Option("Structured debate","debate"));
+      ms.onchange=aiModeChange;aiModeChange();
+    }
+    const md=aiEl("ai-modelsel");
+    md.innerHTML="";(d.models||[]).forEach(m=>md.add(new Option(m,m)));
+    if(d.models&&d.models.includes(d.config.model))md.value=d.config.model;
+    md.onchange=async()=>{await fetch(`${API}/api/ai/config`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:md.value})});aiLoadStatus();};
+    const dt=aiEl("ai-topic");
+    if(!dt.options.length)for(const[k,v]of Object.entries(d.debates||{}))dt.add(new Option(v,k));
+    if(!d.reachable)aiEl("ai-note").innerHTML=`<span class="down">Ollama unreachable at ${d.config.host}${d.error?` (${d.error})`:""}</span> — start Ollama on this PC; everything else keeps working.`;
+    aiEl("ai-tel").textContent=((d.telemetry||[]).slice(-3).map(t=>`${t.mode} ${(t.latencyMs/1000).toFixed(1)}s/${t.outputTokens??"?"}tok`).join(" · ")||"no calls yet")+` · RAG ${d.ragChunks} chunks · cached prompts 10min`;
+  }catch(e){}
+}
+function aiModeChange(){
+  const m=aiEl("ai-mode").value;
+  aiEl("ai-sym").style.display=(m==="sector"||m==="company")?"":"none";
+  aiEl("ai-topic").style.display=m==="debate"?"":"none";
+  aiEl("ai-q").style.display=(m==="ask"||m==="explain"||m==="experiment")?"":"none";
+}
+function aiOpen(mode,q){
+  aiEl("ai-drawer").style.display="flex";
+  aiLoadStatus();
+  if(mode&&aiEl("ai-mode").options.length){aiEl("ai-mode").value=mode;aiModeChange();}
+  if(q!=null)aiEl("ai-q").value=q;
+}
+async function aiGo(extra){
+  if(_aiAbort)_aiAbort.abort();
+  const mode=aiEl("ai-mode").value||"ask",q=aiEl("ai-q").value.trim();
+  const body={mode,q,symbol:aiEl("ai-sym").value.trim(),topic:aiEl("ai-topic").value,stream:true,
+              history:mode==="ask"?_aiHist:[],...(extra||{})};
+  _aiAbort=new AbortController();
+  aiEl("ai-stop").style.display="";aiEl("ai-run").disabled=true;
+  _aiConv+=`<div style="border-top:1px solid var(--border);margin-top:10px;padding-top:6px"><span class="badge b-neu">${body.mode}</span> <b>${(body.q||body.symbol||body.topic||"").slice(0,120)}</b></div>`;
+  let raw="";aiRenderStream("");
+  try{
+    const r=await fetch(`${API}/api/ai/ask`,{method:"POST",headers:{"Content-Type":"application/json"},
+                        body:JSON.stringify(body),signal:_aiAbort.signal});
+    const rd=r.body.getReader(),dec=new TextDecoder();
+    for(;;){const{done,value}=await rd.read();if(done)break;raw+=dec.decode(value,{stream:true});aiRenderStream(raw);}
+  }catch(e){if(e.name!=="AbortError")raw+=`\n\n[request failed: ${e.message}]`;else raw+="\n\n[stopped]";}
+  const clean=aiStripThink(raw);
+  _aiConv+=mdLite(clean);
+  if(mode==="ask"&&q&&clean){_aiHist.push({role:"user",content:q},{role:"assistant",content:clean});_aiHist=_aiHist.slice(-8);}
+  _aiAbort=null;aiEl("ai-stop").style.display="none";aiEl("ai-run").disabled=false;
+  aiRenderStream("");aiLoadStatus();
+}
+function aiExplain(subject,data){
+  aiOpen();
+  setTimeout(()=>{ // ensure mode list is loaded before selecting
+    if(aiEl("ai-mode").options.length){aiEl("ai-mode").value="explain";aiModeChange();}
+    aiEl("ai-q").value=subject;
+    aiGo({mode:"explain",q:subject,data:data||null});
+  },_aiStatus?0:400);
+}
+document.getElementById("ai-btn").onclick=()=>{const d=aiEl("ai-drawer");d.style.display=d.style.display==="none"?"flex":"none";if(d.style.display==="flex")aiLoadStatus();};
+aiEl("ai-run").onclick=()=>aiGo();
+aiEl("ai-stop").onclick=()=>{if(_aiAbort)_aiAbort.abort();};
+aiEl("ai-q").addEventListener("keydown",e=>{if(e.key==="Enter")aiGo();});
 
 // ── MACRO INSIGHT (Markets tab) ──
 async function loadMacro(){

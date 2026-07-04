@@ -18,6 +18,11 @@ services:
     environment:
       # open positions + custom price alerts persist here (bind-mounted below)
       QUANTA_DATA: /data
+      # AI research analyst: the host's local Ollama (Docker Desktop proxies
+      # host.docker.internal to host loopback). Override in .env if remote.
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data
     restart: unless-stopped
