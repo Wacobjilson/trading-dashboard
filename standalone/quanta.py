@@ -337,6 +337,28 @@ DEEP_DIR = os.path.join(os.environ.get("QUANTA_DATA", "") or
 _deep_lock, _deep = threading.Lock(), {}
 
 
+def fetch_tiingo_daily(symbol, start="2000-01-01"):
+    """Tiingo EOD (institutional-quality, free tier) — deep-history fallback and
+    cross-validation source for the unofficial Yahoo endpoint."""
+    token = _key("tiingo")
+    if not token:
+        raise ValueError("no TIINGO_API_KEY")
+    d = http_get_json("https://api.tiingo.com/tiingo/daily/%s/prices?startDate=%s&token=%s"
+                      % (urllib.parse.quote(symbol), start, urllib.parse.quote(token)), timeout=30)
+    bars = []
+    for r in d:
+        c, a = r.get("close"), r.get("adjClose")
+        if not c or a is None:
+            continue
+        k = a / c
+        ts = int(dt.datetime.fromisoformat(r["date"].replace("Z", "+00:00")).timestamp() * 1000)
+        bars.append({"t": ts, "o": round((r.get("open") or c) * k, 4), "h": round((r.get("high") or c) * k, 4),
+                     "l": round((r.get("low") or c) * k, 4), "c": round(a, 4), "v": int(r.get("volume") or 0)})
+    if len(bars) < 300:
+        raise ValueError("tiingo history too short for %s" % symbol)
+    return bars
+
+
 def fetch_yahoo_daily(symbol, rng="25y"):
     url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=1d"
            % (urllib.parse.quote(symbol), rng))
@@ -420,8 +442,13 @@ def deep_loop():
                     if sym not in _deep:
                         get_deep_bars(sym)      # warm the in-memory cache
                     continue
-                bars = fetch_yahoo_daily(sym)
-                d = {"bars": bars, "fetched": time.time(), "bars_n": len(bars),
+                provider = "yahoo"
+                try:
+                    bars = fetch_yahoo_daily(sym)
+                except Exception:
+                    bars = fetch_tiingo_daily(sym)   # institutional fallback
+                    provider = "tiingo"
+                d = {"bars": bars, "fetched": time.time(), "bars_n": len(bars), "provider": provider,
                      "first": dt.datetime.fromtimestamp(bars[0]["t"] / 1000, dt.timezone.utc).date().isoformat(),
                      "quality": _deep_quality(bars, get_bars(sym))}
                 os.makedirs(DEEP_DIR, exist_ok=True)
@@ -1748,13 +1775,49 @@ FACTOR_DEFS = [
     ("USO", "Crude Oil"),
     ("GLD", "Gold"),
     ("CPER", "Copper / global growth"),
-    ("VIXY", "Volatility regime"),
-    ("HYG", "Credit / risk appetite"),
+    ("VIXY", "Volatility regime (futures proxy)"),
+    ("HYG", "Credit / risk appetite (ETF proxy)"),
     ("RSPvSPY", "Equal-weight vs cap-weight (breadth)"),
     ("IWMvSPY", "Small vs large caps"),
     ("QQQvSPY", "Growth / mega-cap-tech leadership"),
+    # Real official series (FRED, St. Louis Fed) — added 2026-07-04 when the
+    # user supplied a key. These are LEVELS (%, pts), carried as additive
+    # indices (100 + level change), so their "trend %" reads as a change in
+    # level points, and they sit beside — not silently replacing — the ETF
+    # proxies until the factor engine shows which is more informative.
+    ("fredVIX", "VIX (actual index, FRED VIXCLS)"),
+    ("fredRealY10", "10y REAL yield (FRED DFII10)"),
+    ("fredCurve", "2s10s yield curve (FRED T10Y2Y)"),
+    ("fredHYspread", "High-yield credit spread (FRED BAMLH0A0HYM2)"),
+    ("fredInflExp", "10y inflation expectations (FRED T10YIE)"),
 ]
 FACTOR_RATIOS = {"RSPvSPY": ("RSP", None), "IWMvSPY": ("IWM", None), "QQQvSPY": ("QQQ", None)}
+FRED_SERIES = {"fredVIX": "VIXCLS", "fredRealY10": "DFII10", "fredCurve": "T10Y2Y",
+               "fredHYspread": "BAMLH0A0HYM2", "fredInflExp": "T10YIE"}
+_fred_cache = {}
+
+
+def fetch_fred_series(series_id, start="2015-01-01"):
+    key = _key("fred")
+    if not key:
+        return None
+    ck = (series_id, dt.date.today().isoformat())
+    if ck in _fred_cache:
+        return _fred_cache[ck]
+    d = http_get_json("https://api.stlouisfed.org/fred/series/observations?series_id=%s&api_key=%s"
+                      "&file_type=json&observation_start=%s" % (series_id, key, start), timeout=25)
+    out = []
+    for o in d.get("observations", []):
+        v = o.get("value")
+        if v and v != ".":
+            try:
+                out.append((dt.date.fromisoformat(o["date"]), float(v)))
+            except ValueError:
+                pass
+    if len(_fred_cache) > 16:
+        _fred_cache.clear()
+    _fred_cache[ck] = out if len(out) > 200 else None
+    return _fred_cache[ck]
 
 
 def _factor_matrix():
@@ -1789,6 +1852,18 @@ def _factor_matrix():
         if fid in FACTOR_RATIOS:
             num = series_for(FACTOR_RATIOS[fid][0])
             F[fid] = [a / b for a, b in zip(num, m["spy"])] if num else None
+        elif fid in FRED_SERIES:
+            obs = fetch_fred_series(FRED_SERIES[fid])
+            if obs:
+                omap = dict(obs)
+                out, last = [], None
+                for d in dates:
+                    last = omap.get(d, last)
+                    out.append(last)
+                first = next((v for v in out if v is not None), None)
+                if first is not None:
+                    # levels → additive index (100 + Δlevel): "trend %" ≈ change in pts
+                    F[fid] = [100 + ((v if v is not None else first) - first) for v in out]
         else:
             F[fid] = series_for(fid)
     F = {k: v for k, v in F.items() if v}
@@ -3822,6 +3897,435 @@ def options_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CONGRESSIONAL INTELLIGENCE — political intelligence with disclosure honesty.
+# CORE PRINCIPLE: congressional trades are DELAYED DISCLOSURES (STOCK Act
+# allows up to 45 days; often longer). Every record carries traded date,
+# disclosed date, the delay, source, collection time, and a verification
+# status; the UI shows the delay on every row. Nothing here implies real-time
+# knowledge, and per the integration rule this module adds CONTEXT ONLY — it
+# never feeds the composite or the allocation gate.
+# Sources: trades via FMP free tier (requires FMP_API_KEY — module degrades
+# gracefully and says exactly how to enable it); regulatory actions via the
+# official keyless Federal Register API; auctions via Treasury FiscalData;
+# bills/hearings gated on a free congress.gov key (CONGRESS_GOV_API_KEY).
+# Committee memberships are NOT in any free feed → conviction scoring omits
+# committee overlap and says so.
+# ─────────────────────────────────────────────────────────────────────────────
+CONGRESS_PATH = os.path.join(os.environ.get("QUANTA_DATA", "") or
+                             os.path.dirname(os.path.abspath(__file__)), "congress_trades.json")
+_congress_lock = threading.Lock()
+_congress = {"trades": {}, "fetchedAt": None, "sourceStatus": "not configured"}
+CONGRESS_DISCLAIMER = ("Congressional disclosures are DELAYED (up to 45+ days after the trade) and "
+                       "self-reported in wide dollar ranges. This is research context, never a signal that "
+                       "someone 'just bought'. Member trades shown as filed, unverified.")
+
+# Curated ticker → sector-ETF mapping (top congressional names; coverage % shown)
+CONGRESS_SECTOR_MAP = {
+    "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AVGO": "XLK", "AMD": "XLK", "CRM": "XLK",
+    "ORCL": "XLK", "INTC": "XLK", "CSCO": "XLK", "IBM": "XLK", "TXN": "XLK", "QCOM": "XLK",
+    "MU": "XLK", "PLTR": "XLK", "ADBE": "XLK", "NOW": "XLK", "PANW": "XLK", "SNOW": "XLK",
+    "GOOG": "XLC", "GOOGL": "XLC", "META": "XLC", "NFLX": "XLC", "DIS": "XLC", "T": "XLC",
+    "VZ": "XLC", "CMCSA": "XLC", "TMUS": "XLC",
+    "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY", "MCD": "XLY", "NKE": "XLY", "SBUX": "XLY",
+    "LOW": "XLY", "BKNG": "XLY", "GM": "XLY", "F": "XLY",
+    "JPM": "XLF", "BAC": "XLF", "WFC": "XLF", "GS": "XLF", "MS": "XLF", "C": "XLF",
+    "BLK": "XLF", "SCHW": "XLF", "V": "XLF", "MA": "XLF", "AXP": "XLF", "PYPL": "XLF",
+    "BRK.B": "XLF", "KKR": "XLF", "BX": "XLF",
+    "UNH": "XLV", "JNJ": "XLV", "PFE": "XLV", "LLY": "XLV", "MRK": "XLV", "ABBV": "XLV",
+    "TMO": "XLV", "ABT": "XLV", "MRNA": "XLV", "CVS": "XLV", "BMY": "XLV", "AMGN": "XLV",
+    "BA": "XLI", "LMT": "XLI", "RTX": "XLI", "NOC": "XLI", "GD": "XLI", "GE": "XLI",
+    "CAT": "XLI", "DE": "XLI", "UNP": "XLI", "UPS": "XLI", "HON": "XLI", "MMM": "XLI",
+    "XOM": "XLE", "CVX": "XLE", "COP": "XLE", "SLB": "XLE", "OXY": "XLE", "EOG": "XLE",
+    "PSX": "XLE", "VLO": "XLE", "KMI": "XLE",
+    "LIN": "XLB", "FCX": "XLB", "NEM": "XLB", "DOW": "XLB", "APD": "XLB", "NUE": "XLB",
+    "PG": "XLP", "KO": "XLP", "PEP": "XLP", "WMT": "XLP", "COST": "XLP", "PM": "XLP",
+    "MO": "XLP", "CL": "XLP", "TGT": "XLP",
+    "NEE": "XLU", "DUK": "XLU", "SO": "XLU", "D": "XLU", "AEP": "XLU", "EXC": "XLU",
+    "AMT": "XLRE", "PLD": "XLRE", "CCI": "XLRE", "SPG": "XLRE", "O": "XLRE",
+}
+for _s, _n in SECTORS:
+    CONGRESS_SECTOR_MAP[_s] = _s
+CONGRESS_SECTOR_MAP.update({"SPY": "SPY", "QQQ": "SPY", "IWM": "SPY", "DIA": "SPY"})
+
+
+def _amount_midpoint(s):
+    import re
+    nums = [float(x.replace(",", "")) for x in re.findall(r"[\d,]+(?:\.\d+)?", s or "")]
+    if not nums:
+        return None
+    return (nums[0] + nums[1]) / 2 if len(nums) >= 2 else nums[0]
+
+
+def _pdate(s):
+    if not s:
+        return None
+    s = str(s)[:10]
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def fetch_fmp_congress():
+    key = _key("fmp")
+    if not key:
+        return None, "not configured — free key at financialmodelingprep.com → set FMP_API_KEY"
+    out = {}
+    err = None
+    for chamber, ep in (("Senate", "senate-latest"), ("House", "house-latest")):
+        for page in range(0, 4):
+            try:
+                d = http_get_json("https://financialmodelingprep.com/stable/%s?page=%d&apikey=%s"
+                                  % (ep, page, urllib.parse.quote(key)), timeout=25)
+            except Exception as e:
+                err = "%s fetch failed: %s" % (chamber, e)
+                break
+            if not isinstance(d, list) or not d:
+                break
+            for r in d:
+                member = (r.get("senator") or ("%s %s" % (r.get("firstName", ""), r.get("lastName", ""))).strip()
+                          or r.get("representative") or r.get("office") or "?")
+                ticker = (r.get("symbol") or r.get("ticker") or "").upper().strip()
+                txn = _pdate(r.get("transactionDate"))
+                disc = _pdate(r.get("disclosureDate") or r.get("dateRecieved") or r.get("filingDate"))
+                if not ticker or not txn:
+                    continue
+                ty = (r.get("type") or "").lower()
+                side = "buy" if "purchase" in ty else "sell" if ("sale" in ty or "sell" in ty) else "other"
+                rid = "%s|%s|%s|%s|%s" % (member, txn.isoformat(), ticker, side, r.get("amount", ""))
+                out[rid] = {
+                    "id": rid, "chamber": chamber, "member": member,
+                    "office": r.get("office") or r.get("district") or "",
+                    "txnDate": txn.isoformat(), "discDate": disc.isoformat() if disc else None,
+                    "delayDays": (disc - txn).days if disc else None,
+                    "ticker": ticker, "asset": (r.get("assetDescription") or "")[:80],
+                    "assetType": r.get("assetType") or "", "side": side,
+                    "amount": r.get("amount") or "", "amountMid": _amount_midpoint(r.get("amount")),
+                    "owner": r.get("owner") or "", "link": r.get("link") or "",
+                    "sector": CONGRESS_SECTOR_MAP.get(ticker),
+                    "source": "FMP (%s filings)" % chamber, "collectedAt": time.time(),
+                    "verification": "as filed — unverified",
+                }
+    return out, err
+
+
+def _congress_save():
+    try:
+        os.makedirs(os.path.dirname(CONGRESS_PATH) or ".", exist_ok=True)
+        with _congress_lock:
+            body = json.dumps(_congress)
+        with open(CONGRESS_PATH + ".tmp", "w") as f:
+            f.write(body)
+        os.replace(CONGRESS_PATH + ".tmp", CONGRESS_PATH)
+    except OSError:
+        pass
+
+
+def _congress_load():
+    try:
+        with open(CONGRESS_PATH) as f:
+            d = json.load(f)
+        with _congress_lock:
+            _congress.update(d)
+    except (FileNotFoundError, ValueError):
+        pass
+
+
+def _px_from(bars, date_iso):
+    d0 = dt.date.fromisoformat(date_iso)
+    for b in bars:
+        if dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date() >= d0:
+            return b["c"]
+    return None
+
+
+def _congress_perf(rec):
+    """Performance since the TRADE date (not disclosure), vs SPY and vs the
+    mapped sector — only when we hold price history for the ticker."""
+    bars = get_deep_bars(rec["ticker"]) if (rec["ticker"] in _deep or
+                                            os.path.exists(_deep_path(rec["ticker"])) or
+                                            rec["ticker"] in BAR_UNIVERSE) else None
+    if not bars:
+        return None
+    p0 = _px_from(bars, rec["txnDate"])
+    if not p0:
+        return None
+    perf = (bars[-1]["c"] / p0 - 1) * 100
+    out = {"sinceTradePct": round(perf, 1)}
+    spy = get_deep_bars(BENCH)
+    if spy:
+        s0 = _px_from(spy, rec["txnDate"])
+        if s0:
+            out["vsSPY"] = round(perf - (spy[-1]["c"] / s0 - 1) * 100, 1)
+    if rec.get("sector") and rec["sector"] != rec["ticker"]:
+        sec = get_deep_bars(rec["sector"])
+        if sec:
+            x0 = _px_from(sec, rec["txnDate"])
+            if x0:
+                out["vsSector"] = round(perf - (sec[-1]["c"] / x0 - 1) * 100, 1)
+    return out
+
+
+AGENCY_SECTOR = {
+    "securities-and-exchange-commission": ("SEC", "XLF"),
+    "federal-reserve-system": ("Federal Reserve", "XLF"),
+    "comptroller-of-the-currency": ("OCC", "XLF"),
+    "environmental-protection-agency": ("EPA", "XLE/XLB/XLU"),
+    "energy-department": ("Dept. of Energy", "XLE/XLU"),
+    "food-and-drug-administration": ("FDA", "XLV"),
+    "health-and-human-services-department": ("HHS", "XLV"),
+    "federal-trade-commission": ("FTC", "XLK/XLC"),
+    "justice-department": ("DOJ", "XLK/XLC/XLF"),
+    "federal-communications-commission": ("FCC", "XLC"),
+    "defense-department": ("Dept. of Defense", "XLI"),
+    "transportation-department": ("DOT", "XLI"),
+    "agriculture-department": ("USDA", "XLP/XLB"),
+}
+
+
+def fetch_fedreg():
+    """Official Federal Register documents for market-relevant agencies."""
+    qs = "&".join("conditions%%5Bagencies%%5D%%5B%%5D=%s" % a for a in AGENCY_SECTOR)
+    try:
+        d = http_get_json("https://www.federalregister.gov/api/v1/documents.json?per_page=40&order=newest"
+                          "&fields%5B%5D=title&fields%5B%5D=type&fields%5B%5D=agencies"
+                          "&fields%5B%5D=publication_date&fields%5B%5D=html_url&" + qs, timeout=25)
+    except Exception as e:
+        return {"error": str(e), "items": []}
+    items = []
+    for r in d.get("results", []):
+        slugs = [a.get("slug") for a in (r.get("agencies") or []) if a.get("slug") in AGENCY_SECTOR]
+        ag = AGENCY_SECTOR.get(slugs[0]) if slugs else ("", "")
+        items.append({"date": r.get("publication_date"), "type": r.get("type"),
+                      "agency": ag[0] or ", ".join(a.get("name", "") for a in (r.get("agencies") or [])[:1]),
+                      "sectors": ag[1], "title": (r.get("title") or "")[:140], "url": r.get("html_url"),
+                      "significance": "rule" if "Rule" in (r.get("type") or "") else "notice"})
+    return {"items": items, "source": "Federal Register API (official, keyless)", "fetchedAt": time.time()}
+
+
+FOMC_2026 = ["2026-01-27", "2026-03-17", "2026-04-28", "2026-06-16",
+             "2026-07-28", "2026-09-15", "2026-10-27", "2026-12-08"]
+
+
+def political_calendar():
+    out = {"items": [], "notes": []}
+    today = dt.date.today().isoformat()
+    for d in FOMC_2026:
+        if d >= today:
+            out["items"].append({"date": d, "event": "FOMC meeting (day 1 of 2)", "kind": "Fed",
+                                 "sectors": "all (rates: XLF/XLU/XLRE most sensitive)",
+                                 "source": "federalreserve.gov published schedule"})
+    try:
+        d = http_get_json("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/"
+                          "upcoming_auctions?sort=auction_date&page%%5Bsize%%5D=60", timeout=25)
+        for r in d.get("data", []):
+            if (r.get("auction_date") or "") >= today:
+                out["items"].append({"date": r["auction_date"],
+                                     "event": "Treasury auction: %s %s" % (r.get("security_term"), r.get("security_type")),
+                                     "kind": "Treasury", "sectors": "rates-sensitive (XLU/XLRE/XLF)",
+                                     "source": "Treasury FiscalData (official)"})
+    except Exception as e:
+        out["notes"].append("Treasury auctions unavailable (%s)" % e)
+    cal = cache_get("calendar", 1e9) or {}
+    for e in (cal.get("economic") or []):
+        if e.get("impact") == "High" and (e.get("time") or "") >= today:
+            out["items"].append({"date": (e.get("time") or "")[:10],
+                                 "event": "%s %s" % (e.get("country"), e.get("event")), "kind": "Economic",
+                                 "sectors": "macro-wide", "source": "economic calendar feed"})
+    out["items"].sort(key=lambda x: x["date"])
+    out["items"] = out["items"][:40]
+    if not _key("congress_gov"):
+        out["notes"].append("Bills/hearings/votes need a free congress.gov key "
+                            "(api.congress.gov/sign-up) — set CONGRESS_GOV_API_KEY to enable.")
+    return out
+
+
+def congress_view():
+    with _congress_lock:
+        trades = list(_congress["trades"].values())
+        status = _congress["sourceStatus"]
+        fetched = _congress["fetchedAt"]
+    trades.sort(key=lambda t: t.get("discDate") or t["txnDate"], reverse=True)
+    recent = trades[:60]
+    for r in recent:
+        r["perf"] = _congress_perf(r)
+    cutoff = (dt.date.today() - dt.timedelta(days=90)).isoformat()
+    win = [t for t in trades if t["txnDate"] >= cutoff]
+    heat = {}
+    for s, _n in SECTORS:
+        heat[s] = {"sector": s, "buys": 0, "sells": 0, "buyers": set(), "tickers": {}}
+    for t in win:
+        sec = t.get("sector")
+        if sec in heat:
+            k = "buys" if t["side"] == "buy" else "sells" if t["side"] == "sell" else None
+            if k:
+                heat[sec][k] += 1
+                if t["side"] == "buy":
+                    heat[sec]["buyers"].add(t["member"])
+                heat[sec]["tickers"][t["ticker"]] = heat[sec]["tickers"].get(t["ticker"], 0) + 1
+    reg = cache_get("fedreg", 6 * 3600) or _cache_and_return("fedreg", fetch_fedreg)
+    regcount = {}
+    for it in reg.get("items", []):
+        for s in (it.get("sectors") or "").split("/"):
+            if s in regcount or s in heat:
+                regcount[s] = regcount.get(s, 0) + 1
+    heat_rows = []
+    for s, h in heat.items():
+        heat_rows.append({"sector": s, "buys90d": h["buys"], "sells90d": h["sells"],
+                          "distinctBuyers": len(h["buyers"]),
+                          "topTickers": sorted(h["tickers"], key=h["tickers"].get, reverse=True)[:3],
+                          "regDocs": regcount.get(s, 0),
+                          "read": ("net congressional buying" if h["buys"] > h["sells"] else
+                                   "net selling" if h["sells"] > h["buys"] else "balanced/quiet")})
+    heat_rows.sort(key=lambda x: -(x["buys90d"] + x["sells90d"]))
+    # conviction per ticker (explained, committee overlap unavailable → omitted)
+    conv = {}
+    for t in win:
+        if t["side"] != "buy" or not t.get("ticker"):
+            continue
+        c = conv.setdefault(t["ticker"], {"ticker": t["ticker"], "sector": t.get("sector"),
+                                          "buyers": set(), "n": 0, "maxMid": 0})
+        c["n"] += 1
+        c["buyers"].add(t["member"])
+        c["maxMid"] = max(c["maxMid"], t.get("amountMid") or 0)
+    convictions = []
+    for c in conv.values():
+        pts, why = 0, []
+        nb = len(c["buyers"])
+        if nb >= 3:
+            pts += 3
+            why.append("%d distinct buyers in 90d (cluster)" % nb)
+        elif nb == 2:
+            pts += 2
+            why.append("2 distinct buyers")
+        if c["n"] > nb:
+            pts += 1
+            why.append("repeat purchases (%d trades)" % c["n"])
+        if c["maxMid"] >= 250000:
+            pts += 2
+            why.append("large size (midpoint ≥ $250k)")
+        elif c["maxMid"] >= 50000:
+            pts += 1
+            why.append("mid size (≥ $50k)")
+        grade = "Very High" if pts >= 5 else "High" if pts >= 4 else "Medium" if pts >= 2 else "Low"
+        convictions.append({"ticker": c["ticker"], "sector": c["sector"], "grade": grade, "points": pts,
+                            "why": why + ["committee/bill overlap unavailable in free data — not scored"]})
+    convictions.sort(key=lambda x: -x["points"])
+    # member leaderboard: 90d-forward alpha vs SPY where computable, n≥10 gate
+    mem = {}
+    spy = get_deep_bars(BENCH)
+    for t in trades:
+        m2 = mem.setdefault(t["member"], {"member": t["member"], "chamber": t["chamber"], "n": 0,
+                                          "buys": 0, "sells": 0, "delays": [], "alphas": []})
+        m2["n"] += 1
+        m2["buys" if t["side"] == "buy" else "sells" if t["side"] == "sell" else "n"] += (1 if t["side"] in ("buy", "sell") else 0)
+        if t.get("delayDays") is not None:
+            m2["delays"].append(t["delayDays"])
+        if t["side"] == "buy" and spy:
+            bars = get_deep_bars(t["ticker"]) if (t["ticker"] in _deep or t["ticker"] in BAR_UNIVERSE) else None
+            if bars:
+                d0 = dt.date.fromisoformat(t["txnDate"])
+                d90 = (d0 + dt.timedelta(days=90)).isoformat()
+                p0, p1 = _px_from(bars, t["txnDate"]), _px_from(bars, d90)
+                s0, s1 = _px_from(spy, t["txnDate"]), _px_from(spy, d90)
+                if p0 and p1 and s0 and s1 and d90 < dt.date.today().isoformat():
+                    m2["alphas"].append((p1 / p0 - s1 / s0) * 100)
+    members = []
+    for m2 in mem.values():
+        row = {"member": m2["member"], "chamber": m2["chamber"], "trades": m2["n"],
+               "buys": m2["buys"], "sells": m2["sells"],
+               "medianDelayDays": sorted(m2["delays"])[len(m2["delays"]) // 2] if m2["delays"] else None,
+               "alphaN": len(m2["alphas"])}
+        if len(m2["alphas"]) >= 10:
+            row["avgAlpha90dVsSPY"] = round(sum(m2["alphas"]) / len(m2["alphas"]), 1)
+            row["hitRate"] = round(100 * sum(1 for a in m2["alphas"] if a > 0) / len(m2["alphas"]))
+            row["confidence"] = "moderate (n=%d)" % len(m2["alphas"])
+        else:
+            row["avgAlpha90dVsSPY"] = None
+            row["confidence"] = "INSUFFICIENT SAMPLE (n=%d computable) — not ranked" % len(m2["alphas"])
+        members.append(row)
+    members.sort(key=lambda r: (-(r["avgAlpha90dVsSPY"] if r["avgAlpha90dVsSPY"] is not None else -999),
+                                -r["trades"]))
+    mapped = sum(1 for t in trades if t.get("sector"))
+    return {"disclaimer": CONGRESS_DISCLAIMER,
+            "sourceStatus": {"trades": status, "fetchedAt": fetched,
+                             "regulatory": "Federal Register API — live",
+                             "auctions": "Treasury FiscalData — live",
+                             "billsHearings": "gated on free CONGRESS_GOV_API_KEY" if not _key("congress_gov") else "configured",
+                             "committees": "no free source — conviction scoring omits committee overlap"},
+            "totals": {"records": len(trades),
+                       "sectorMappedPct": round(100 * mapped / len(trades)) if trades else 0,
+                       "medianDelayDays": (sorted([t["delayDays"] for t in trades if t.get("delayDays") is not None])
+                                           [len([t for t in trades if t.get("delayDays") is not None]) // 2]
+                                           if any(t.get("delayDays") is not None for t in trades) else None)},
+            "recent": recent, "heat": heat_rows, "conviction": convictions[:12], "members": members[:25],
+            "note": "Performance computed only for tickers with loaded price history; sector mapping is a "
+                    "curated list (coverage shown) — unmapped tickers appear with sector —."}
+
+
+def congress_reg_view():
+    return {"regulatory": cache_get("fedreg", 6 * 3600) or _cache_and_return("fedreg", fetch_fedreg),
+            "calendar": political_calendar()}
+
+
+_congress_seen = set()
+
+
+def congress_loop():
+    _congress_load()
+    with _congress_lock:
+        _congress_seen.update(_congress["trades"].keys())
+    while True:
+        new, err = fetch_fmp_congress()
+        with _congress_lock:
+            if new is not None:
+                fresh = [r for rid, r in new.items() if rid not in _congress["trades"]]
+                _congress["trades"].update(new)
+                if len(_congress["trades"]) > 8000:
+                    keep = sorted(_congress["trades"].values(), key=lambda t: t["txnDate"], reverse=True)[:8000]
+                    _congress["trades"] = {t["id"]: t for t in keep}
+                _congress["sourceStatus"] = err or "FMP live (%d records)" % len(_congress["trades"])
+                _congress["fetchedAt"] = time.time()
+            else:
+                _congress["sourceStatus"] = err or "not configured"
+                fresh = []
+        if new is not None:
+            _congress_save()
+            # top disclosed tickers get price history so performance is computable
+            counts = {}
+            with _congress_lock:
+                for t in _congress["trades"].values():
+                    if t["txnDate"] >= (dt.date.today() - dt.timedelta(days=365)).isoformat():
+                        counts[t["ticker"]] = counts.get(t["ticker"], 0) + 1
+            for tk in sorted(counts, key=counts.get, reverse=True)[:25]:
+                if tk not in _deep and not os.path.exists(_deep_path(tk)) and tk not in BAR_UNIVERSE:
+                    try:
+                        bars = fetch_yahoo_daily(tk, rng="5y")
+                        os.makedirs(DEEP_DIR, exist_ok=True)
+                        with open(_deep_path(tk) + ".tmp", "w") as f:
+                            json.dump({"bars": bars, "fetched": time.time(), "bars_n": len(bars),
+                                       "first": None, "quality": None, "provider": "yahoo"}, f)
+                        os.replace(_deep_path(tk) + ".tmp", _deep_path(tk))
+                        time.sleep(2)
+                    except Exception:
+                        pass
+            for r in fresh:
+                if r["id"] in _congress_seen:
+                    continue
+                _congress_seen.add(r["id"])
+                if r.get("sector") or r["ticker"] in WATCHLIST:
+                    push_alert("congress", r["ticker"],
+                               "congressional %s disclosed: %s %s %s (traded %s, disclosed %s — %s-day delay). "
+                               "Delayed filing, not a live signal."
+                               % (r["side"], r["member"], r["side"], r["amount"] or "?", r["txnDate"],
+                                  r["discDate"] or "?", r.get("delayDays", "?")),
+                               "info", dedupe_hours=0, key=r["id"][:60])
+        time.sleep(6 * 3600)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # News (Finnhub) + classification
 # ─────────────────────────────────────────────────────────────────────────────
 CATEGORY_RULES = [
@@ -4626,6 +5130,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("exp11", 3600) or _cache_and_return("exp11", exp11_view))
         elif path == "/api/integrity":
             self._json(cache_get("integrity", 900) or _cache_and_return("integrity", integrity_view))
+        elif path == "/api/congress":
+            self._json(cache_get("congress", 900) or _cache_and_return("congress", congress_view))
+        elif path == "/api/congress_reg":
+            self._json(cache_get("congress_reg", 3600) or _cache_and_return("congress_reg", congress_reg_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -4692,7 +5200,7 @@ def main():
     print("  alerts   : signals · setups · position stop/target · price levels (checked ~30s)")
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
-    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop):
+    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop):
         threading.Thread(target=fn, daemon=True).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

@@ -114,6 +114,7 @@
   <button data-tab="rotation">Rotation</button>
   <button data-tab="options">Options</button>
   <button data-tab="research">Research</button>
+  <button data-tab="congress">Congress</button>
   <button data-tab="entries">Entries</button>
   <button data-tab="portfolio">Portfolio</button>
   <button data-tab="chart">Chart</button>
@@ -223,6 +224,25 @@
       <div class="card"><h2>P(beat SPY) by RS rank group — historical base rates</h2><div id="rs-probs"><div class="loading">…</div></div></div>
     </div>
     <div class="card"><h2>Historical analogs — the market states most similar to today</h2><div id="rs-analogs"><div class="loading">…</div></div></div>
+  </section>
+
+  <!-- CONGRESSIONAL INTELLIGENCE -->
+  <section class="tab" id="tab-congress">
+    <div class="card" style="font-size:13px"><span class="badge b-bear">DELAYED DISCLOSURES</span>
+      &nbsp;Congressional trades are self-reported up to <b>45+ days after the transaction</b>, in wide dollar
+      ranges, unverified. Every row shows traded date, disclosed date, and the delay. This module is
+      <b>context only</b> — it never feeds the composite score or the allocation gate.
+      <span id="cg-status" class="muted" style="font-size:11px"></span></div>
+    <div class="card"><h2>Sector political heat (last 90 days)</h2><div id="cg-heat"><div class="loading">…</div></div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Conviction (cluster/repeat/size — explained)</h2><div id="cg-conv"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Member statistics (sample-size gated)</h2><div id="cg-members"><div class="loading">…</div></div></div>
+    </div>
+    <div class="card"><h2>Recent disclosures</h2><div id="cg-recent" class="scrollx"><div class="loading">…</div></div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Regulatory intelligence (Federal Register — official)</h2><div id="cg-reg"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Political calendar</h2><div id="cg-cal"><div class="loading">…</div></div></div>
+    </div>
   </section>
 
   <!-- ENTRIES -->
@@ -371,6 +391,7 @@ function activate(t){
   if(t==="rotation")loadRotation();
   if(t==="options")loadOptions();
   if(t==="research")loadResearch();
+  if(t==="congress")loadCongress();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
   if(t==="portfolio"){loadPortfolio();loadAllocation();}
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
@@ -916,6 +937,7 @@ function renderPfAlloc(){
 }
 async function loadIntel(){
   loadSummary(); loadOpps(); loadAllocation();
+  if(!_cgHeat)fetch(`${API}/api/congress`).then(r=>r.json()).then(d=>{_cgHeat=d.heat||[];}).catch(()=>{});
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();
     _intel=d.sectors||[];
@@ -968,7 +990,10 @@ function renderIntelDetail(sym){
     cats.map(catRow).join("")+
     (ctx.length?`<div style="margin-top:8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Context (measured, zero weight — failed or pending validation)</div>`+ctx.map(catRow).join(""):"")+
     `<div class="cat-row"><b class="down">risk</b><span>${sbar(o.risk,'var(--down)')}<span class="mono">${o.risk.toFixed(0)}</span></span>
-      <span class="muted">${o.riskDetail||''} (separate from composite)</span></div>`;
+      <span class="muted">${o.riskDetail||''} (separate from composite)</span></div>`+
+    (()=>{const h=(_cgHeat||[]).find(x=>x.sector===o.symbol);
+      return h?`<div class="cat-row"><b class="amber">political</b><span class="mono">${h.buys90d}B/${h.sells90d}S</span>
+        <span class="muted">90d congressional filings: ${h.read} (${h.distinctBuyers} buyers${(h.topTickers||[]).length?'; '+h.topTickers.join(" "):''}) · ${h.regDocs} regulatory docs — CONTEXT ONLY, delayed disclosures, never scored</span></div>`:''})();
 }
 async function loadSummary(){
   try{
@@ -1323,6 +1348,71 @@ function renderRsReplication(r,e){
     btab("By year:",r.byYear)+btab("By regime:",r.byRegime)+btab("By vol tercile:",r.byVolTercile)+
     btab("Parameter grid:",r.paramGrid)+btab("Frictions:",r.frictions)+ex+
     `<div class="note">${r.note} ${e&&e.note?e.note:''}</div>`;
+}
+
+// ── CONGRESSIONAL INTELLIGENCE ──
+let _cgHeat=null;
+async function loadCongress(){
+  try{
+    const [d,rg]=await Promise.all([fetch(`${API}/api/congress`).then(r=>r.json()),
+                                    fetch(`${API}/api/congress_reg`).then(r=>r.json())]);
+    _cgHeat=d.heat||null;
+    const st=d.sourceStatus||{};
+    document.getElementById("cg-status").innerHTML=` · trades: <b>${st.trades||'—'}</b> · regulatory: ${st.regulatory} · bills/hearings: ${st.billsHearings} · committees: ${st.committees}`
+      +(d.totals&&d.totals.records?` · ${d.totals.records} records, sector-mapped ${d.totals.sectorMappedPct}%, median delay ${d.totals.medianDelayDays??'—'}d`:``);
+    document.getElementById("cg-heat").innerHTML=(d.heat&&d.heat.length)?
+      `<table><thead><tr><th>Sector</th><th>Buys 90d</th><th>Sells 90d</th><th>Buyers</th><th>Top tickers</th><th>Reg docs</th><th>Read</th></tr></thead><tbody>
+      ${d.heat.map(h=>`<tr class="clk" onclick="openChart('${h.sector}')"><td><b>${h.sector}</b></td>
+        <td class="mono up">${h.buys90d}</td><td class="mono down">${h.sells90d}</td>
+        <td class="mono">${h.distinctBuyers}</td><td class="mono muted">${(h.topTickers||[]).join(" ")||'—'}</td>
+        <td class="mono muted">${h.regDocs}</td>
+        <td class="${h.read.includes('buying')?'up':h.read.includes('selling')?'down':'muted'}" style="font-size:12px">${h.read}</td></tr>`).join("")}</tbody></table>
+      <div class="note">Counts from delayed filings in the last 90 days (by TRADE date) + Federal Register documents mapped by agency→sector. ${d.note||''}</div>`
+      :`<div class="muted" style="padding:8px">No trade data yet — ${st.trades||'source not configured'}.</div>`;
+    document.getElementById("cg-conv").innerHTML=(d.conviction&&d.conviction.length)?
+      d.conviction.map(c=>`<div style="padding:6px 0;border-top:1px solid var(--border);font-size:12px">
+        <b>${c.ticker}</b> ${c.sector?`<span class="muted">(${c.sector})</span>`:''}
+        <span class="badge ${c.grade==='Very High'?'b-ready':c.grade==='High'?'b-appr':'b-neu'}">${c.grade}</span>
+        <div class="muted" style="font-size:11px">${c.why.join(" · ")}</div></div>`).join("")
+      :'<div class="muted" style="padding:8px">Awaiting trade data.</div>';
+    document.getElementById("cg-members").innerHTML=(d.members&&d.members.length)?
+      `<table><thead><tr><th>Member</th><th>Trades</th><th>B/S</th><th>Med delay</th><th>α90d vs SPY</th><th>Hit</th><th>Confidence</th></tr></thead><tbody>
+      ${d.members.map(m2=>`<tr><td style="white-space:normal"><b>${m2.member}</b> <span class="muted" style="font-size:10px">${m2.chamber}</span></td>
+        <td class="mono">${m2.trades}</td><td class="mono">${m2.buys}/${m2.sells}</td>
+        <td class="mono muted">${m2.medianDelayDays??'—'}d</td>
+        <td class="mono ${dir(m2.avgAlpha90dVsSPY)}">${m2.avgAlpha90dVsSPY!=null?pct(m2.avgAlpha90dVsSPY):'—'}</td>
+        <td class="mono">${m2.hitRate!=null?m2.hitRate+'%':'—'}</td>
+        <td class="muted" style="font-size:10px;white-space:normal">${m2.confidence}</td></tr>`).join("")}</tbody></table>`
+      :'<div class="muted" style="padding:8px">Awaiting trade data.</div>';
+    document.getElementById("cg-recent").innerHTML=(d.recent&&d.recent.length)?
+      `<table><thead><tr><th>Member</th><th>Ticker</th><th>Side</th><th>Amount</th><th>Traded</th><th>Disclosed</th><th>Delay</th><th>Since trade</th><th>vs SPY</th><th>Sector</th></tr></thead><tbody>
+      ${d.recent.map(t=>{const p=t.perf||{};return`<tr>
+        <td style="white-space:normal;font-size:12px">${t.member} <span class="muted" style="font-size:10px">${t.chamber}${t.owner?' · '+t.owner:''}</span></td>
+        <td><b>${t.ticker}</b></td><td><span class="badge ${t.side==='buy'?'b-long':t.side==='sell'?'b-short':'b-neu'}">${t.side}</span></td>
+        <td class="mono muted" style="font-size:11px">${t.amount||'—'}</td>
+        <td class="mono">${t.txnDate}</td><td class="mono">${t.discDate||'—'}</td>
+        <td class="mono ${t.delayDays>45?'down':'muted'}">${t.delayDays!=null?t.delayDays+'d':'—'}</td>
+        <td class="mono ${dir(p.sinceTradePct)}">${p.sinceTradePct!=null?pct(p.sinceTradePct):'—'}</td>
+        <td class="mono ${dir(p.vsSPY)}">${p.vsSPY!=null?pct(p.vsSPY):'—'}</td>
+        <td class="muted">${t.sector||'—'}</td></tr>`;}).join("")}</tbody></table>
+      <div class="note">${d.disclaimer}</div>`
+      :`<div class="muted" style="padding:8px">${st.trades||'Trades source not configured'} — everything else on this tab is live.</div>`;
+    const reg=rg.regulatory||{};
+    document.getElementById("cg-reg").innerHTML=(reg.items&&reg.items.length)?
+      reg.items.slice(0,18).map(it=>`<div style="padding:5px 0;border-top:1px solid var(--border);font-size:12px">
+        <span class="badge ${it.significance==='rule'?'b-appr':'b-neu'}">${it.type||''}</span>
+        <b>${it.agency}</b> <span class="muted">(${it.sectors})</span> · <span class="mono muted">${it.date}</span>
+        <div><a href="${it.url}" target="_blank" rel="noopener" style="color:var(--text)">${it.title}</a></div></div>`).join("")
+      +`<div class="note">${reg.source||''}</div>`
+      :'<div class="loading">Regulatory feed unavailable.</div>';
+    const cal=rg.calendar||{};
+    document.getElementById("cg-cal").innerHTML=(cal.items&&cal.items.length)?
+      `<table><thead><tr><th>Date</th><th>Event</th><th>Kind</th><th>Sectors</th></tr></thead><tbody>
+      ${cal.items.map(e=>`<tr><td class="mono">${e.date}</td><td style="white-space:normal;font-size:12px">${e.event}</td>
+        <td><span class="badge b-neu">${e.kind}</span></td><td class="muted" style="font-size:11px;white-space:normal">${e.sectors}</td></tr>`).join("")}</tbody></table>
+      <div class="note">${(cal.notes||[]).join(" · ")}</div>`
+      :'<div class="loading">Calendar unavailable.</div>';
+  }catch(e){document.getElementById("cg-heat").innerHTML='<div class="loading">Congressional module failed to load.</div>';}
 }
 
 // ── MACRO INSIGHT (Markets tab) ──
