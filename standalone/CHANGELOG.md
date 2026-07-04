@@ -1,5 +1,27 @@
 # Changelog (standalone platform)
 
+## 2026-07-04 · Phase 14 — Research Director (the platform improving itself)
+- **/api/director**: platform health (self-explaining metrics), evidence-
+  growth counters (each states what it unlocks), meta-learning parsed from
+  EXPERIMENT_LOG.md (outcome mix, pre-registration rate, velocity), priority
+  engine (10-item backlog scored on infoGain/tradingValue/cost/overfitRisk/
+  novelty with live unblock % from data counters; stated ranking formula),
+  knowledge graph (docs↔experiments↔beliefs↔models via citation scan),
+  code inventory for the AI auditor. Research tab gains the Director section.
+- **Decision journal**: 7-question pre-trade record (regime-stamped, never
+  edited), outcome auto-attached at position close (P&L, R, days held),
+  stats gated n≥10 (confidence vs realized win rate, by regime). Portfolio
+  tab card + `decisions` AI review mode.
+- **Hybrid RAG**: modular rankers (BM25 + TF-IDF + optional Ollama-embedding
+  vector) fused with RRF; RAG_MODE config, TF-IDF backward-compatible;
+  embeddings cached on disk; cross-encoder hook reserved. Degrades to
+  lexical-only without an embedding model.
+- New AI modes: director (daily report), monthly (review), audit (code
+  auditor — inventory-grounded, never modifies), decisions. Governance
+  unchanged: evidence changes models, AI organizes evidence, humans approve.
+- Docs: RESEARCH_DIRECTOR, KNOWLEDGE_GRAPH, HYBRID_RAG, RESEARCH_PROCESS,
+  AI_AUDITOR, DECISION_JOURNAL.
+
 ## 2026-07-04 · Phase 13 — local AI research analyst (Ollama)
 - Provider-modular AI layer (ollama default, anthropic adapter; config-only
   switching, runtime model swap via /api/ai/config). Frontend never calls

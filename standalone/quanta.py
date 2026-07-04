@@ -5170,21 +5170,148 @@ def _rag_build():
     _rag.update({"chunks": idx, "df": df, "built": time.time()})
 
 
+# Modular retrieval (HYBRID_RAG.md): rankers score independently, fused with
+# Reciprocal Rank Fusion. All local. RAG_MODE=tfidf|bm25|hybrid (default
+# hybrid, which degrades to lexical-only when no embedding model is pulled).
+RAG_MODE = os.environ.get("RAG_MODE", "hybrid").lower()
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+_rag_embed = {"vecs": {}, "ok": None}      # chunk-hash -> vector; ok=None means unprobed
+
+
+def _rank_tfidf(toks):
+    n = max(1, len(_rag["chunks"]))
+    out = []
+    for i, c in enumerate(_rag["chunks"]):
+        s = sum((c["tf"][t] / c["len"]) * math.log(1 + n / (1 + _rag["df"].get(t, 0)))
+                for t in toks if t in c["tf"])
+        if s > 0:
+            out.append((s, i))
+    return [i for _s, i in sorted(out, key=lambda x: -x[0])]
+
+
+def _rank_bm25(toks, k1=1.5, b=0.75):
+    chunks = _rag["chunks"]
+    n = max(1, len(chunks))
+    avg = sum(c["len"] for c in chunks) / n if chunks else 1
+    out = []
+    for i, c in enumerate(chunks):
+        s = 0.0
+        for t in toks:
+            f = c["tf"].get(t, 0)
+            if not f:
+                continue
+            idf = math.log(1 + (n - _rag["df"].get(t, 0) + 0.5) / (_rag["df"].get(t, 0) + 0.5))
+            s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * c["len"] / avg))
+        if s > 0:
+            out.append((s, i))
+    return [i for _s, i in sorted(out, key=lambda x: -x[0])]
+
+
+def _ollama_embed(texts):
+    with _ai_lock:
+        host = AI_CFG["host"]
+    d = http_post_json_raw(host + "/api/embed", {"model": OLLAMA_EMBED_MODEL, "input": texts}, timeout=60)
+    return d.get("embeddings") or []
+
+
+def http_post_json_raw(url, body, timeout=30):
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _rag_embed_ensure():
+    """Vector index over chunks — only if an embedding model is available.
+    Probed once; embeddings cached on disk keyed by chunk hash."""
+    import hashlib
+    if _rag_embed["ok"] is False:
+        return False
+    path = os.path.join(DATA_DIR, "rag_embed.json")
+    if not _rag_embed["vecs"]:
+        try:
+            with open(path) as f:
+                _rag_embed["vecs"] = json.load(f)
+        except (OSError, ValueError):
+            pass
+    missing = []
+    for c in _rag["chunks"]:
+        h = hashlib.sha1(c["text"].encode()).hexdigest()[:16]
+        c["h"] = h
+        if h not in _rag_embed["vecs"]:
+            missing.append(c)
+    if missing:
+        try:
+            for i in range(0, len(missing), 16):
+                batch = missing[i:i + 16]
+                vecs = _ollama_embed([c["text"][:1000] for c in batch])
+                for c, v in zip(batch, vecs):
+                    _rag_embed["vecs"][c["h"]] = v
+            _rag_embed["ok"] = True
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(path, "w") as f:
+                    json.dump(_rag_embed["vecs"], f)
+            except OSError:
+                pass
+        except Exception:
+            _rag_embed["ok"] = False        # model not pulled / host down → lexical-only
+            return False
+    else:
+        _rag_embed["ok"] = True
+    return True
+
+
+def _rank_vector(q):
+    if not _rag_embed_ensure():
+        return []
+    try:
+        qv = _ollama_embed([q[:1000]])[0]
+    except Exception:
+        return []
+    qn = math.sqrt(sum(x * x for x in qv)) or 1.0
+    out = []
+    for i, c in enumerate(_rag["chunks"]):
+        v = _rag_embed["vecs"].get(c.get("h"))
+        if not v:
+            continue
+        dot = sum(a * b for a, b in zip(qv, v))
+        vn = math.sqrt(sum(x * x for x in v)) or 1.0
+        out.append((dot / (qn * vn), i))
+    return [i for _s, i in sorted(out, key=lambda x: -x[0])]
+
+
+_rag_rerank = None   # cross-encoder rerank hook: set to fn(query, chunks)->chunks (architecture only, not implemented)
+
+
 def rag_search(q, k=3):
     if time.time() - _rag["built"] > 1800:
         try:
             _rag_build()
+            _rag_embed["vecs"] = {v: e for v, e in _rag_embed["vecs"].items()}  # keep disk cache
         except Exception:
             pass
-    toks, n = _rag_tokens(q), max(1, len(_rag["chunks"]))
-    scored = []
-    for c in _rag["chunks"]:
-        s = sum((c["tf"][t] / c["len"]) * math.log(1 + n / (1 + _rag["df"].get(t, 0)))
-                for t in toks if t in c["tf"])
-        if s > 0:
-            scored.append((s, c))
-    scored.sort(key=lambda x: -x[0])
-    return [{"doc": c["doc"], "score": round(s, 4), "text": c["text"][:1500]} for s, c in scored[:k]]
+    toks = _rag_tokens(q)
+    rankings = []
+    if RAG_MODE == "tfidf":
+        rankings = [_rank_tfidf(toks)]
+    elif RAG_MODE == "bm25":
+        rankings = [_rank_bm25(toks)]
+    else:                                   # hybrid: RRF over every available ranker
+        rankings = [_rank_bm25(toks), _rank_tfidf(toks)]
+        vec = _rank_vector(q)
+        if vec:
+            rankings.append(vec)
+    rrf = {}
+    for ranking in rankings:
+        for rank, idx in enumerate(ranking[:30]):
+            rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (60 + rank)
+    top = sorted(rrf.items(), key=lambda x: -x[1])[:k]
+    chunks = [{"doc": _rag["chunks"][i]["doc"], "score": round(s, 4), "text": _rag["chunks"][i]["text"][:1500]}
+              for i, s in top]
+    if _rag_rerank:
+        chunks = _rag_rerank(q, chunks)
+    return chunks
 
 
 # ── prompt library ────────────────────────────────────────────────────────────
@@ -5431,6 +5558,390 @@ def ai_config_update(d):
     return {"ok": True, "changed": changed, "note": "runtime only — set the same values in .env to persist"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Research Director — the platform improving itself. Deterministic meta-views
+# (health, evidence growth, meta-learning, priority engine, knowledge graph);
+# the AI interprets them but never changes anything. Humans approve changes.
+# See RESEARCH_DIRECTOR.md.
+# ─────────────────────────────────────────────────────────────────────────────
+def _read_doc(name):
+    try:
+        with open(os.path.join(HERE, name), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _meta_learning():
+    """Parse the platform's own EXPERIMENT_LOG.md — research about the research
+    process. Keyword-classified; read the log itself for nuance (stated)."""
+    import re
+    txt = _read_doc("EXPERIMENT_LOG.md")
+    rows, months = [], {}
+    for s in re.split(r"^## ", txt, flags=re.M)[1:]:
+        m = re.match(r"(EXP-\d+|GOV-\d+)", s)
+        if not m:
+            continue
+        low = s.lower()
+        outcome = ("rejected" if ("reject" in low or ("fail" in low and "data-gated" not in low)) else
+                   "replicated/confirmed" if ("replication" in low or "survives" in low or "confirmed" in low) else
+                   "data-gated" if ("data-gated" in low or "accumulating" in low) else "mixed")
+        dm = re.search(r"(\d{4}-\d{2})-\d{2}", s)
+        if dm:
+            months[dm.group(1)] = months.get(dm.group(1), 0) + 1
+        rows.append({"id": m.group(1), "outcome": outcome,
+                     "preRegistered": "pre-register" in low or "registered" in low})
+    n = len(rows)
+    out = {"experiments": n,
+           "byOutcome": {k: sum(1 for r in rows if r["outcome"] == k)
+                         for k in ("rejected", "replicated/confirmed", "data-gated", "mixed")},
+           "preRegisteredPct": round(100 * sum(1 for r in rows if r["preRegistered"]) / n) if n else 0,
+           "velocityByMonth": months, "rows": rows,
+           "read": None,
+           "note": "keyword-classified from EXPERIMENT_LOG.md — the log is the source of truth; n is small, "
+                   "so these are counts, not statistics"}
+    rej = out["byOutcome"]["rejected"]
+    if n:
+        out["read"] = ("%d experiments logged; %d rejected vs %d replicated — a high rejection rate is the "
+                       "validation gate working, not failure. Meta-finding on record: the both-windows-positive "
+                       "gate caught every curve-fit so far." % (n, rej, out["byOutcome"]["replicated/confirmed"]))
+    return out
+
+
+def _code_stats():
+    """Static code inventory for the AI auditor — measured facts, no judgments."""
+    import re
+    st = {}
+    for fname in ("quanta.py", "index.html"):
+        txt = _read_doc(fname)
+        if not txt:
+            continue
+        d = {"lines": txt.count("\n") + 1, "kb": round(len(txt) / 1024)}
+        if fname.endswith(".py"):
+            funcs = re.findall(r"^def (\w+)", txt, re.M)
+            d.update({"functions": len(funcs), "getRoutes": txt.count('path == "/api/'),
+                      "threads": len(re.findall(r"threading\.Thread\(target", txt)),
+                      "locks": len(re.findall(r"threading\.Lock\(\)", txt)),
+                      "broadExceptPass": len(re.findall(r"except Exception:\s*\n\s*pass", txt)),
+                      "todoFixme": len(re.findall(r"TODO|FIXME", txt))})
+        else:
+            d.update({"scriptKb": round(sum(len(m) for m in re.findall(r"<script>([\s\S]*?)</script>", txt)) / 1024),
+                      "elementIds": len(re.findall(r'id="', txt))})
+        st[fname] = d
+    st["note"] = ("single-file architecture is deliberate (zero-dependency deployability) — flag real risks, "
+                  "not style. The AI auditor suggests; it never edits code.")
+    return st
+
+
+def _evidence_growth():
+    """What the platform has accumulated — each counter states what it unlocks."""
+    def _flen(path, key=None):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            return len(d if key is None else d.get(key, d))
+        except (OSError, ValueError):
+            return 0
+    with _state_lock:
+        closed, decisions = len(_state["closed"]), len(_state.get("decisions", []))
+    with _congress_lock:
+        heat_days, events, trades = (len(_congress.get("heatHistory", {})), len(_congress.get("events", {})),
+                                     len(_congress.get("trades", {})))
+    opt_days = _flen(os.path.join(DATA_DIR, "options_history.json"))
+    preds = _flen(os.path.join(DATA_DIR, "predictions_history.json"))
+    import glob as _glob
+    deep_n = len(_glob.glob(os.path.join(DEEP_DIR, "*.json")))
+    return [
+        {"metric": "options snapshot days", "count": opt_days, "unlocks": "options-category IC test at ~60 days (pre-registered)"},
+        {"metric": "logged allocation predictions", "count": preds, "unlocks": "calibration first read at ≥30 matured (10 trading days each)"},
+        {"metric": "closed trades", "count": closed, "unlocks": "journal expectancy by regime at n≥10 per group"},
+        {"metric": "scored decisions (journal)", "count": decisions, "unlocks": "decision-quality statistics at n≥10"},
+        {"metric": "congressional disclosures stored", "count": trades, "unlocks": "EXP-13 matures as disclosures age ≥95d"},
+        {"metric": "sector-heat snapshots (days)", "count": heat_days, "unlocks": "GOV-02/03 at ≥26 weekly observations"},
+        {"metric": "government events archived", "count": events, "unlocks": "GOV-04 reaction studies at ≥30 events/kind"},
+        {"metric": "deep-history symbols cached", "count": deep_n, "unlocks": "already powering research engines (8yr window)"},
+    ]
+
+
+# Priority engine: dimensions are 0–100 display heuristics with stated logic;
+# unblockPct is measured from live data counts. Ranking favors information
+# gain per unit cost, penalizing overfitting risk — learning over features.
+DIRECTOR_BACKLOG = [
+    {"id": "options-ic", "title": "Run pre-registered options-category IC test (auto at snapshot day ~60)",
+     "infoGain": 80, "tradingValue": 55, "cost": 10, "validationDifficulty": 40, "overfitRisk": 25, "novelty": 45,
+     "requiredData": "options_history days", "gate": 60, "counter": "options snapshot days",
+     "timeline": "automatic on data maturity", "depends": [], "confidence": "design fixed in advance",
+     "why": "options weight (0.25) is currently unvalidated; this either earns it or retires it"},
+    {"id": "calibration-read", "title": "First calibration read of allocation confidence",
+     "infoGain": 75, "tradingValue": 50, "cost": 5, "validationDifficulty": 30, "overfitRisk": 10, "novelty": 30,
+     "requiredData": "matured predictions", "gate": 30, "counter": "logged allocation predictions",
+     "timeline": "automatic", "depends": [], "confidence": "mechanical",
+     "why": "unknown whether stated probabilities mean anything — the platform's honesty depends on this"},
+    {"id": "exp13", "title": "EXP-13 follow-the-filing verdict (congressional buys)",
+     "infoGain": 60, "tradingValue": 35, "cost": 5, "validationDifficulty": 50, "overfitRisk": 30, "novelty": 60,
+     "requiredData": "matured buy disclosures ≥95d", "gate": 40, "counter": None,
+     "timeline": "months (store started 2026-07-03)", "depends": [], "confidence": "prior expectation: FAIL (recorded)",
+     "why": "settles whether political flow deserves any research budget"},
+    {"id": "gov02", "title": "GOV-02 sector heat vs forward returns",
+     "infoGain": 55, "tradingValue": 40, "cost": 15, "validationDifficulty": 55, "overfitRisk": 45, "novelty": 55,
+     "requiredData": "weekly heat observations", "gate": 26, "counter": "sector-heat snapshots (days)",
+     "timeline": "~6 months of snapshots", "depends": ["exp13"], "confidence": "speculative",
+     "why": "only government hypothesis with a plausible sector-rotation mechanism"},
+    {"id": "exp08", "title": "EXP-08 inverted-volatility on post-registration data",
+     "infoGain": 65, "tradingValue": 45, "cost": 10, "validationDifficulty": 45, "overfitRisk": 55, "novelty": 35,
+     "requiredData": "post-2026-07-03 weekly cross-sections", "gate": 26, "counter": None,
+     "timeline": "~6 months", "depends": [], "confidence": "pre-registered — cannot peek early",
+     "why": "wrong-signed volatility was the platform's biggest surprise; the inversion must be tested honestly"},
+    {"id": "journal-expectancy", "title": "Journal expectancy by regime/setup",
+     "infoGain": 70, "tradingValue": 65, "cost": 5, "validationDifficulty": 25, "overfitRisk": 15, "novelty": 25,
+     "requiredData": "closed trades per group", "gate": 10, "counter": "closed trades",
+     "timeline": "depends on trading activity", "depends": [], "confidence": "mechanical once n arrives",
+     "why": "the user's own execution is the least-measured model on the platform"},
+    {"id": "decision-stats", "title": "Decision-journal quality statistics (confidence vs outcome)",
+     "infoGain": 70, "tradingValue": 60, "cost": 10, "validationDifficulty": 30, "overfitRisk": 15, "novelty": 50,
+     "requiredData": "scored decisions", "gate": 10, "counter": "scored decisions (journal)",
+     "timeline": "one entry per trade decision", "depends": [], "confidence": "mechanical",
+     "why": "measures the human: forecast accuracy, bias patterns, regime dependence of judgment"},
+    {"id": "embed-rag", "title": "Pull an Ollama embedding model to activate vector+hybrid retrieval",
+     "infoGain": 45, "tradingValue": 15, "cost": 10, "validationDifficulty": 20, "overfitRisk": 0, "novelty": 40,
+     "requiredData": "`ollama pull nomic-embed-text` on the host", "gate": None, "counter": None,
+     "timeline": "minutes (user action)", "depends": [], "confidence": "hybrid falls back gracefully until then",
+     "why": "TF-IDF misses synonyms; BM25+vector RRF measurably improves grounding quality for the analyst"},
+    {"id": "gov04", "title": "GOV-04 first non-FOMC event-reaction study",
+     "infoGain": 50, "tradingValue": 30, "cost": 10, "validationDifficulty": 50, "overfitRisk": 40, "novelty": 65,
+     "requiredData": "≥30 archived events of one kind", "gate": 30, "counter": "government events archived",
+     "timeline": "archive-driven", "depends": [], "confidence": "design mirrors the FOMC study",
+     "why": "turns the event archive from storage into knowledge"},
+    {"id": "edge-requal", "title": "Quarterly re-verification of edge-lab survivors & RSI(2) health",
+     "infoGain": 55, "tradingValue": 70, "cost": 10, "validationDifficulty": 35, "overfitRisk": 20, "novelty": 15,
+     "requiredData": "next quarter of bars", "gate": None, "counter": None,
+     "timeline": "2026-10 (quarterly cadence)", "depends": [], "confidence": "protects the only production edge",
+     "why": "RSI(2) is the platform's single replicated edge — its decay would be the most important fact to know early"},
+]
+
+
+def _director_backlog():
+    growth = {g["metric"]: g["count"] for g in _evidence_growth()}
+    out = []
+    for it in DIRECTOR_BACKLOG:
+        b = dict(it)
+        if b.get("gate") and b.get("counter"):
+            have = growth.get(b["counter"], 0)
+            b["unblockPct"] = min(100, round(100 * have / b["gate"]))
+            b["progress"] = "%d / %d" % (have, b["gate"])
+        else:
+            b["unblockPct"] = None
+        ub = b["unblockPct"] if b["unblockPct"] is not None else 50
+        b["priorityScore"] = round(b["infoGain"] * 0.45 + b["tradingValue"] * 0.2 + ub * 0.2
+                                   - b["cost"] * 0.15 - b["overfitRisk"] * 0.15)
+        out.append(b)
+    out.sort(key=lambda x: -x["priorityScore"])
+    return out
+
+
+def _knowledge_graph():
+    """Entity links scanned from the docs and registries: which documents cite
+    which experiments, which beliefs cite which evidence. Sector-of-truth is
+    the docs; this is navigation, not new information."""
+    import re
+    import glob as _glob
+    nodes, edges = {}, []
+    for p in sorted(_glob.glob(os.path.join(HERE, "*.md"))):
+        doc = os.path.basename(p)
+        txt = _read_doc(doc)
+        ids = sorted(set(re.findall(r"\b(EXP-\d+|GOV-0\d)\b", txt)))
+        if not ids:
+            continue
+        nodes[doc] = "doc"
+        for i in ids:
+            nodes[i] = "experiment"
+            edges.append({"from": doc, "to": i, "rel": "cites"})
+    integ = cache_get("integrity", 1200) or {}
+    for b in (integ.get("beliefs") or []):
+        name = b.get("belief") or b.get("id") or "belief"
+        nodes[name[:60]] = "belief"
+        for i in set(re.findall(r"\b(EXP-\d+|GOV-0\d)\b", json.dumps(b))):
+            edges.append({"from": name[:60], "to": i, "rel": "evidence"})
+    regy = cache_get("registry", 1200) or {}
+    for m in (regy.get("models") or []):
+        nm = m.get("model") or m.get("name")
+        if nm:
+            nodes[nm] = "model"
+            for i in set(re.findall(r"\b(EXP-\d+|GOV-0\d)\b", json.dumps(m))):
+                edges.append({"from": nm, "to": i, "rel": "validated-by"})
+    return {"nodes": [{"id": k, "type": v} for k, v in nodes.items()], "edges": edges,
+            "note": "scanned from docs + registries; ask the AI (ask mode) natural-language questions like "
+                    "'why was RS alpha retired?' — RAG retrieves the cited sections"}
+
+
+def director_view():
+    ml = _meta_learning()
+    growth = _evidence_growth()
+    backlog = _director_backlog()
+    scorecard = cache_get("scorecard", 1200) or {}
+    integ = cache_get("integrity", 1200) or {}
+    calib = cache_get("calib", 1200) or {}
+    drift = cache_get("drift", 1200) or {}
+    regy = cache_get("registry", 1200) or {}
+    docs_n = len([f for f in os.listdir(HERE) if f.endswith(".md")]) if os.path.isdir(HERE) else 0
+    beliefs = integ.get("beliefs") or []
+    health = [
+        {"metric": "Model health", "value": (scorecard.get("summary") or {}).get("read") if isinstance(scorecard.get("summary"), dict) else None,
+         "why": "from /api/scorecard replays — UNAVAILABLE until bars warm" if not scorecard else "scorecard replay over cached bars"},
+        {"metric": "Belief register", "value": "%d beliefs tracked" % len(beliefs) if beliefs else None,
+         "why": "confidence evolution lives in /api/integrity; changes only via logged evidence"},
+        {"metric": "Validation stages", "value": _j({(m.get("stage") or "?"): sum(1 for x in (regy.get("models") or [])
+                                                     if x.get("stage") == m.get("stage")) for m in (regy.get("models") or [])}, 200) if regy else None,
+         "why": "registry stage distribution (production/validation/descriptive/retired)"},
+        {"metric": "Calibration", "value": (calib.get("status") or calib.get("note") or "pending")[:140] if calib else None,
+         "why": "reliability requires ≥30 matured predictions — no backfill allowed"},
+        {"metric": "Drift watch", "value": ("%d models at risk" % len(drift.get("atRisk", []))) if drift else None,
+         "why": "state-vs-own-history drift from /api/drift"},
+        {"metric": "Research velocity", "value": _j(ml["velocityByMonth"], 200),
+         "why": "experiments logged per month (EXPERIMENT_LOG.md)"},
+        {"metric": "Documentation", "value": "%d docs in repo, indexed for RAG" % docs_n,
+         "why": "docs are updated as part of every research decision (platform rule)"},
+        {"metric": "Research debt", "value": (_read_doc("RESEARCH_DEBT.md").count("\n- ") or None),
+         "why": "open items in RESEARCH_DEBT.md (count of list entries)"},
+    ]
+    return {"mission": "Based on everything the platform has learned, what is the single highest-value "
+                       "improvement to make next?",
+            "topRecommendation": backlog[0] if backlog else None,
+            "health": health, "evidenceGrowth": growth, "metaLearning": ml,
+            "backlog": backlog, "graph": _knowledge_graph(), "codeStats": _code_stats(),
+            "governance": "The Director advises; humans approve. Nothing here modifies validated logic, "
+                          "weights, allocation or experiments. Priority scores are display heuristics "
+                          "(formula: 0.45·infoGain + 0.2·tradingValue + 0.2·unblock − 0.15·cost − 0.15·overfitRisk).",
+            "generatedAt": time.time()}
+
+
+# ── Decision journal — measuring the human's judgment, same honesty rules ────
+def decision_add(d):
+    req = {k: (d.get(k) or "").strip() for k in ("symbol", "thesis", "evidenceFor", "evidenceAgainst",
+                                                 "invalidation", "assumptions", "changeMind")}
+    if not req["symbol"] or not req["thesis"]:
+        return {"ok": False, "error": "symbol and thesis are required"}
+    try:
+        conf = max(1, min(99, int(d.get("confidencePct") or 0)))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "confidencePct must be a number 1-99"}
+    reg = cache_get("regime", 900) or {}
+    rec = {"id": _next_id(), "ts": time.time(), "date": dt.date.today().isoformat(),
+           "symbol": req["symbol"].upper(), "thesis": req["thesis"][:600],
+           "evidenceFor": req["evidenceFor"][:600], "evidenceAgainst": req["evidenceAgainst"][:600],
+           "invalidation": req["invalidation"][:300], "assumptions": req["assumptions"][:400],
+           "confidencePct": conf, "changeMind": req["changeMind"][:300],
+           "regime": ((reg.get("current") or {}).get("primary")) if not reg.get("error") else None,
+           "status": "open", "outcome": None}
+    with _state_lock:
+        _state.setdefault("decisions", []).append(rec)
+        del _state["decisions"][:-300]
+    save_state()
+    return {"ok": True, "id": rec["id"]}
+
+
+def _decision_close_for(symbol, exit_px, pl, r_mult):
+    """Called from position_close: attach the outcome to the newest open
+    decision on that symbol — prediction vs outcome, no editing history."""
+    with _state_lock:
+        for rec in reversed(_state.get("decisions", [])):
+            if rec["symbol"] == symbol.upper() and rec["status"] == "open":
+                rec["status"] = "closed"
+                rec["outcome"] = {"exit": exit_px, "pl": pl, "r": r_mult,
+                                  "won": pl > 0, "closedAt": time.time(),
+                                  "daysHeld": round((time.time() - rec["ts"]) / 86400, 1)}
+                break
+
+
+def decision_delete(d):
+    """Only OPEN decisions can be removed (fat-finger recovery) — once an
+    outcome is attached the record is immutable, that's the whole point."""
+    did = int(d.get("id", 0))
+    with _state_lock:
+        rec = next((r for r in _state.get("decisions", []) if r["id"] == did), None)
+        if not rec:
+            return {"ok": False, "error": "decision not found"}
+        if rec["status"] != "open":
+            return {"ok": False, "error": "closed decisions are immutable"}
+        _state["decisions"] = [r for r in _state["decisions"] if r["id"] != did]
+    save_state()
+    return {"ok": True}
+
+
+def decisions_view():
+    with _state_lock:
+        recs = [dict(r) for r in _state.get("decisions", [])]
+    closed = [r for r in recs if r["status"] == "closed" and r.get("outcome")]
+    stats = {"scored": len(closed), "gate": 10}
+    if len(closed) >= 10:
+        wins = sum(1 for r in closed if r["outcome"]["won"])
+        stats["winRate"] = round(100 * wins / len(closed))
+        stats["avgStatedConfidence"] = round(sum(r["confidencePct"] for r in closed) / len(closed))
+        stats["read"] = ("stated confidence %d%% vs realized win rate %d%% — %s"
+                         % (stats["avgStatedConfidence"], stats["winRate"],
+                            "roughly calibrated" if abs(stats["avgStatedConfidence"] - stats["winRate"]) <= 10
+                            else "overconfident" if stats["avgStatedConfidence"] > stats["winRate"] else "underconfident"))
+        byreg = {}
+        for r in closed:
+            byreg.setdefault(r.get("regime") or "?", []).append(r["outcome"]["won"])
+        stats["byRegime"] = {k: {"n": len(v), "winPct": round(100 * sum(v) / len(v))} for k, v in byreg.items()}
+    else:
+        stats["read"] = "decision statistics unlock at 10 scored decisions (have %d) — no early reads" % len(closed)
+    return {"decisions": recs[::-1][:50], "stats": stats,
+            "questions": ["Why am I interested in this trade?", "What evidence supports it?",
+                          "What evidence contradicts it?", "What would invalidate it?",
+                          "What assumptions am I making?", "How confident am I (1-99%)?",
+                          "What would change my mind?"],
+            "note": "pre-trade reasoning is written BEFORE the outcome and never edited after — the comparison "
+                    "is the point. Outcomes attach automatically when the matching position closes."}
+
+
+def _part_director():
+    d = cache_get("director", 900) or _cache_and_return("director", director_view)
+    return {"topRecommendation": d.get("topRecommendation"), "health": d.get("health"),
+            "evidenceGrowth": d.get("evidenceGrowth"), "metaLearning": {k: v for k, v in
+            (d.get("metaLearning") or {}).items() if k != "rows"},
+            "backlogTop5": (d.get("backlog") or [])[:5]}
+
+
+AI_PARTS.update({
+    "director": ("Research Director meta-view (health, evidence growth, ranked backlog)", _part_director),
+    "codestats": ("Code inventory (measured facts about the codebase)", _code_stats),
+    "decisions": ("Decision journal (pre-trade reasoning vs outcomes)", decisions_view),
+})
+AI_MODES.update({
+    "director": {"title": "Daily research report", "rag": True, "ragQuery": "experiment assumption evidence priorities",
+                 "parts": ["director", "government", "scorecard", "integrity", "alerts", "registry"],
+                 "system": "You are the Research Director's analyst. Write the daily research report: what "
+                           "changed, which assumptions strengthened/weakened, which models improved/degraded, "
+                           "what data matured, what deserves attention today. Sections exactly: FACTS / "
+                           "INTERPRETATION / UNKNOWNS / RECOMMENDED RESEARCH. Recommend investigations, never "
+                           "conclusions; the ranked backlog is the platform's own priority engine — critique it "
+                           "rather than restating it.",
+                 "user": "Generate today's research director report."},
+    "monthly": {"title": "Monthly research review", "rag": True, "ragQuery": "experiment log changelog decision belief",
+                "parts": ["director", "integrity", "registry", "calibration", "journal", "decisions"],
+                "system": "Write the comprehensive monthly research review: research maturity, evidence growth, "
+                          "knowledge gained and lost, what was retired/protected, greatest current uncertainty, "
+                          "future priorities. Ground in the meta-learning counts and retrieved docs; state "
+                          "explicitly where the record is too young for conclusions.",
+                "user": "Generate the monthly research review."},
+    "audit": {"title": "Code audit", "rag": True, "ragQuery": "architecture threading cache stdlib server",
+              "parts": ["codestats"],
+              "system": "You are a code auditor for a deliberately single-file, zero-dependency stdlib platform. "
+                        "From the measured inventory and architecture docs: flag likely dead code, duplicate "
+                        "logic, thread-safety risks (locks vs threads), broad exception handling, missing docs, "
+                        "testing gaps, config problems. Suggest specific investigations with expected payoff. "
+                        "You cannot see the source itself — reason from the inventory and docs, and say which "
+                        "file/function the human should open. NEVER propose auto-modifying anything."},
+    "decisions": {"title": "Decision journal review", "parts": ["decisions", "journal", "regime"],
+                  "system": "Review the decision journal: compare stated confidence and reasoning against "
+                            "outcomes; identify recurring strengths, mistakes, bias patterns and regime "
+                            "dependence. Cite specific decisions (symbol, date). Below the n=10 gate, limit "
+                            "yourself to process feedback on the reasoning quality itself."},
+})
+
+
 _congress_seen = set()
 
 
@@ -5674,7 +6185,7 @@ def calendar_loop():
 DATA_DIR = os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(DATA_DIR, "quanta_state.json")
 _state_lock = threading.Lock()
-_state = {"positions": [], "closed": [], "price_alerts": [], "next_id": 1}
+_state = {"positions": [], "closed": [], "price_alerts": [], "decisions": [], "next_id": 1}
 
 
 def load_state():
@@ -5847,6 +6358,9 @@ def position_close(d):
         _state["positions"] = [x for x in _state["positions"] if x["id"] != pid]
         _state["closed"].append({**p, "exit": round(exit_px, 4), "pl": round(pl, 2), "closedAt": time.time()})
         del _state["closed"][:-200]
+    risk = abs(p["entry"] - p["stop"]) if p.get("stop") else None
+    r_mult = round((exit_px - p["entry"]) * sgn / risk, 2) if risk else None
+    _decision_close_for(p["symbol"], round(exit_px, 4), round(pl, 2), r_mult)
     save_state()
     return {"ok": True, "pl": round(pl, 2), "exit": round(exit_px, 2)}
 
@@ -6350,6 +6864,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("government", 900) or _cache_and_return("government", government_view))
         elif path == "/api/ai/status":
             self._json(ai_status())
+        elif path == "/api/director":
+            self._json(cache_get("director", 600) or _cache_and_return("director", director_view))
+        elif path == "/api/journal/decisions":
+            self._json(decisions_view())
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -6365,6 +6883,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/portfolio/delete": position_delete,
         "/api/alert/add": price_alert_add,
         "/api/alert/delete": price_alert_delete,
+        "/api/journal/decision": decision_add,
+        "/api/journal/decision_delete": decision_delete,
     }
 
     def do_POST(self):

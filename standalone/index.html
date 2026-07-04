@@ -216,6 +216,24 @@
 
   <!-- RESEARCH -->
   <section class="tab" id="tab-research">
+    <div class="sechead">RESEARCH DIRECTOR — the platform improving itself</div>
+    <div class="card"><h2>Highest-value next improvement
+      <span style="float:right;font-weight:normal">
+        <button class="mini" onclick="aiOpen('director');aiGo({mode:'director'})">✨ daily report</button>
+        <button class="mini" onclick="aiOpen('monthly');aiGo({mode:'monthly'})">✨ monthly review</button>
+        <button class="mini" onclick="aiOpen('audit');aiGo({mode:'audit'})">✨ code audit</button></span></h2>
+      <div id="rd-top"><div class="loading">…</div></div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Platform health — every metric explains itself</h2><div id="rd-health"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Evidence growth — what data unlocks next</h2><div id="rd-growth"><div class="loading">…</div></div></div>
+    </div>
+    <div class="card"><h2>Research priority engine <span class="muted" style="font-weight:normal;font-size:11px">(ranked by information gain, not feature count)</span></h2>
+      <div id="rd-backlog" class="scrollx"><div class="loading">…</div></div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Meta-learning — research about the research process</h2><div id="rd-meta"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Knowledge graph — what evidence connects to what</h2><div id="rd-graph" style="max-height:260px;overflow-y:auto"><div class="loading">…</div></div></div>
+    </div>
+
     <div class="card" style="font-size:13px"><span class="badge b-appr">RESEARCH MODE</span>
       &nbsp;Everything here computes live from the same 2-year bar cache the production score uses — regime
       classification, historical base rates, analogs and validation. <b class="amber">A 2-year sample is one
@@ -319,6 +337,27 @@
   <!-- PORTFOLIO -->
   <section class="tab" id="tab-portfolio">
     <div id="pf-summary" class="card" style="font-size:13px">Loading portfolio…</div>
+    <div class="card"><h2>Decision journal — write the reasoning BEFORE the trade
+      <button class="mini" style="float:right" onclick="aiOpen('decisions');aiGo({mode:'decisions'})">✨ AI review</button></h2>
+      <div style="font-size:12px">
+        <div class="ctl" style="margin:4px 0;flex-wrap:wrap;gap:4px">
+          <input class="ipt" id="dj-sym" placeholder="SYM" style="width:64px;text-transform:uppercase">
+          <input class="ipt" id="dj-conf" placeholder="confidence % (1-99)" style="width:150px" type="number" min="1" max="99">
+        </div>
+        <textarea class="ipt" id="dj-thesis" placeholder="Why am I interested in this trade?" style="width:100%;height:38px;margin:2px 0"></textarea>
+        <div class="cols cols2" style="gap:6px">
+          <textarea class="ipt" id="dj-for" placeholder="Evidence supporting it" style="width:100%;height:34px"></textarea>
+          <textarea class="ipt" id="dj-against" placeholder="Evidence contradicting it" style="width:100%;height:34px"></textarea>
+        </div>
+        <div class="cols cols2" style="gap:6px;margin-top:4px">
+          <input class="ipt" id="dj-invalid" placeholder="What would invalidate it?" style="width:100%">
+          <input class="ipt" id="dj-mind" placeholder="What would change my mind?" style="width:100%">
+        </div>
+        <input class="ipt" id="dj-assume" placeholder="Assumptions I'm making" style="width:100%;margin-top:4px">
+        <button class="go" style="margin-top:6px" onclick="djAdd()">Record decision</button>
+        <span class="muted" id="dj-msg" style="font-size:11px;margin-left:8px"></span>
+      </div>
+      <div id="dj-list" style="margin-top:8px"></div></div>
     <div class="card"><h2>Suggested allocation — decision-support framework (not advice)</h2>
       <div id="pf-alloc"><div class="loading">Building allocation…</div></div></div>
     <div class="card"><h2>Position sizing calculator — multiple methods, none crowned</h2>
@@ -446,7 +485,7 @@ function activate(t){
   if(t==="research")loadResearch();
   if(t==="congress")loadCongress();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
-  if(t==="portfolio"){loadPortfolio();loadAllocation();}
+  if(t==="portfolio"){loadPortfolio();loadAllocation();djLoad();}
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
   if(t==="futures"){loadFutures();}
   if(t==="markets"){if(!loaded.markets){loadQuotes();loaded.markets=true;}loadMacro();}
@@ -1157,7 +1196,67 @@ function drawGexCurve(d){
 
 // ── RESEARCH TAB ──
 let _fx=null,fxSym="XLK",fxBuilt=false;
+// ── RESEARCH DIRECTOR ──
+async function loadDirector(){
+  try{
+    const d=await(await fetch(`${API}/api/director`)).json();
+    const t=d.topRecommendation||{};
+    document.getElementById("rd-top").innerHTML=
+      `<div style="font-size:13px"><span class="badge b-ready">score ${t.priorityScore}</span> <b>${t.title||"—"}</b>
+       <div class="muted" style="font-size:12px;margin-top:3px">${t.why||""}</div>
+       <div class="muted" style="font-size:11px;margin-top:3px">needs: ${t.requiredData||"—"} ${t.progress?`· progress <b>${t.progress}</b>`:""} · timeline: ${t.timeline||"—"} · ${t.confidence||""}</div>
+       <div class="note">${d.governance||""}</div></div>`;
+    document.getElementById("rd-health").innerHTML=(d.health||[]).map(h=>
+      `<div style="padding:4px 0;border-top:1px solid var(--border);font-size:12px"><b>${h.metric}</b>: ${h.value!=null?h.value:'<span class="muted">unavailable (warming)</span>'}
+       <div class="muted" style="font-size:10px">${h.why}</div></div>`).join("");
+    document.getElementById("rd-growth").innerHTML=`<table><thead><tr><th>Evidence</th><th>Count</th><th>Unlocks</th></tr></thead><tbody>
+      ${(d.evidenceGrowth||[]).map(g=>`<tr><td style="font-size:12px">${g.metric}</td><td class="mono">${g.count}</td><td class="muted" style="font-size:11px;white-space:normal">${g.unlocks}</td></tr>`).join("")}</tbody></table>`;
+    document.getElementById("rd-backlog").innerHTML=`<table><thead><tr><th>#</th><th>Improvement</th><th>Score</th><th>Info gain</th><th>Trade value</th><th>Cost</th><th>Overfit risk</th><th>Progress</th><th>Timeline</th></tr></thead><tbody>
+      ${(d.backlog||[]).map((b,i)=>`<tr title="${(b.why||"").replace(/"/g,"'")}"><td class="mono muted">${i+1}</td>
+        <td style="white-space:normal;font-size:12px"><b>${b.title}</b><div class="muted" style="font-size:10px">${b.why}</div></td>
+        <td class="mono amber">${b.priorityScore}</td><td class="mono">${b.infoGain}</td><td class="mono">${b.tradingValue}</td>
+        <td class="mono">${b.cost}</td><td class="mono ${b.overfitRisk>=45?'down':'muted'}">${b.overfitRisk}</td>
+        <td class="mono">${b.progress||"—"}</td><td class="muted" style="font-size:10px">${b.timeline}</td></tr>`).join("")}</tbody></table>`;
+    const ml=d.metaLearning||{};
+    document.getElementById("rd-meta").innerHTML=
+      `<div style="font-size:12px"><b>${ml.experiments||0}</b> experiments logged · outcomes: ${Object.entries(ml.byOutcome||{}).map(([k,v])=>`${k} <b>${v}</b>`).join(" · ")}
+       <div>pre-registered: <b>${ml.preRegisteredPct||0}%</b> · velocity: ${Object.entries(ml.velocityByMonth||{}).map(([m,n])=>`${m}: ${n}`).join(", ")}</div>
+       <div class="muted" style="font-size:11px;margin-top:4px">${ml.read||""}</div><div class="note">${ml.note||""}</div></div>`;
+    const gr=d.graph||{};const byId={};(gr.edges||[]).forEach(e=>{(byId[e.to]=byId[e.to]||[]).push(e.from);});
+    document.getElementById("rd-graph").innerHTML=Object.entries(byId).sort().map(([k,v])=>
+      `<div style="font-size:11px;padding:3px 0;border-top:1px solid var(--border)"><b class="amber">${k}</b> ← ${v.slice(0,6).join(", ")}${v.length>6?` +${v.length-6}`:""}</div>`).join("")
+      +`<div class="note">${gr.note||""}</div>`;
+  }catch(e){document.getElementById("rd-top").innerHTML='<div class="loading">Director unavailable.</div>';}
+}
+// ── DECISION JOURNAL ──
+async function djAdd(){
+  const g=id=>document.getElementById(id).value;
+  const r=await post("/api/journal/decision",{symbol:g("dj-sym"),thesis:g("dj-thesis"),evidenceFor:g("dj-for"),
+    evidenceAgainst:g("dj-against"),invalidation:g("dj-invalid"),changeMind:g("dj-mind"),
+    assumptions:g("dj-assume"),confidencePct:g("dj-conf")});
+  document.getElementById("dj-msg").textContent=r.ok?"recorded — outcome attaches when the position closes":(r.error||"failed");
+  if(r.ok){["dj-sym","dj-thesis","dj-for","dj-against","dj-invalid","dj-mind","dj-assume","dj-conf"].forEach(i=>document.getElementById(i).value="");djLoad();}
+}
+async function djDel(id){ if(!confirm("Remove this open decision? (Closed decisions are immutable.)"))return; await post("/api/journal/decision_delete",{id}); djLoad(); }
+async function djLoad(){
+  try{
+    const d=await(await fetch(`${API}/api/journal/decisions`)).json();
+    const st=d.stats||{};
+    document.getElementById("dj-list").innerHTML=
+      `<div class="muted" style="font-size:11px;margin-bottom:4px">${st.read||""}${st.byRegime?` · by regime: ${Object.entries(st.byRegime).map(([k,v])=>`${k} ${v.winPct}% (n=${v.n})`).join(", ")}`:""}</div>`
+      +(d.decisions||[]).slice(0,10).map(r=>{
+        const o=r.outcome;
+        return`<details style="border-top:1px solid var(--border);padding:4px 0;font-size:12px">
+          <summary style="cursor:pointer"><b>${r.symbol}</b> <span class="mono muted">${r.date}</span> conf <b>${r.confidencePct}%</b> ${r.regime?`<span class="badge b-neu">${r.regime}</span>`:""}
+            ${o?`<span class="mono ${o.pl>0?'up':'down'}">${o.pl>0?"+":""}${o.pl} (${o.r!=null?o.r+"R":"—"}) in ${o.daysHeld}d</span>`:`<span class="badge b-appr">open</span> <span class="clk muted" style="font-size:10px" onclick="event.preventDefault();djDel(${r.id})">✕</span>`}</summary>
+          <div class="muted" style="font-size:11px;padding:4px 0 0 12px">
+            <div><b>Thesis:</b> ${r.thesis}</div><div><b>For:</b> ${r.evidenceFor||"—"} · <b>Against:</b> ${r.evidenceAgainst||"—"}</div>
+            <div><b>Invalidation:</b> ${r.invalidation||"—"} · <b>Assumptions:</b> ${r.assumptions||"—"} · <b>Would change my mind:</b> ${r.changeMind||"—"}</div></div></details>`;}).join("")
+      +`<div class="note">${d.note||""}</div>`;
+  }catch(e){}
+}
 async function loadResearch(){
+  loadDirector();
   try{
     const [reg,val,prob,ana,regy,fx,lab,cal]=await Promise.all(
       ["regime","research","probabilities","analogs","registry","factors","edgelab","calibration"]
