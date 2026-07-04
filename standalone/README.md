@@ -75,6 +75,28 @@ warning: with only 30 test trades, treat the 1-month version as a **candidate** 
 not a proven one. It's shown in the **Rotation** tab as the model portfolio (with these
 stats attached), and an alert fires whenever its top-3 composition changes.
 
+### Category validation (`research_categories.py`) — the Intel scores earn their weights
+
+Every Intel score category is tested for real predictive power: 54 weekly
+cross-sections (no lookahead), Spearman IC vs forward 5/10/21-day SPY-relative
+returns, train/test split, redundancy matrix, leave-one-out ablation, bootstrap CIs.
+
+**2026-07-03 run on 2yr Polygon bars:** only **relative strength** survived
+(train IC +0.031 / test +0.017; ablation −0.041 without it). **Trend** was
+ρ=0.81-redundant with RS. **Momentum** (−0.06) and **volume** (−0.16) had negative
+train ICs. **Volatility was significantly wrong-signed** as a selection signal
+(IC21 −0.213, t=−4.8 — calm sectors *underperformed*). Consequence: the composite
+is now RS 0.70 + options 0.15 + macro 0.15 (the latter two provisional/unvalidated
+until their snapshot history allows this same test); the failed categories are
+displayed as zero-weight context with their measured ICs. Inverting volatility
+would have been positive in both windows, but a post-hoc sign flip is curve-fitting —
+it's parked as a hypothesis to retest on new data.
+
+```bash
+python research_categories.py          # real bars (~4 min)
+QUANTA_SYNTH_BARS=1 python research_categories.py
+```
+
 ### Intraday research (`research_futures.py`) — honest negative result
 
 Same discipline applied to **15-min** ETF-proxy data (ORB, VWAP-reversion, intraday

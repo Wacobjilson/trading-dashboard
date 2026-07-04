@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import socket
 import threading
 import time
 import urllib.parse
@@ -803,8 +804,30 @@ def rotation():
 # both data coverage and cross-category agreement. News/ETF-flow categories are
 # intentionally absent: no reliable per-sector source on the free tier.
 # ─────────────────────────────────────────────────────────────────────────────
-SCORE_WEIGHTS = {"trend": 0.16, "rs": 0.18, "momentum": 0.12, "volume": 0.08,
-                 "volatility": 0.08, "breadth": 0.10, "options": 0.12, "macro": 0.16}
+# Composite weights are EVIDENCE-BASED (research_categories.py, 2026-07-03 run:
+# 54 weekly cross-sections on 2yr Polygon bars, Spearman IC vs forward 10d
+# SPY-relative returns, train/test + ablation):
+#   rs          train IC +0.031 / test +0.017 — the ONLY survivor; ablation:
+#               removing it costs −0.041 composite IC → carries the weight.
+#   trend       redundant with rs (ρ=0.81) and sign-flipped → weight 0 (context).
+#   momentum    train IC −0.061 → weight 0 (context).
+#   volume      train IC −0.161 → weight 0 (context).
+#   volatility  WRONG-SIGNED as selection signal (IC21 −0.213, t=−4.8): calm
+#               sectors underperformed. Weight 0; kept visible as risk info.
+#               (Inverting it would be a post-hoc sign flip = curve-fit — parked
+#               as a research hypothesis until more history exists.)
+#   options/macro: no reconstructible history to validate yet → small
+#               PROVISIONAL weights, flagged "unvalidated" in the UI; the daily
+#               snapshot files will eventually allow the same IC test.
+# "breadth" was removed as a per-sector category (market context ± quadrant,
+# which duplicates rs) — it now lives in the regime block.
+SCORE_WEIGHTS = {"rs": 0.70, "options": 0.15, "macro": 0.15}
+CONTEXT_CATS = {   # displayed with 0 weight + their measured ICs, never composited
+    "trend": "0 weight — failed validation (train IC −0.03, ρ 0.81 with RS = redundant)",
+    "momentum": "0 weight — failed validation (train IC −0.06)",
+    "volume": "0 weight — failed validation (train IC −0.16)",
+    "volatility": "0 weight — WRONG-SIGNED as selection (IC21 −0.21, t −4.8); read as risk info",
+}
 try:
     SCORE_WEIGHTS.update({k: float(v) for k, v in
                           json.loads(os.environ.get("QUANTA_SCORE_WEIGHTS", "{}")).items()
@@ -892,15 +915,24 @@ def _bar_categories(bars, spy_closes, rs_rank, atr_rank):
     return {"trend": trend, "rs": rs, "momentum": momentum, "volume": volume, "volatility": volatility}
 
 
-def _options_category(sym):
+def _options_category(sym, pcr_median=None):
     o = get_options(sym)
     if not o or o.get("error") or not o.get("pcrOI"):
         return None
     s, why = 50.0, []
     pcr = o["pcrOI"]
-    d = clamp((0.9 - pcr) * 40, -18, 18)
-    s += d
-    why.append("P/C OI %.2f (%+.0f)" % (pcr, d))
+    # PCR is only meaningful RELATIVE to a baseline: preferred = z vs the
+    # symbol's own accumulated history; fallback = vs today's sector median.
+    # (Absolute anchors mis-read structurally hedged products — SPY sits ~2.5+.)
+    if o.get("pcrZ") is not None:
+        d = clamp(-o["pcrZ"] * 7, -14, 14)
+        s += d
+        why.append("P/C %.2f, z %+.1f vs own norm (%+.0f)" % (pcr, o["pcrZ"], d))
+    elif pcr_median:
+        d = clamp((pcr_median - pcr) / pcr_median * 25, -10, 10)
+        s += d
+        why.append("P/C %.2f vs sector median %.2f (%+.0f; own-history z calibrating %d/%d days)"
+                   % (pcr, pcr_median, d, o.get("ivHistDays") or 0, OPT_HISTORY_DAYS_MIN))
     if o.get("netGEX") is not None:
         s += 8 if o["netGEX"] > 0 else -8
         why.append("net GEX %+.0fM$ (%s)" % (o["netGEX"], "stabilizing" if o["netGEX"] > 0 else "destabilizing"))
@@ -984,31 +1016,32 @@ def sector_scores(weights_qs=None):
     blends = [v["blend"] for v in raw.values()]
     atrps = [v["atrp"] for v in raw.values()]
     spyc = _tf_closes(BENCH, "daily")
-    b_base = None
-    if breadth.get("n"):
-        n = breadth["n"]
-        b_base = 100 * (0.3 * breadth["above20"] / n + 0.4 * breadth["above50"] / n + 0.3 * breadth["above200"] / n)
+    pcrs = sorted(p for p in ((get_options(s) or {}).get("pcrOI") for s, _ in SECTORS) if p)
+    pcr_median = pcrs[len(pcrs) // 2] if pcrs else None
+    prev_scores = _scores_prev_day()
     for sym, v in raw.items():
         cats = _bar_categories(v["bars"], spyc, _pct_rank(blends, v["blend"]), _pct_rank(atrps, v["atrp"]))
-        if b_base is not None:
-            adj = {"Leading": 10, "Improving": 5, "Weakening": -5, "Lagging": -10}.get(v["rot"].get("quadrant"), 0)
-            cats["breadth"] = _cat(b_base + adj, "market: %d/%d>50d %d/%d>200d (base %.0f) · %s %+d"
-                                   % (breadth["above50"], breadth["n"], breadth["above200"], breadth["n"],
-                                      b_base, v["rot"].get("quadrant"), adj))
-        oc = _options_category(sym)
+        oc = _options_category(sym, pcr_median)
         if oc:
             cats["options"] = oc
         mc = _macro_category(sym)
         if mc:
             cats["macro"] = mc
-        avail_w = sum(w[k] for k in cats)
-        contribs = {k: {"score": cats[k]["score"], "weight": w[k],
-                        "contrib": round(w[k] / avail_w * cats[k]["score"], 1),
-                        "detail": cats[k]["detail"]} for k in cats}
+        weighted = {k: cats[k] for k in cats if w.get(k)}
+        avail_w = sum(w[k] for k in weighted)
+        contribs = {k: {"score": weighted[k]["score"], "weight": w[k],
+                        "contrib": round(w[k] / avail_w * weighted[k]["score"], 1),
+                        "detail": weighted[k]["detail"],
+                        "status": "validated (IC survives train/test)" if k == "rs"
+                                  else "UNVALIDATED — provisional until snapshot history allows the IC test"}
+                    for k in weighted}
+        context = {k: {"score": cats[k]["score"], "weight": 0.0, "contrib": 0.0,
+                       "detail": cats[k]["detail"], "status": CONTEXT_CATS.get(k, "context only")}
+                   for k in cats if k not in weighted}
         total = round(sum(c["contrib"] for c in contribs.values()), 1)
-        bull = round(sum(w[k] / avail_w * max(0.0, cats[k]["score"] - 50) * 2 for k in cats), 1)
-        bear = round(sum(w[k] / avail_w * max(0.0, 50 - cats[k]["score"]) * 2 for k in cats), 1)
-        scores_only = [cats[k]["score"] for k in cats]
+        bull = round(sum(w[k] / avail_w * max(0.0, weighted[k]["score"] - 50) * 2 for k in weighted), 1)
+        bear = round(sum(w[k] / avail_w * max(0.0, 50 - weighted[k]["score"]) * 2 for k in weighted), 1)
+        scores_only = [weighted[k]["score"] for k in weighted]
         agree = 1 - min(1.0, _stdev(scores_only) / 35) if len(scores_only) > 1 else 0.5
         conf = round(100 * avail_w / sum(w.values()) * (0.5 + 0.5 * agree), 1)
         # risk (separate, higher = riskier): realized vol rank, drawdown, IV rank
@@ -1020,6 +1053,7 @@ def sector_scores(weights_qs=None):
         risk = clamp(45 * (_pct_rank(atrps, v["atrp"]) or 0.5) + min(30.0, dd * 2)
                      + (0.25 * ivr if ivr is not None else 0)
                      + (10 if v["rot"].get("quadrant") == "Lagging" else 0))
+        stored = _scores_stored_series(sym)
         out["sectors"].append({
             "symbol": sym, "name": v["name"], "price": round(c[-1], 2),
             "total": total, "bull": bull, "bear": bear, "confidence": conf,
@@ -1028,28 +1062,126 @@ def sector_scores(weights_qs=None):
                           % ((_pct_rank(atrps, v["atrp"]) or 0.5) * 100, dd,
                              ("%.0f" % ivr) if ivr is not None else "n/a", v["rot"].get("quadrant")),
             "quadrant": v["rot"].get("quadrant"),
-            "categories": contribs,
-            "history": _score_history(v["bars"], blends, atrps, v["blend"], v["atrp"]),
+            "categories": contribs, "context": context,
+            "delta1d": round(total - prev_scores[sym], 1) if sym in prev_scores else None,
+            "history": stored if stored else _score_history(v["bars"], spyc),
+            "historySource": "stored daily snapshots" if stored else "RS-blend trajectory (until snapshots accumulate)",
         })
     out["sectors"].sort(key=lambda s: -s["total"])
+    out["regime"] = market_regime(rot)
+    _scores_persist(out["sectors"])
     return out
 
 
-def _score_history(bars, blends, atrps, blend, atrp, points=13, step=5):
-    """Weekly composite of the five bar-based categories over ~a quarter.
-    Cross-sectional ranks are frozen at today's values — a simplification, noted
-    in the UI; recomputing full cross-sections per snapshot isn't worth the cost."""
+# ── daily score snapshots: real history + day-over-day movers ────────────────
+SCORES_HIST_PATH = os.path.join(os.environ.get("QUANTA_DATA", "") or
+                                os.path.dirname(os.path.abspath(__file__)), "scores_history.json")
+_scores_hist_lock = threading.Lock()
+
+
+def _scores_hist_read():
+    try:
+        with open(SCORES_HIST_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _scores_persist(sectors):
+    day = dt.date.today().isoformat()
+    try:
+        with _scores_hist_lock:
+            hist = _scores_hist_read()
+            row = {s["symbol"]: s["total"] for s in sectors}
+            if hist.get(day) != row:
+                hist[day] = row
+                for d in sorted(hist)[:-120]:
+                    del hist[d]
+                with open(SCORES_HIST_PATH + ".tmp", "w") as f:
+                    json.dump(hist, f)
+                os.replace(SCORES_HIST_PATH + ".tmp", SCORES_HIST_PATH)
+    except OSError:
+        pass
+
+
+def _scores_prev_day():
+    with _scores_hist_lock:
+        hist = _scores_hist_read()
+    days = [d for d in sorted(hist) if d < dt.date.today().isoformat()]
+    return hist[days[-1]] if days else {}
+
+
+def _scores_stored_series(sym, min_days=5, max_days=30):
+    with _scores_hist_lock:
+        hist = _scores_hist_read()
+    vals = [hist[d].get(sym) for d in sorted(hist)[-max_days:] if hist[d].get(sym) is not None]
+    return vals if len(vals) >= min_days else None
+
+
+def market_regime(rot):
+    """Market-level context that scales HOW to read the scores (not who's best):
+    breadth, vol trend, gamma regime, cyclical/defensive spread, active signals."""
+    b = rot.get("breadth") or {}
+    vix = get_bars("VIXY")
+    v1m = pct_return([x["c"] for x in vix], 21) if vix else None
+    spy_o = get_options(BENCH) or {}
+    gex = spy_o.get("netGEX")
+    sig = cache_get("signals", 120) or _cache_and_return("signals", signals)
+    buys = [s["symbol"] for s in sig.get("sectors", []) if s.get("signal") == "BUY"]
+    arming = [s["symbol"] for s in sig.get("sectors", []) if s.get("signal") == "Arming"]
+    ready = []
+    for sym, _n in SECTORS:
+        a = analyze(sym)
+        if a.get("ok") and a["status"] == "Ready":
+            ready.append(sym)
+    rotmap = {s["symbol"]: s for s in rot.get("sectors", []) if not s.get("warming")}
+    defs = [rotmap[s]["rs1m"] for s in ("XLP", "XLU", "XLV") if s in rotmap and rotmap[s].get("rs1m") is not None]
+    cycs = [rotmap[s]["rs1m"] for s in ("XLK", "XLY", "XLF", "XLI") if s in rotmap and rotmap[s].get("rs1m") is not None]
+    spread = (sum(cycs) / len(cycs) - sum(defs) / len(defs)) if (defs and cycs) else None
+    return {
+        "breadthAbove50": "%d/%d" % (b.get("above50", 0), b.get("n", 0)) if b.get("n") else None,
+        "ewMinusSpy1m": b.get("ewMinusSpy1m"),
+        "volTrend1m": round(v1m, 1) if v1m is not None else None,
+        "spyNetGEX": gex,
+        "gammaRegime": ("positive (naive conv. — moves dampened)" if gex > 0
+                        else "negative (naive conv. — moves amplified)") if gex is not None else None,
+        "cycMinusDef1m": round(spread, 2) if spread is not None else None,
+        "rsi2Buys": buys, "rsi2Arming": arming, "readySetups": ready,
+        "note": "Mean-reversion BUYs fire on weakness by design — a low momentum "
+                "category on a BUY sector is expected, not a contradiction.",
+    }
+
+
+_hist_cache = {}
+
+
+def _score_history(bars, spyc, points=13, step=5):
+    """Fallback sparkline until stored daily snapshots accumulate: the sector's
+    RS blend vs SPY (the weight-bearing category) mapped to 0-100, weekly over
+    ~a quarter. No lookahead; cached per (last-bar, count) — this was the most
+    expensive part of /api/scores before caching."""
+    ck = (bars[-1]["t"], len(bars))
+    if ck in _hist_cache:
+        return _hist_cache[ck]
     hist = []
-    rs_r, atr_r = _pct_rank(blends, blend), _pct_rank(atrps, atrp)
-    wsub = {k: SCORE_WEIGHTS[k] for k in ("trend", "rs", "momentum", "volume", "volatility")}
-    tw = sum(wsub.values())
     for k in range(points - 1, -1, -1):
-        sub = bars[:len(bars) - k * step]
-        if len(sub) < 210:
+        sub = [b["c"] for b in bars[:len(bars) - k * step]]
+        ssub = spyc[:len(spyc) - k * step] if spyc else None
+        if len(sub) < 150 or not ssub:
             hist.append(None)
             continue
-        cats = _bar_categories(sub, None, rs_r, atr_r)
-        hist.append(round(sum(wsub[c] / tw * cats[c]["score"] for c in wsub), 1))
+        def rel(n):
+            a, b = pct_return(sub, n), pct_return(ssub, n)
+            return (a - b) if (a is not None and b is not None) else None
+        r1, r3, r6 = rel(21), rel(63), rel(126)
+        if r1 is None or r3 is None:
+            hist.append(None)
+            continue
+        blend = 0.5 * r1 + 0.3 * r3 + 0.2 * (r6 or 0)
+        hist.append(round(clamp(50 + blend * 6), 1))
+    if len(_hist_cache) > 64:
+        _hist_cache.clear()
+    _hist_cache[ck] = hist
     return hist
 
 
@@ -1156,6 +1288,48 @@ def _rule_based_summary(sc, rot, mac, opts):
         risks.append("negative net GEX (dealer-hedging amplification, naive convention) in " + ", ".join(negg[:4]))
     lines.append("RISKS — " + ("; ".join(risks) if risks else
                                "no acute flags from breadth, vol regime, or options positioning right now") + ".")
+    # invalidation: concrete, checkable triggers with current readings
+    inval = []
+    if b.get("ewMinusSpy1m") is not None:
+        inval.append("EW−SPY 1m crossing %s zero (now %+.2f%%) would flip the breadth read"
+                     % ("above" if b["ewMinusSpy1m"] < 0 else "below", b["ewMinusSpy1m"]))
+    if len(secs) >= 2:
+        margin = secs[0]["total"] - secs[1]["total"]
+        inval.append("%s losing the top slot needs only a %.1f-pt score swing vs %s"
+                     % (secs[0]["symbol"], margin, secs[1]["symbol"]))
+    spy_gex = opts.get(BENCH, {}).get("netGEX")
+    if spy_gex is not None:
+        inval.append("SPY net GEX flipping sign (now %+.0fM$, naive conv.) would change the vol-behavior regime" % spy_gex)
+    reg2 = (mac or {}).get("regime")
+    if reg2 and reg2.get("cycMinusDef1m") is not None:
+        inval.append("cyclical-defensive 1m spread crossing zero (now %+.2f%%)" % reg2["cycMinusDef1m"])
+    if inval:
+        lines.append("INVALIDATION — watch for: " + "; ".join(inval) + ".")
+    # watch today: biggest score movers + calendar
+    movers = sorted([s for s in secs if s.get("delta1d") is not None], key=lambda s: -abs(s["delta1d"]))[:3]
+    watch = []
+    if movers and any(abs(s["delta1d"]) >= 1 for s in movers):
+        watch.append("largest score moves d/d: " +
+                     ", ".join("%s %+.1f" % (s["symbol"], s["delta1d"]) for s in movers))
+    cal = cache_get("calendar", 1e9) or {}
+    now_iso = dt.datetime.now().isoformat()
+    nxt = next((e for e in (cal.get("economic") or [])
+                if e.get("impact") == "High" and (e.get("time") or "") > now_iso), None)
+    if nxt:
+        watch.append("next high-impact release: %s %s at %s (fcst %s, prev %s)"
+                     % (nxt.get("country"), nxt.get("event"), nxt.get("time", "")[11:16],
+                        nxt.get("estimate") or "—", nxt.get("prev") or "—"))
+    if watch:
+        lines.append("WATCH TODAY — " + "; ".join(watch) + ".")
+    # missing data, stated plainly
+    miss = []
+    ivd = min((opts[s].get("ivRank") is None for s in opts), default=True)
+    hist_days = max((get_options(s) or {}).get("ivHistDays") or 0 for s in OPTIONS_UNIVERSE) if opts else 0
+    if ivd:
+        miss.append("IV rank / P/C z-scores still calibrating (%d/20 daily snapshots)" % hist_days)
+    miss.append("options & macro score categories are unvalidated (no history for the IC test yet)")
+    miss.append("ETF flows, dealer inventory, vanna/charm: not derivable from free feeds")
+    lines.append("MISSING — " + "; ".join(miss) + ".")
     return {"text": "\n\n".join(lines), "engine": "rules",
             "disclaimer": "Deterministic synthesis of the numbers shown elsewhere in this dashboard; not advice."}
 
@@ -1524,19 +1698,31 @@ def fetch_options_summary(symbol):
         else:
             put_oi += c["oi"]; put_vol += c["vol"]; s["poi"] += c["oi"]
 
-    # gamma flip: zero crossing of cumulative net GEX across strikes (approx.)
-    ks = sorted(by_strike)
+    # gamma flip: recompute net GEX with Black-Scholes gamma re-evaluated at
+    # shifted spot levels (r=0, quoted IV per contract) — the proper definition,
+    # not the cumulative-by-strike shortcut. Also yields the GEX(S) curve.
+    def _bs_gamma(S, K, iv, T):
+        if iv <= 0 or T <= 0 or S <= 0 or K <= 0:
+            return 0.0
+        st = iv * math.sqrt(T)
+        d1 = (math.log(S / K) + 0.5 * iv * iv * T) / st
+        return math.exp(-d1 * d1 / 2) / math.sqrt(2 * math.pi) / (S * st)
+
+    live_con = [c for c in con if c["oi"] > 0 and c["iv"] > 0 and c["dte"] >= 1]
+    gex_curve = []
+    for step_i in range(-10, 11):
+        S = spot * (1 + step_i * 0.015)
+        net = sum((1 if c["cp"] == "C" else -1) * _bs_gamma(S, c["k"], c["iv"], c["dte"] / 365.0)
+                  * c["oi"] * 100 * S * S * 0.01 for c in live_con)
+        gex_curve.append({"s": round(S, 2), "gex": round(net / 1e6, 1)})
     flip = None
-    cum = 0.0
-    prev_k, prev_cum = None, None
-    total_neg = sum(v["gex"] for v in by_strike.values() if v["gex"] < 0)
-    for k in ks:
-        cum += by_strike[k]["gex"]
-        if prev_cum is not None and prev_cum < 0 <= cum:
-            flip = prev_k + (k - prev_k) * (-prev_cum) / (cum - prev_cum)
-        prev_k, prev_cum = k, cum
-    if total_neg == 0:
-        flip = None   # all-positive profile: no flip below — leave unset
+    for i in range(1, len(gex_curve)):
+        a, b2 = gex_curve[i - 1], gex_curve[i]
+        if (a["gex"] < 0) != (b2["gex"] < 0) and b2["gex"] != a["gex"]:
+            x = a["s"] + (b2["s"] - a["s"]) * (-a["gex"]) / (b2["gex"] - a["gex"])
+            if flip is None or abs(x - spot) < abs(flip - spot):
+                flip = x
+    ks = sorted(by_strike)
 
     near = [k for k in ks if 0.8 * spot <= k <= 1.2 * spot]
     call_wall = max(near, key=lambda k: by_strike[k]["coi"], default=None)
@@ -1595,7 +1781,7 @@ def fetch_options_summary(symbol):
         "iv30": data.get("iv30"), "contracts": len(con), "windowDays": 90,
         "netGEX": round(gex / 1e6, 1), "netDEX": round(dex / 1e6, 1),          # $M
         "vegaExp": round(vega_exp / 1e6, 2),                                    # $M per IV pt
-        "gammaFlip": round(flip, 2) if flip else None,
+        "gammaFlip": round(flip, 2) if flip else None, "gexCurve": gex_curve,
         "callWall": call_wall, "putWall": put_wall, "maxPain": max_pain,
         "pcrOI": round(put_oi / call_oi, 2) if call_oi else None,
         "pcrVol": round(put_vol / call_vol, 2) if call_vol else None,
@@ -1644,6 +1830,15 @@ def _opt_enrich_from_history(summ, h):
     days = sorted(h)
     ivs = [h[d]["iv30"] for d in days if h[d].get("iv30")]
     summ["ivHistDays"] = len(ivs)
+    # P/C ratio z-score vs this symbol's OWN history — absolute PCR levels are
+    # structural (index/hedged products sit far above 1.0), so only deviation
+    # from the symbol's norm is information.
+    pcrs = [h[d]["pcr"] for d in days if h[d].get("pcr")]
+    if len(pcrs) >= OPT_HISTORY_DAYS_MIN and summ.get("pcrOI"):
+        mu, sd = sum(pcrs) / len(pcrs), _stdev(pcrs)
+        summ["pcrZ"] = round((summ["pcrOI"] - mu) / sd, 2) if sd > 0.01 else 0.0
+    else:
+        summ["pcrZ"] = None
     if len(ivs) >= OPT_HISTORY_DAYS_MIN and summ.get("iv30"):
         lo, hi = min(ivs), max(ivs)
         summ["ivRank"] = round((summ["iv30"] - lo) / (hi - lo) * 100, 1) if hi > lo else 50.0
@@ -2068,6 +2263,33 @@ def positions_view():
                         cs.append(_cov(held[i][2], held[j][2]) / (v1 ** 0.5 * v2 ** 0.5))
             if cs:
                 analytics["avgPairCorr"] = round(sum(cs) / len(cs), 2)
+    # stress: replay the CURRENT allocation over the last ~250 sessions —
+    # worst day, VaR95, max drawdown, annualized vol/Sharpe. This is the
+    # allocation's history, NOT your trade record (it says so in the UI).
+    if held:
+        hrets = []
+        for _s, w_, _r in held:
+            rr = _rets(_s, 250)
+            hrets.append((w_, rr))
+        m = min(len(r) for _w, r in hrets if r)
+        if m >= 60:
+            port = [sum(w_ * r[-m:][i] for w_, r in hrets) for i in range(m)]
+            sp = sorted(port)
+            eq = peak = mdd = 0.0
+            for r_ in port:
+                eq += r_
+                peak = max(peak, eq)
+                mdd = min(mdd, eq - peak)
+            mu, sd = sum(port) / m, _stdev(port)
+            analytics["stress"] = {
+                "days": m,
+                "worstDayPct": round(sp[0] * 100, 2),
+                "var95Pct": round(sp[int(m * 0.05)] * 100, 2),
+                "maxDDPct": round(mdd * 100, 2),
+                "annVolPct": round(sd * (252 ** 0.5) * 100, 1),
+                "sharpe": round(mu / sd * (252 ** 0.5), 2) if sd > 0 else None,
+                "note": "current allocation replayed over %d sessions — not your trade record" % m,
+            }
     analytics["note"] = "63d daily returns; weights = share of gross exposure (shorts negative)"
     return {"open": rows, "closed": closed[::-1], "analytics": analytics,
             "totalValue": round(tot_val, 2), "openPL": round(tot_pl, 2),
@@ -2127,6 +2349,9 @@ def push_alert(kind, symbol, msg, level="info", price=None, dedupe_hours=12.0, k
         if dedupe_hours and now - _alert_seen.get(key, 0) < dedupe_hours * 3600:
             return False
         _alert_seen[key] = now
+        if len(_alert_seen) > 800:      # bound the dedupe map (it grows forever otherwise)
+            for k2 in sorted(_alert_seen, key=_alert_seen.get)[:200]:
+                del _alert_seen[k2]
         _alert_seq[0] += 1
         _alerts.insert(0, {"id": _alert_seq[0], "ts": now, "kind": kind, "symbol": symbol,
                            "msg": msg, "level": level,
@@ -2402,7 +2627,24 @@ def main():
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop):
         threading.Thread(target=fn, daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
+    # an IPv4-only bind costs ~2s per request on such clients (measured on
+    # Windows: 2050ms via localhost vs 1ms via 127.0.0.1). Fall back to IPv4 if
+    # the host has no IPv6 (e.g. some containers).
+    class DualStackServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+            ThreadingHTTPServer.server_bind(self)
+
+    try:
+        server = DualStackServer(("::", PORT), Handler)
+    except OSError:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

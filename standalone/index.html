@@ -125,15 +125,18 @@
 <main>
   <!-- INTEL (market intelligence engine — the synthesis view) -->
   <section class="tab active" id="tab-intel">
+    <div class="card" id="intel-regime" style="font-size:13px;padding:10px 16px">Loading regime…</div>
     <div class="card" id="intel-summary" style="font-size:13px;white-space:pre-line">Loading market summary…</div>
     <div class="card"><h2>Sector intelligence scores <span class="muted" style="text-transform:none;letter-spacing:0" id="intel-weights"></span></h2>
       <div class="scrollx" id="intel-table"><div class="loading">Scoring sectors…</div></div>
-      <div class="note">Composite of up to 8 evidence categories (trend, relative strength, momentum, volume,
-        volatility, breadth, options positioning, macro tailwind). Categories without data are <b>excluded and the
-        rest renormalized</b> — never guessed. <b>Conf</b> = data coverage × cross-category agreement.
-        <b>Risk</b> is separate (higher = riskier), so a strong-but-extended sector shows both. Click a row for the
-        full per-category breakdown with the numbers behind every score. Spark = 13-week score history
-        (bar-based categories only). News/ETF-flow categories are intentionally absent: no reliable free per-sector source.</div></div>
+      <div class="note"><b>Evidence-based composite</b> (research_categories.py, 54 weekly cross-sections):
+        <b>relative strength</b> is the only bar category whose forward-10d IC survived train/test, so it carries
+        the weight; <b>options</b> and <b>macro</b> are small and flagged <span class="amber">unvalidated</span>
+        until their snapshot history allows the same test. Trend/momentum/volume/volatility <b>failed validation</b>
+        (trend is ρ0.81-redundant with RS; volatility was wrong-signed, IC21 −0.21) — they're shown in the
+        drill-down as zero-weight context, not composited. Categories without data are excluded and the rest
+        renormalized — never guessed. <b>Conf</b> = coverage × agreement; <b>Risk</b> is separate. Click a row for
+        the full breakdown. Spark = stored daily score history (RS-trajectory fallback until ≥5 days accumulate).</div></div>
     <div class="card" id="intel-detail" style="display:none"></div>
   </section>
 
@@ -175,8 +178,11 @@
       <div class="ctl"><span class="seg" id="opt-sel"></span><span id="opt-meta" class="muted" style="font-size:12px"></span></div>
       <div class="grid" id="opt-cards" style="grid-template-columns:repeat(2,1fr)"></div>
       <div id="opt-profile"></div>
-      <div class="note">Bars = net GEX by strike ($M, green +/red −); amber line = spot; C/P = call & put walls
-        (max OI strike within ±20% of spot); MP = front-expiry max pain.</div>
+      <div id="opt-gexcurve" style="margin-top:10px"></div>
+      <div class="note">Top: net GEX by strike ($M, green +/red −); amber = spot; C/P = call & put walls
+        (max OI strike within ±20% of spot); MP = front-expiry max pain. Bottom: <b>net GEX vs spot level</b> —
+        Black-Scholes gamma re-evaluated across ±15% spot from each contract's quoted IV (r=0); the zero crossing
+        is the gamma flip.</div>
     </div>
     <div class="cols cols2">
       <div class="card"><h2>Term structure (ATM IV by expiry)</h2><div id="opt-term"></div></div>
@@ -786,6 +792,7 @@ const INTEL_COLS=[
   {k:"symbol",l:"Sector",r:o=>`<b>${o.symbol}</b> <span class="muted" style="font-size:11px">${o.name}</span>`},
   {k:"price",l:"Price",r:o=>`<span class="mono">${fmt(o.price)}</span>`},
   {k:"total",l:"Score",r:o=>`${sbar(o.total)}<b class="mono" style="color:${scoreCol(o.total)}">${o.total.toFixed(0)}</b>`},
+  {k:"delta1d",l:"Δ1d",r:o=>`<span class="mono ${dir(o.delta1d)}">${o.delta1d==null?'—':(o.delta1d>0?'+':'')+o.delta1d.toFixed(1)}</span>`},
   {k:"bull",l:"Bull",r:o=>`<span class="mono up">${o.bull.toFixed(0)}</span>`},
   {k:"bear",l:"Bear",r:o=>`<span class="mono down">${o.bear.toFixed(0)}</span>`},
   {k:"confidence",l:"Conf",r:o=>`<span class="mono ${o.confidence>=70?'up':o.confidence>=50?'amber':'muted'}">${o.confidence.toFixed(0)}%</span>`},
@@ -798,6 +805,7 @@ async function loadIntel(){
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();
     _intel=d.sectors||[];
+    renderRegime(d.regime);
     const w=d.weights||{};
     document.getElementById("intel-weights").textContent="· weights: "+Object.entries(w).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(" · ");
     if(!_intel.length){document.getElementById("intel-table").innerHTML=`<div class="loading">Warming bars ${d.warm?d.warm.have:0}/${d.warm?d.warm.total:'?'}… scores need ~210 daily bars/sector.</div>`;return;}
@@ -815,17 +823,36 @@ function renderIntel(){
   el.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;
     if(intelSort.k===k)intelSort.d*=-1;else{intelSort.k=k;intelSort.d=(k==="symbol")?1:-1;}renderIntel();});
 }
+function renderRegime(r){
+  const el=document.getElementById("intel-regime");
+  if(!r){el.innerHTML='<span class="muted">Regime data warming…</span>';return;}
+  const chip=(l,v,cls)=>v==null?'':`<span style="margin-right:14px"><span class="muted" style="font-size:11px">${l}</span> <b class="${cls||''} mono">${v}</b></span>`;
+  el.innerHTML=`<b style="color:var(--amber)">REGIME</b> &nbsp;`+
+    chip("breadth >50d",r.breadthAbove50)+
+    chip("EW−SPY 1m",r.ewMinusSpy1m!=null?pct(r.ewMinusSpy1m):null,dir(r.ewMinusSpy1m))+
+    chip("vol 1m",r.volTrend1m!=null?pct(r.volTrend1m):null,r.volTrend1m>5?'down':'muted')+
+    chip("SPY GEX",r.spyNetGEX!=null?(r.spyNetGEX>0?'+':'')+r.spyNetGEX+'M$':null,r.spyNetGEX>0?'up':'down')+
+    chip("cyc−def 1m",r.cycMinusDef1m!=null?pct(r.cycMinusDef1m):null,dir(r.cycMinusDef1m))+
+    chip("RSI2 BUY",(r.rsi2Buys||[]).length?r.rsi2Buys.join(" "):"none",(r.rsi2Buys||[]).length?'up':'muted')+
+    chip("arming",(r.rsi2Arming||[]).length?r.rsi2Arming.join(" "):null,'amber')+
+    chip("Ready setups",(r.readySetups||[]).length?r.readySetups.join(" "):"none",(r.readySetups||[]).length?'up':'muted')+
+    `<div class="muted" style="font-size:11px;margin-top:5px">${r.gammaRegime?('gamma regime: '+r.gammaRegime+' · '):''}${r.note||''}</div>`;
+}
 function renderIntelDetail(sym){
   intelSel=sym;
   const o=_intel.find(s=>s.symbol===sym);
   const el=document.getElementById("intel-detail");
   if(!o){el.style.display="none";return;}
+  const catRow=([k,c])=>`<div class="cat-row"><b>${k}</b><span>${sbar(c.score)}<span class="mono">${c.score.toFixed(0)}</span></span>
+      <span class="muted">${c.weight?`w ${(c.weight*100).toFixed(0)}% → contrib ${c.contrib}`:'unweighted'} · ${c.detail}
+      ${c.status?`<br><span style="font-size:11px;color:${/UNVALIDATED|0 weight|WRONG/.test(c.status)?'var(--amber)':'var(--up)'}">${c.status}</span>`:''}</span></div>`;
   const cats=Object.entries(o.categories||{}).sort((a,b)=>b[1].contrib-a[1].contrib);
+  const ctx=Object.entries(o.context||{});
   el.style.display="block";
-  el.innerHTML=`<h2>${o.symbol} — ${o.name} · score ${o.total} (bull ${o.bull} / bear ${o.bear} / conf ${o.confidence}%)
+  el.innerHTML=`<h2>${o.symbol} — ${o.name} · score ${o.total} (bull ${o.bull} / bear ${o.bear} / conf ${o.confidence}%) · history: ${o.historySource||''}
       <button class="mini" style="float:right" onclick="openChart('${o.symbol}')">chart →</button></h2>`+
-    cats.map(([k,c])=>`<div class="cat-row"><b>${k}</b><span>${sbar(c.score)}<span class="mono">${c.score.toFixed(0)}</span></span>
-      <span class="muted">w ${(c.weight*100).toFixed(0)}% → contrib ${c.contrib} · ${c.detail}</span></div>`).join("")+
+    cats.map(catRow).join("")+
+    (ctx.length?`<div style="margin-top:8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Context (measured, zero weight — failed or pending validation)</div>`+ctx.map(catRow).join(""):"")+
     `<div class="cat-row"><b class="down">risk</b><span>${sbar(o.risk,'var(--down)')}<span class="mono">${o.risk.toFixed(0)}</span></span>
       <span class="muted">${o.riskDetail||''} (separate from composite)</span></div>`;
 }
@@ -874,7 +901,7 @@ async function loadOptions(){
       card("25Δ skew",d.skew25d!=null?d.skew25d.toFixed(1)+' pts':'—',"put IV − call IV (front)")+
       card("Vega exposure",d.vegaExp!=null?fmt(d.vegaExp,1)+'M$/IVpt':'—',"")+
       card("Unavailable",(d.unavailable||[]).length+" metrics","vanna/charm/dealer inv./blocks/flows — feed can't derive");
-    drawOptProfile(d);
+    drawOptProfile(d); drawGexCurve(d);
     document.getElementById("opt-term").innerHTML=(d.term&&d.term.length)?
       "<table><thead><tr><th>Expiry</th><th>DTE</th><th>ATM IV</th></tr></thead><tbody>"+
       d.term.map(t=>`<tr><td class="mono">${t.exp}</td><td class="mono">${t.dte}</td><td class="mono">${t.atmIV}%</td></tr>`).join("")+"</tbody></table>"
@@ -905,6 +932,29 @@ function drawOptProfile(d){
   prof.forEach((p,i)=>{if(i%step===0)g+=`<text x="${X(i).toFixed(1)}" y="${H-6}" fill="var(--muted)" font-size="9" text-anchor="middle">${p.k}</text>`;});
   g+=`</svg>`;
   document.getElementById("opt-profile").innerHTML=g;
+}
+
+function drawGexCurve(d){
+  const cv=d.gexCurve||[];
+  const el=document.getElementById("opt-gexcurve");
+  if(cv.length<3){el.innerHTML="";return;}
+  const W=960,H=150,padL=8,padR=56,padT=10,padB=18;
+  let mx=1;cv.forEach(p=>mx=Math.max(mx,Math.abs(p.gex)));mx*=1.1;
+  const X=i=>padL+i/(cv.length-1)*(W-padL-padR),Y=v=>padT+(mx-v)/(2*mx)*(H-padT-padB),y0=Y(0);
+  let g=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="background:#0c1219;border:1px solid var(--border);border-radius:6px">`;
+  g+=`<line x1="${padL}" y1="${y0}" x2="${W-padR}" y2="${y0}" stroke="#2a3645"/>`;
+  g+=`<text x="${W-padR+4}" y="${padT+8}" fill="var(--muted)" font-size="9">+${mx.toFixed(0)}M$</text><text x="${W-padR+4}" y="${H-padB}" fill="var(--muted)" font-size="9">−${mx.toFixed(0)}M$</text>`;
+  const pts=cv.map((p,i)=>`${X(i).toFixed(1)},${Y(p.gex).toFixed(1)}`).join(" ");
+  g+=`<polyline points="${pts}" fill="none" stroke="#3b82f6" stroke-width="1.6"/>`;
+  const si=cv.reduce((b,p,i)=>Math.abs(p.s-d.spot)<Math.abs(cv[b].s-d.spot)?i:b,0);
+  g+=`<line x1="${X(si).toFixed(1)}" y1="${padT}" x2="${X(si).toFixed(1)}" y2="${H-padB}" stroke="var(--amber)" stroke-dasharray="3 3"/><text x="${(X(si)+3).toFixed(1)}" y="${padT+9}" fill="var(--amber)" font-size="9">spot</text>`;
+  if(d.gammaFlip!=null){
+    const fi=cv.reduce((b,p,i)=>Math.abs(p.s-d.gammaFlip)<Math.abs(cv[b].s-d.gammaFlip)?i:b,0);
+    g+=`<line x1="${X(fi).toFixed(1)}" y1="${padT}" x2="${X(fi).toFixed(1)}" y2="${H-padB}" stroke="#a855f7" stroke-dasharray="3 3"/><text x="${(X(fi)+3).toFixed(1)}" y="${padT+18}" fill="#a855f7" font-size="9">flip ${fmt(d.gammaFlip)}</text>`;
+  }
+  cv.forEach((p,i)=>{if(i%4===0)g+=`<text x="${X(i).toFixed(1)}" y="${H-5}" fill="var(--muted)" font-size="9" text-anchor="middle">${p.s.toFixed(0)}</text>`;});
+  g+=`</svg>`;
+  el.innerHTML=g;
 }
 
 // ── MACRO INSIGHT (Markets tab) ──
@@ -954,16 +1004,24 @@ async function loadPortfolio(){
     const d=await(await fetch(`${API}/api/portfolio`)).json();
     const alloc=(d.alloc||[]).map(a=>`<span class="badge b-neu">${a.symbol} ${a.pct}%</span>`).join(" ");
     const an=d.analytics||{};
+    const st=an.stress;
     const anLine=(an.beta!=null||an.expDailyVolPct!=null)?
       ` · <b>β vs SPY:</b> <span class="mono">${an.beta!=null?an.beta:'—'}</span>
         · <b>exp. daily vol:</b> <span class="mono">${an.expDailyVolPct!=null?an.expDailyVolPct+'%':'—'}</span>
         · <b>avg pair ρ:</b> <span class="mono">${an.avgPairCorr!=null?an.avgPairCorr:'—'}</span>
         ${an.excluded&&an.excluded.length?`<span class="muted">(no bar history: ${an.excluded.join(", ")})</span>`:""}`:"";
+    const stLine=st?`<div style="margin-top:6px;font-size:13px"><b>Stress (${st.days}d replay):</b>
+        worst day <span class="mono down">${st.worstDayPct}%</span> ·
+        VaR95 <span class="mono down">${st.var95Pct}%</span> ·
+        max DD <span class="mono down">${st.maxDDPct}%</span> ·
+        ann. vol <span class="mono">${st.annVolPct}%</span> ·
+        Sharpe <span class="mono ${st.sharpe>=1?'up':'muted'}">${st.sharpe??'—'}</span>
+        <span class="muted" style="font-size:11px">(${st.note})</span></div>`:"";
     document.getElementById("pf-summary").innerHTML=
       `<b>Open P&L:</b> <span class="${dir(d.openPL)} mono">${signed(d.openPL)}</span> ·
        <b>Realized:</b> <span class="${dir(d.realizedPL)} mono">${signed(d.realizedPL)}</span> ·
        <b>Exposure:</b> <span class="mono">${fmt(d.totalValue)}</span>
-       ${alloc?` · <b>Allocation:</b> ${alloc}`:""}${anLine}
+       ${alloc?` · <b>Allocation:</b> ${alloc}`:""}${anLine}${stLine}
        <div class="note">Live prices refresh ~30s server-side. Alerts fire automatically at 85% of the move to target and 75% of risk used, and when a stop/target is actually hit.
        ${an.note?` Risk analytics: ${an.note}.`:''}</div>`;
     const open=d.open||[];
