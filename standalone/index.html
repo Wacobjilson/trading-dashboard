@@ -201,6 +201,13 @@
       regime cycle</b>: every number carries its n and these are descriptions of this sample, never forecasts.
       Nothing enters the production composite until it survives the validation shown here.</div>
     <div class="card" id="rs-registry"><div class="loading">Loading research control center…</div></div>
+    <div class="card"><h2>Model scorecard — every model earns its place, continuously</h2><div id="rs-scorecard"><div class="loading">Replaying models…</div></div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Assumption monitor</h2><div id="rs-assumptions"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Drift detection — is this still the market our sample described?</h2><div id="rs-drift"><div class="loading">…</div></div></div>
+    </div>
+    <div class="card"><h2>Counterfactual baselines — would something simpler have done better?</h2><div id="rs-counterfactual"><div class="loading">…</div></div></div>
+    <div class="card"><h2>Weekly committee minutes (auto-generated)</h2><div id="rs-committee"><div class="loading">…</div></div></div>
     <div class="card" id="rs-regime"><div class="loading">Classifying regime…</div></div>
     <div class="card"><h2>Factor intelligence — what is driving each sector, and how stable is it</h2>
       <div class="ctl"><span class="seg" id="fx-sel"></span></div>
@@ -1069,6 +1076,12 @@ async function loadResearch(){
       .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
     renderRsRegistry(regy); renderRsRegime(reg); renderRsValidation(val); renderRsProbs(prob);
     renderRsAnalogs(ana); _fx=fx; renderRsFactors(); renderRsEdgeLab(lab); renderRsCalib(cal);
+    // self-evaluation engines (heavier — loaded after the first paint)
+    const [scd,asm,drf,cft,cmt,pri]=await Promise.all(
+      ["scorecard","assumptions","drift","counterfactual","committee","priorities"]
+      .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
+    renderRsScorecard(scd); renderRsAssumptions(asm); renderRsDrift(drf);
+    renderRsCounterfactual(cft); renderRsCommittee(cmt); window._pri=pri;
   }catch(e){document.getElementById("rs-regime").innerHTML='<div class="loading">Research engines failed to load.</div>';}
 }
 const stageBadge=s=>({production:'b-ready',validation:'b-appr',retired:'b-bear'}[s]||'b-neu');
@@ -1200,6 +1213,63 @@ function renderRsAnalogs(d){
       <td class="mono ${dir(r.spyFwd21)}">${r.spyFwd21==null?'—':pct(r.spyFwd21)}</td>
       <td class="mono ${dir(r.top3FwdRel21)}">${r.top3FwdRel21==null?'—':pct(r.top3FwdRel21)}</td></tr>`).join("")}</tbody></table></div>
     <div class="note">${d.note}</div>`;
+}
+
+// ── SELF-EVALUATION CARDS ──
+function renderRsScorecard(d){
+  const el=document.getElementById("rs-scorecard");
+  if(!d||d.error){el.innerHTML=`<div class="loading">${d?d.error:'…'}</div>`;return;}
+  const wcell=w=>{
+    if(!w)return'<td class="muted">—</td>';
+    if("meanIC" in w)return`<td class="mono ${w.meanIC>0?'up':'down'}">IC ${w.meanIC} <span class="muted" style="font-size:10px">n${w.n}</span></td>`;
+    if("avg" in w)return`<td class="mono ${w.avg>0?'up':'down'}">${w.avg>0?'+':''}${w.avg}% <span class="muted" style="font-size:10px">n${w.n} w${w.win}% pf${w.pf??'—'}</span></td>`;
+    return`<td class="mono muted">n${w.n??'—'}</td>`;};
+  el.innerHTML=`<div class="scrollx"><table><thead><tr><th>Model</th><th>30d</th><th>90d</th><th>180d</th><th>1y</th><th>All</th><th>Health</th><th>Recommendation</th></tr></thead><tbody>
+    ${d.models.map(m2=>{const w=m2.windows||{};
+      return`<tr><td style="white-space:normal"><b>${m2.model}</b><div class="muted" style="font-size:10px">${m2.kind}</div></td>
+      ${["30d","90d","180d","1y","all"].map(k=>wcell(w[k]||w.matured)).join("")}
+      <td>${m2.health!=null?sbar(m2.health)+`<span class="mono">${m2.health}</span>`:'—'}</td>
+      <td class="muted" style="white-space:normal;font-size:11px">${m2.recommendation}${m2.degradation!=null&&m2.degradation>0?` <span class="amber">(recent ${m2.degradation}% below all-history)</span>`:''}</td></tr>`;}).join("")}
+    </tbody></table></div><div class="note">${d.note}</div>`;
+}
+function renderRsAssumptions(d){
+  const el=document.getElementById("rs-assumptions");
+  if(!d||d.error){el.innerHTML=`<div class="loading">${d?d.error:'…'}</div>`;return;}
+  el.innerHTML=d.assumptions.map(a=>{
+    const ok=String(a.status).startsWith("holding");
+    const gated=String(a.status).startsWith("UNTESTED");
+    return`<div style="padding:6px 0;border-top:1px solid var(--border);font-size:12px">
+      <span class="${ok?'up':gated?'muted':'amber'}">${ok?'✓':gated?'◌':'⚠'}</span> <b>${a.assumption}</b>
+      <div class="muted" style="font-size:11px">test: ${a.test} → ${a.reading}</div>
+      <div class="${ok?'muted':'amber'}" style="font-size:11px">status: ${a.status}</div></div>`;}).join("")+
+    `<div class="note">${d.note}</div>`;
+}
+function renderRsDrift(d){
+  const el=document.getElementById("rs-drift");
+  if(!d||d.error){el.innerHTML=`<div class="loading">${d?d.error:'…'}</div>`;return;}
+  el.innerHTML=`<table><thead><tr><th>Feature</th><th>Now</th><th>Pctile</th><th></th></tr></thead><tbody>
+    ${d.features.map(f=>`<tr><td style="white-space:normal;font-size:12px">${f.feature}${f.impact?`<div class="amber" style="font-size:10px">${f.impact}</div>`:''}</td>
+      <td class="mono">${f.current}</td><td class="mono ${f.drifting?'amber':'muted'}">${f.pctile??'—'}</td>
+      <td>${f.drifting?'<span class="badge b-appr">DRIFT</span>':''}</td></tr>`).join("")}</tbody></table>`+
+    (d.modelsAtRisk.length?`<div class="amber" style="font-size:12px;margin-top:6px"><b>Models at risk:</b> ${d.modelsAtRisk.join("; ")}</div>`:'')+
+    `<div class="note">${d.note}</div>`;
+}
+function renderRsCounterfactual(d){
+  const el=document.getElementById("rs-counterfactual");
+  if(!d||d.error){el.innerHTML=`<div class="loading">${d?d.error:'…'}</div>`;return;}
+  el.innerHTML=`<table><thead><tr><th>Strategy</th><th>Total</th><th>Avg/wk</th><th>Win%</th><th>PF</th><th>MaxDD</th><th>Sharpe</th><th>n</th></tr></thead><tbody>
+    ${d.strategies.map((s,i)=>`<tr ${s.strategy.includes("the model")?'style="background:rgba(245,166,35,.06)"':''}>
+      <td><b>${s.strategy}</b></td><td class="mono ${dir(s.total)}">${pct(s.total)}</td>
+      <td class="mono ${dir(s.avg)}">${s.avg>0?'+':''}${s.avg}%</td><td class="mono">${s.win}%</td>
+      <td class="mono">${s.pf??'—'}</td><td class="mono down">${s.maxDD}%</td>
+      <td class="mono">${s.sharpe??'—'}</td><td class="mono muted">${s.n}</td></tr>`).join("")}</tbody></table>
+    <div class="note">${d.note}</div>`;
+}
+function renderRsCommittee(d){
+  const el=document.getElementById("rs-committee");
+  if(!d||!d.text){el.innerHTML='<div class="loading">Report warming…</div>';return;}
+  el.innerHTML=`<pre style="white-space:pre-wrap;font-size:12px;line-height:1.5;color:var(--text);font-family:'JetBrains Mono',monospace;margin:0">${d.text.replace(/</g,"&lt;")}</pre>
+    <div class="note">Auto-generated from the live engines · regenerates every 30 min · every number traces to a tab on this dashboard.</div>`;
 }
 
 // ── MACRO INSIGHT (Markets tab) ──

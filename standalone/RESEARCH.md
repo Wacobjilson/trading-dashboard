@@ -40,6 +40,23 @@ plus the live in-app engines (`/api/research`, `/api/edgelab`, `/api/factors`).
   n_test≥8, mean>0 both, t≥1.5, beats baseline; multiple-comparison caveat in
   every payload), Control Center with stage registry and model-disagreement.
 
+## 2026-07-04 — Phase-6 self-evaluation engines
+- Scorecard (/api/scorecard): production models replayed over cached bars with
+  30/90/180/1y/all windows + health + influence recommendation.
+- Assumption monitor: 6 named assumptions as live measurable tests (RS
+  predictiveness, breadth persistence, factor stability, GEX-vol [data-gated],
+  regime-budget ordering, mean-reversion health).
+- Drift detection: current weekly state vs its own history (vol pctile, avg
+  correlation, breadth, rotation spread, EW−SPY, leadership turnover, factor
+  breaks) → models-at-risk list.
+- Counterfactual baselines: top-3 RS vs equal-weight / top-1 / bottom-3 / SPY
+  on non-overlapping weekly 5d returns.
+- Live research prioritization (/api/priorities): data-gated projects rise as
+  their data accumulates (unblockPct computed from actual counts).
+- Weekly committee minutes (/api/committee): auto-generated from live engines.
+- Prediction log enriched at publish (options/macro scores, regime, active
+  stability-flag count) so forecast post-mortems can attribute failures later.
+
 ## Standing rules
 - No lookahead anywhere; acceptance = positive in BOTH train and test.
 - Small n is labeled, never hidden. 2yr Polygon history = one regime cycle.

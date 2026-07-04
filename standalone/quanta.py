@@ -1854,16 +1854,22 @@ def registry_view():
         n_open = len(_state["positions"])
     models = [
         {"name": "RSI(2) mean-reversion (Signals)", "stage": "production",
+         "version": "v1 · deployed 2026-07-01 · trained/validated 60/40 split of 2yr Polygon daily",
+         "limitations": "pre-cost close fills; bull-heavy sample; 200-SMA gate untested in a real bear",
          "evidence": "walk-forward OOS: 74.7% win, PF 2.05, n=87 (research.py)",
-         "monitoring": "live daily; regime-expectancy pending journal trades"},
+         "monitoring": "live daily + scorecard replay windows; regime-expectancy pending journal trades"},
         {"name": "RS rotation top-3/1m (Rotation model)", "stage": "production",
+         "version": "v1 · deployed 2026-07-02 · trained/validated 60/40 split; 1m lookback chosen of 6 variants (multiple-comparison risk noted)",
+         "limitations": "n=30 test trades; 3m/6m variants decayed — lookback choice may be luck",
          "evidence": "train PF 2.88 → test PF 2.92, 67% win, n=30 (small sample)",
          "monitoring": "weekly IC %.3f overall · rolling13w %s%s" % (
              rs_live["overallIC"] or 0, rs_live["rolling13w"],
              " · ⚠ DEGRADING (rolling<0)" if rs_live["degrading"] else "")},
         {"name": "Composite: rs category (w 0.70)", "stage": "production",
+         "version": "v2 · reweighted 2026-07-03 after IC validation (v1 had 8 equal-ish arbitrary weights)",
+         "limitations": "IC ~0.02-0.03 is weak; 54-week sample",
          "evidence": "IC +0.031 train / +0.017 test; only ablation survivor",
-         "monitoring": "continuous (Research tab rolling IC)"},
+         "monitoring": "continuous (Research tab rolling IC + scorecard)"},
         {"name": "Composite: options category (w 0.15)", "stage": "validation",
          "evidence": "UNVALIDATED — %d/60 snapshot days toward the IC test" % opt_days,
          "monitoring": "PCR z calibrating (%d/20 days)" % opt_days},
@@ -1902,6 +1908,433 @@ def registry_view():
             "disagreement": disagree, "backlog": RESEARCH_BACKLOG,
             "note": "Stages: idea → testing → validation → production → monitoring → retirement. Nothing holds "
                     "composite weight without surviving train/test; retired items stay visible with the reason."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELF-EVALUATION ENGINE — the platform grading its own decision process.
+# Scorecards replay each production model over the cached bars with rolling
+# windows; assumptions are monitored as measurable tests; drift detection
+# compares current market structure to its own history; counterfactual
+# baselines answer "what if we'd done something simpler". Audits that need the
+# live logs (predictions/GEX/journal) state their maturity dates instead of
+# backfilling — a self-evaluation trained on its own training data would be
+# self-flattery, not evaluation.
+# ─────────────────────────────────────────────────────────────────────────────
+def _sma_ser(c, n):
+    out, s = [None] * len(c), 0.0
+    for i, v in enumerate(c):
+        s += v
+        if i >= n:
+            s -= c[i - n]
+        if i >= n - 1:
+            out[i] = s / n
+    return out
+
+
+def _rsi_ser(c, n=2):
+    out = [None] * len(c)
+    if len(c) <= n:
+        return out
+    deltas = [c[i] - c[i - 1] for i in range(1, len(c))]
+    ag = sum(d for d in deltas[:n] if d > 0) / n
+    al = -sum(d for d in deltas[:n] if d < 0) / n
+    out[n] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    for k in range(n, len(deltas)):
+        d = deltas[k]
+        ag = (ag * (n - 1) + (d if d > 0 else 0)) / n
+        al = (al * (n - 1) + (-d if d < 0 else 0)) / n
+        out[k + 1] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def _trade_metrics(rets):
+    n = len(rets)
+    if n == 0:
+        return None
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r <= 0]
+    gp, gl = sum(wins), -sum(losses)
+    eq = peak = mdd = 0.0
+    for r in rets:
+        eq += r
+        peak = max(peak, eq)
+        mdd = min(mdd, eq - peak)
+    sd = _stdev(rets)
+    neg_sd = _stdev(losses) if len(losses) > 1 else None
+    mean = sum(rets) / n
+    return {"n": n, "win": round(100 * len(wins) / n), "avg": round(mean, 3),
+            "total": round(sum(rets), 2), "pf": round(gp / gl, 2) if gl > 0 else None,
+            "maxDD": round(mdd, 2), "sharpe": round(mean / sd, 2) if sd > 0 else None,
+            "sortino": round(mean / neg_sd, 2) if neg_sd else None}
+
+
+def _replay_rsi2(m):
+    """Replay the production RSI(2) rule on the aligned matrix. Returns trades
+    [{'sym','exit_date','ret%'}] — same rule as the Signals tab, no lookahead."""
+    trades = []
+    dates = m["dates"]
+    for sym, c in m["C"].items():
+        s5, s200, r2 = _sma_ser(c, 5), _sma_ser(c, 200), _rsi_ser(c, 2)
+        i = 200
+        while i < len(c) - 1:
+            if s200[i] and c[i] > s200[i] and r2[i] is not None and r2[i] < 10:
+                j = i + 1
+                while j < len(c) - 1 and not (s5[j] and c[j] > s5[j]):
+                    j += 1
+                trades.append({"sym": sym, "exit_i": j, "date": dates[j],
+                               "ret": (c[j] / c[i] - 1) * 100})
+                i = j + 1
+            else:
+                i += 1
+    return trades
+
+
+def _replay_rotation(m, k=3, lb=21, hold=21):
+    trades = []
+    dates = m["dates"]
+    spy = m["spy"]
+    i = 260
+    while i < len(dates) - 1:
+        j = min(i + hold, len(dates) - 1)
+        scored = []
+        for s, c in m["C"].items():
+            if c[i - lb] and spy[i - lb]:
+                scored.append(((c[i] / c[i - lb] - 1) - (spy[i] / spy[i - lb] - 1), s))
+        scored.sort(reverse=True)
+        for _r, s in scored[:k]:
+            c = m["C"][s]
+            trades.append({"sym": s, "exit_i": j, "date": dates[j],
+                           "ret": (c[j] / c[i] - 1) * 100})
+        i = j
+    return trades
+
+
+_SCORE_WINDOWS = [("30d", 30), ("90d", 90), ("180d", 180), ("1y", 365), ("all", 10 ** 5)]
+
+
+def _windowed(trades, last_date):
+    out = {}
+    for wname, days in _SCORE_WINDOWS:
+        cut = last_date - dt.timedelta(days=days)
+        out[wname] = _trade_metrics([t["ret"] for t in trades if t["date"] >= cut])
+    return out
+
+
+def _edge_health(w):
+    """Health + recommendation from windowed metrics (needs 'all' and a recent window)."""
+    allm, recent = w.get("all"), (w.get("90d") or w.get("180d"))
+    if not allm:
+        return {"health": None, "recommendation": "insufficient data"}
+    if not recent or recent["n"] < 5:
+        return {"health": 60, "recommendation": "continue monitoring (few recent trades — normal for selective signals)"}
+    base = allm["avg"] or 1e-9
+    ratio = recent["avg"] / base if base > 0 else 0
+    health = round(clamp(60 * min(1.5, max(0.0, ratio)) + (20 if recent["avg"] > 0 else 0)
+                         + (20 if (recent["pf"] or 0) > 1.2 else 0)))
+    rec = ("continue / consider increased influence" if recent["avg"] > 0 and ratio >= 0.8 else
+           "continue monitoring" if recent["avg"] > 0 else
+           "reduce influence — recent window negative" if allm["avg"] > 0 else
+           "retirement candidate — negative overall")
+    return {"health": health, "recommendation": rec,
+            "degradation": round((1 - ratio) * 100) if base > 0 else None}
+
+
+def scorecard_view():
+    m = _sector_matrix()
+    if not m:
+        return {"error": "bars still warming"}
+    last = m["dates"][-1]
+    rows = []
+    rsi2_tr = _replay_rsi2(m)
+    w = _windowed(rsi2_tr, last)
+    rows.append({"model": "RSI(2) mean-reversion", "kind": "trade replay (per-trade %)",
+                 "windows": w, **_edge_health(w)})
+    rot_tr = _replay_rotation(m)
+    w = _windowed(rot_tr, last)
+    rows.append({"model": "RS rotation top-3 / 1m", "kind": "trade replay (per-position %, monthly)",
+                 "windows": w, **_edge_health(w)})
+    rv = cache_get("research", 600) or _cache_and_return("research", research_view)
+    ics = rv.get("weeklyIC") or []
+    icw = {}
+    for wname, days in _SCORE_WINDOWS:
+        cut = (last - dt.timedelta(days=days)).isoformat()
+        vals = [x["ic"] for x in ics if x["ic"] is not None and x["date"] >= cut]
+        icw[wname] = ({"n": len(vals), "meanIC": round(sum(vals) / len(vals), 3)} if vals else None)
+    roll = [x["ic13w"] for x in (rv.get("rollingIC") or []) if x.get("ic13w") is not None]
+    ic_recent = icw.get("90d") or {}
+    rows.append({"model": "RS composite (Intel score core)", "kind": "weekly cross-sectional IC",
+                 "windows": icw,
+                 "health": round(clamp(50 + (ic_recent.get("meanIC") or 0) * 800)) if ic_recent else None,
+                 "recommendation": ("continue" if (ic_recent.get("meanIC") or 0) > 0
+                                    else "reduce influence — recent IC negative"),
+                 "degradation": None})
+    cal = cache_get("calib", 600) or _cache_and_return("calib", calibration_view)
+    rows.append({"model": "Published probabilities (calibration)", "kind": "live forecast audit",
+                 "windows": {"matured": {"n": cal.get("maturedN", 0)}},
+                 "health": None,
+                 "recommendation": "matures %s — no backfill by design" %
+                                   ("now" if cal.get("maturedN", 0) >= 30 else
+                                    "after ~%d more trading days" % max(0, 10 - cal.get("days", 0) + 3))})
+    return {"asOf": last.isoformat(), "models": rows,
+            "note": "Replays run the production rules over the cached 2yr bars (idealized close fills, "
+                    "pre-cost). Rolling windows share the same trades — short windows have few trades for "
+                    "selective signals; n is always shown. Sharpe/Sortino are per-trade, not annualized."}
+
+
+# ── Assumption monitor — beliefs as measurable tests ─────────────────────────
+def assumptions_view():
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    spy = m["spy"]
+    out = []
+    rv = cache_get("research", 600) or _cache_and_return("research", research_view)
+    roll = [x["ic13w"] for x in (rv.get("rollingIC") or []) if x.get("ic13w") is not None]
+    cur_ic = roll[-1] if roll else None
+    out.append({"assumption": "Relative strength keeps predicting sector leadership",
+                "test": "rolling 13-week IC of the RS blend vs forward 10d relative returns",
+                "reading": "rolling IC %s (overall %s)" % (cur_ic, rv.get("icOverall")),
+                "status": "holding" if (cur_ic or 0) > 0 else "FAILING — composite leans on this",
+                })
+    hi = [((spy[st["i"] + 10] / spy[st["i"]] - 1) * 100) for st in states
+          if st["features"]["breadth"] >= 70 and st["i"] + 10 < len(spy)]
+    base = [((spy[st["i"] + 10] / spy[st["i"]] - 1) * 100) for st in states if st["i"] + 10 < len(spy)]
+    if len(hi) >= 10 and base:
+        p_hi = 100 * sum(1 for x in hi if x > 0) / len(hi)
+        p_b = 100 * sum(1 for x in base if x > 0) / len(base)
+        out.append({"assumption": "Strong breadth supports trend persistence",
+                    "test": "P(SPY fwd 10d > 0 | breadth ≥ 70%) vs unconditional",
+                    "reading": "%.0f%% (n=%d) vs %.0f%% base (n=%d)" % (p_hi, len(hi), p_b, len(base)),
+                    "status": "holding" if p_hi >= p_b else "weakening — no breadth premium in this sample"})
+    fx = cache_get("factors", 600) or _cache_and_return("factors", factors_view)
+    nflags = len(fx.get("stabilityFlags") or []) if not fx.get("error") else None
+    out.append({"assumption": "Factor relationships are stable enough to use in attribution/allocation",
+                "test": "count of |Δρ| ≥ 0.4 sector-factor breaks (last quarter vs prior)",
+                "reading": "%s active break flags" % nflags,
+                "status": ("holding" if (nflags or 0) <= 3 else
+                           "weakening — %d relationship breaks; treat factor exposures cautiously" % nflags)})
+    opt_days = max(((get_options(s) or {}).get("ivHistDays") or 0) for s in OPTIONS_UNIVERSE) \
+        if any(get_options(s) for s in OPTIONS_UNIVERSE) else 0
+    out.append({"assumption": "Positive net GEX dampens realized volatility (naive dealer convention)",
+                "test": "next-day realized move vs prior-day GEX sign, per symbol",
+                "reading": "data-gated: %d/60 snapshot days" % opt_days,
+                "status": "UNTESTED — collecting; assumption currently carries only ±8 pts in the options category"})
+    reg_perf = {}
+    for st in states:
+        r = st["regime"]["primary"]
+        i = st["i"]
+        if i + 21 < len(spy):
+            reg_perf.setdefault(r, []).append((spy[i + 21] / spy[i] - 1) * 100)
+    order = {r: sum(v) / len(v) for r, v in reg_perf.items() if len(v) >= 5}
+    budget_order = sorted(ALLOC_REGIME_INVEST, key=ALLOC_REGIME_INVEST.get, reverse=True)
+    realized_order = sorted(order, key=order.get, reverse=True)
+    out.append({"assumption": "The regime-invested-budget ordering matches realized regime returns",
+                "test": "mean SPY fwd 21d by regime vs the heuristic budget ordering",
+                "reading": "realized: %s | budget: %s" % (
+                    " > ".join("%s %+0.1f%%" % (r, order[r]) for r in realized_order),
+                    " > ".join(budget_order)),
+                "status": "holding" if realized_order and budget_order[0] == realized_order[0]
+                          else "review — top regimes disagree (small per-regime n, see Research)"})
+    w90 = _windowed(_replay_rsi2(m), m["dates"][-1]).get("90d")
+    out.append({"assumption": "Mean reversion still works on sector dips (RSI2)",
+                "test": "RSI(2) replay expectancy, last 90 days",
+                "reading": "avg %s%%/trade over n=%s" % ((w90 or {}).get("avg"), (w90 or {}).get("n")),
+                "status": "holding" if w90 and (w90.get("avg") or 0) > 0 and w90["n"] >= 3
+                          else "watch — few/negative recent trades"})
+    return {"assumptions": out,
+            "note": "Every assumption is a measurable test re-run on request; 'holding' means the current "
+                    "sample supports it, not that it is true."}
+
+
+# ── Drift detection — is the market still the one our sample described? ──────
+def drift_view():
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    states = ws["states"]
+    feats = ["volPct", "avgCorr", "breadth", "cycDef", "ewSpy21"]
+    labels = {"volPct": "realized-vol percentile", "avgCorr": "avg pairwise sector correlation",
+              "breadth": "breadth (% sectors > 50d)", "cycDef": "cyclical−defensive spread",
+              "ewSpy21": "equal-weight − SPY (1m)"}
+    impact = {"volPct": "vol-sized allocations and stop distances recalibrate slowly",
+              "avgCorr": "high correlation weakens cross-sectional selection (everything is one trade)",
+              "breadth": "regime classifier and breadth assumption operate off this",
+              "cycDef": "rotation-flavor classification shifts",
+              "ewSpy21": "leadership concentration changes what RS can capture"}
+    rows = []
+    cur = states[-1]["features"]
+    for f in feats:
+        histv = [st["features"][f] for st in states[:-1] if st["features"][f] is not None]
+        v = cur.get(f)
+        if v is None or len(histv) < 20:
+            continue
+        pctile = 100 * sum(1 for x in histv if x <= v) / len(histv)
+        drifting = pctile >= 85 or pctile <= 15
+        rows.append({"feature": labels[f], "current": v, "pctile": round(pctile),
+                     "drifting": drifting, "impact": impact[f] if drifting else None})
+    # leadership turnover: top-3 membership changes across the last 3 monthly snapshots
+    tops = []
+    for st in states[-13::4]:
+        tops.append(frozenset(s for s, rk in st["rank"].items() if rk <= 2))
+    turn = sum(len(tops[i] ^ tops[i - 1]) for i in range(1, len(tops))) / max(1, len(tops) - 1) / 2
+    rows.append({"feature": "leadership turnover (top-3 changes per month)", "current": round(turn, 1),
+                 "pctile": None, "drifting": turn >= 2,
+                 "impact": "rotation model rebalances into churn — expect whipsaw" if turn >= 2 else None})
+    fx = cache_get("factors", 600) or _cache_and_return("factors", factors_view)
+    nflags = len(fx.get("stabilityFlags") or []) if not fx.get("error") else 0
+    rows.append({"feature": "factor-relationship breaks (|Δρ|≥0.4)", "current": nflags, "pctile": None,
+                 "drifting": nflags > 3,
+                 "impact": "factor attribution and macro category less reliable" if nflags > 3 else None})
+    unreliable = []
+    if any(r["drifting"] and "correlation" in r["feature"] for r in rows):
+        unreliable.append("cross-sectional RS ranking (selection weakens when correlation is extreme)")
+    if any(r["drifting"] and "vol" in r["feature"] for r in rows):
+        unreliable.append("vol-based sizing (trailing vol lags the new regime)")
+    if nflags > 3:
+        unreliable.append("factor exposures / macro category")
+    return {"features": rows, "modelsAtRisk": unreliable,
+            "note": "Current weekly state vs the distribution of all prior weekly states; ≥85th or ≤15th "
+                    "percentile = drift. One 2yr sample: 'normal' is defined by a short history."}
+
+
+# ── Counterfactual baselines — would something simpler have done better? ─────
+def counterfactual_view():
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    spy = m["spy"]
+    strat = {"top-3 RS (the model)": [], "equal-weight all 11": [], "bottom-3 RS": [],
+             "top-1 RS only": [], "SPY only": []}
+    for st in states:
+        i = st["i"]
+        if i + 5 >= len(spy):
+            continue
+        spy_r = (spy[i + 5] / spy[i] - 1) * 100
+        def fwd(s):
+            c = m["C"][s]
+            return (c[i + 5] / c[i] - 1) * 100
+        ranks = st["rank"]
+        top3 = [s for s, rk in ranks.items() if rk <= 2]
+        bot3 = [s for s, rk in ranks.items() if rk >= 8]
+        top1 = [s for s, rk in ranks.items() if rk == 0]
+        strat["top-3 RS (the model)"].append(sum(fwd(s) for s in top3) / 3)
+        strat["bottom-3 RS"].append(sum(fwd(s) for s in bot3) / 3)
+        strat["top-1 RS only"].append(fwd(top1[0]))
+        strat["equal-weight all 11"].append(sum(fwd(s) for s in ranks) / len(ranks))
+        strat["SPY only"].append(spy_r)
+    rows = []
+    for name, rets in strat.items():
+        mt = _trade_metrics(rets)
+        if mt:
+            rows.append({"strategy": name, **mt})
+    rows.sort(key=lambda r: -(r["total"] or 0))
+    live_note = ("Live counterfactuals (vs the actual published allocation) mature with the prediction "
+                 "log — this table is the historical baseline comparison on non-overlapping weekly 5d returns.")
+    return {"strategies": rows, "weeks": len(states), "note": live_note}
+
+
+# ── Research prioritization — the platform recommends its own next work ──────
+def priorities_view():
+    opt_days = max(((get_options(s) or {}).get("ivHistDays") or 0) for s in OPTIONS_UNIVERSE) \
+        if any(get_options(s) for s in OPTIONS_UNIVERSE) else 0
+    cal = cache_get("calib", 600) or _cache_and_return("calib", calibration_view)
+    with _state_lock:
+        n_closed = len(_state["closed"])
+    items = [
+        {"project": "Import ≥10y daily history", "impact": "HIGH — multiplies power of every engine (regimes, analogs, ICs)",
+         "effort": "low (matrix code is source-agnostic; needs a data source)", "unblockPct": 0,
+         "blockedBy": "data source decision (paid tier or one-time CSV)", "score": 95},
+        {"project": "Options-category IC validation", "impact": "MED-HIGH — 0.15 provisional weight becomes evidence-based or zero",
+         "effort": "low (harness exists)", "unblockPct": round(100 * opt_days / 60),
+         "blockedBy": "snapshot history (%d/60 days)" % opt_days, "score": 70 + round(20 * opt_days / 60)},
+        {"project": "Confidence recalibration pass", "impact": "MED — published probabilities become trustworthy",
+         "effort": "low", "unblockPct": min(100, round(100 * (cal.get("maturedN", 0)) / 30)),
+         "blockedBy": "matured predictions (%d/30)" % cal.get("maturedN", 0),
+         "score": 60 + round(25 * min(1, cal.get("maturedN", 0) / 30))},
+        {"project": "Inverted-volatility (high-beta) category test", "impact": "MED — potential second bar-signal",
+         "effort": "low (pre-registered; run research_categories.py on post-registration data)",
+         "unblockPct": 5, "blockedBy": "new data since 2026-07-03 registration", "score": 55},
+        {"project": "Personal expectancy by entry conditions", "impact": "MED — improves the user's own decisions",
+         "effort": "none (auto)", "unblockPct": min(100, n_closed * 10),
+         "blockedBy": "closed trades (%d/10 per group)" % n_closed, "score": 50 + min(20, n_closed * 2)},
+        {"project": "GEX-change → sector-swing predictiveness", "impact": "UNKNOWN — genuinely open question",
+         "effort": "medium", "unblockPct": round(100 * opt_days / 60),
+         "blockedBy": "snapshot history (%d/60 days)" % opt_days, "score": 45 + round(15 * opt_days / 60)},
+        {"project": "Edge-lab survivor re-verification (quarterly)", "impact": "MED — promotes/demotes candidates",
+         "effort": "low (scheduled re-run)", "unblockPct": 10, "blockedBy": "a quarter of new data", "score": 40},
+        {"project": "Analog-engine feature weighting", "impact": "LOW-MED", "effort": "medium",
+         "unblockPct": 50, "blockedBy": ">100 weeks of states", "score": 30},
+    ]
+    items.sort(key=lambda x: -x["score"])
+    return {"items": items,
+            "note": "Score = expected improvement × readiness ÷ effort (heuristic, shown transparently). "
+                    "unblockPct is LIVE — data-gated projects rise automatically as their data accumulates."}
+
+
+# ── Weekly investment-committee report — auto-generated minutes ──────────────
+def committee_view():
+    parts = []
+    sc = scorecard_view()
+    reg = cache_get("regime", 600) or _cache_and_return("regime", regime_view)
+    al = cache_get("alloc", 300) or _cache_and_return("alloc", allocation_view)
+    dr = drift_view()
+    asm = assumptions_view()
+    cf = counterfactual_view()
+    pr = priorities_view()
+    regy = cache_get("registry", 300) or _cache_and_return("registry", registry_view)
+    cal = cache_get("calib", 600) or _cache_and_return("calib", calibration_view)
+    lab = cache_get("edgelab", 900) or _cache_and_return("edgelab", edge_lab)
+    day = dt.date.today().isoformat()
+    parts.append("QUANTA INVESTMENT COMMITTEE — WEEKLY MINUTES · %s\n%s" % (day, "=" * 60))
+    if not reg.get("error"):
+        parts.append("MARKET STATE — %s (confidence %s%%)." % (reg["current"]["label"], reg["confidence"]))
+    if not al.get("error"):
+        top = ", ".join("%s %s%%" % (r["symbol"], r["weightPct"]) for r in al.get("rows", [])[:4]) or "none pass the gate"
+        parts.append("ALLOCATION STANCE — invested %s%% / cash %s%% (%s%% budget from regime). Book: %s. "
+                     "Excluded: %s." % (al["investedPct"], al["cashPct"], al["investedBudgetPct"], top,
+                                        ", ".join(x["symbol"] for x in al.get("excluded", [])) or "none"))
+    if not sc.get("error"):
+        lines = []
+        for mrow in sc["models"]:
+            w90 = (mrow.get("windows") or {}).get("90d")
+            lines.append("%s: %s%s" % (mrow["model"], mrow["recommendation"],
+                                       (" (90d: avg %s%%, n=%s)" % (w90.get("avg"), w90.get("n")))
+                                       if isinstance(w90, dict) and "avg" in w90 else ""))
+        parts.append("MODEL SCORECARD —\n  " + "\n  ".join(lines))
+    if not asm.get("error"):
+        bad = [a for a in asm["assumptions"] if not str(a["status"]).startswith("holding")]
+        parts.append("ASSUMPTIONS — %d monitored; needing attention: %s"
+                     % (len(asm["assumptions"]),
+                        "; ".join("%s → %s" % (a["assumption"], a["status"]) for a in bad) or "none"))
+    if not dr.get("error"):
+        drf = [r for r in dr["features"] if r["drifting"]]
+        parts.append("DRIFT — %s%s" % ("; ".join("%s at %s (pctile %s)" % (r["feature"], r["current"], r["pctile"])
+                                                 for r in drf) or "no significant structural drift",
+                                       ("; models at risk: " + "; ".join(dr["modelsAtRisk"])) if dr["modelsAtRisk"] else ""))
+    dis = [x for x in (regy.get("disagreement") or []) if x["disagreement"] > 0.5][:3]
+    if dis:
+        parts.append("BIGGEST MODEL DISAGREEMENTS — " + "; ".join(
+            "%s (%s)" % (x["symbol"], ", ".join(k + ("+" if v > 0 else "−") for k, v in x["votes"].items() if v)) for x in dis))
+    if not cf.get("error") and cf.get("strategies"):
+        best = cf["strategies"][0]
+        model = next((s for s in cf["strategies"] if "the model" in s["strategy"]), None)
+        parts.append("COUNTERFACTUAL — best baseline over %d weeks: %s (total %+0.1f%%); the ranked model: %+0.1f%%. %s"
+                     % (cf["weeks"], best["strategy"], best["total"], (model or {}).get("total", 0),
+                        "Ranked selection is EARNING its complexity." if model and model["total"] >= best["total"] * 0.9
+                        else "Simpler baseline currently competitive — keep humility."))
+    parts.append("CALIBRATION — %d matured predictions (%s)."
+                 % (cal.get("maturedN", 0), "reliability table live" if cal.get("maturedN", 0) >= 30
+                    else "first read pending"))
+    parts.append("EDGE LAB — %s combos tested, %s survivors (watchlist only)."
+                 % (lab.get("tested", "?"), lab.get("survivorCount", "?")))
+    parts.append("RESEARCH PRIORITIES —\n  " + "\n  ".join(
+        "%d. %s [%s ready] — %s" % (i + 1, p["project"], str(p["unblockPct"]) + "%", p["impact"])
+        for i, p in enumerate(pr["items"][:4])))
+    parts.append("DATA LIMITATIONS — 2yr bar history (one regime cycle); options/predictions/journal logs "
+                 "maturing; no free source for real yields, CPI surprises, flows, dealer inventory.")
+    return {"generated": time.time(), "date": day, "text": "\n\n".join(parts)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1994,9 +2427,18 @@ def allocation_view():
         })
     rows.sort(key=lambda r: -r["weightPct"])
     invested = sum(r["weightPct"] for r in rows)
-    # log today's published predictions for ALL sectors (calibration matures on these)
+    # log today's published predictions for ALL sectors (calibration matures on
+    # these) — enriched with the context a future forecast post-mortem needs:
+    # options/macro category scores, the regime, and active stability flags.
+    sc_cache = cache_get("scores", 120) or _cache_and_return("scores", sector_scores)
+    catmap = {s["symbol"]: s.get("categories", {}) for s in sc_cache.get("sectors", [])}
+    fx_cache = cache_get("factors", 600)
+    nflags = len((fx_cache or {}).get("stabilityFlags") or [])
     _pred_log([{"symbol": o["symbol"], "score": o["score"], "pBeat10d": o.get("pBeat10d"),
-                "confidence": o.get("confidence")} for o in opps.get("rows", [])], ptab)
+                "confidence": o.get("confidence"),
+                "opt": (catmap.get(o["symbol"], {}).get("options") or {}).get("score"),
+                "mac": (catmap.get(o["symbol"], {}).get("macro") or {}).get("score"),
+                "regime": primary, "flags": nflags} for o in opps.get("rows", [])], ptab)
     # portfolio-level factor exposures of the SUGGESTED book
     betas = _factor_betas()
     expo = {}
@@ -2166,8 +2608,10 @@ def _pred_log(rows, group_probs):
             except (FileNotFoundError, ValueError):
                 hist = {}
             if day not in hist:
-                hist[day] = {r["symbol"]: {"score": r["score"], "p10": r.get("pBeat10d"),
-                                           "conf": r.get("confidence")} for r in rows}
+                hist[day] = {r["symbol"]: {k: r.get(kk) for k, kk in
+                                           (("score", "score"), ("p10", "pBeat10d"), ("conf", "confidence"),
+                                            ("opt", "opt"), ("mac", "mac"), ("regime", "regime"), ("flags", "flags"))}
+                             for r in rows}
                 for d in sorted(hist)[:-250]:
                     del hist[d]
                 os.makedirs(os.path.dirname(PRED_PATH) or ".", exist_ok=True)
@@ -3675,6 +4119,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(simulate_view(weights, qs.get("scenario", [None])[0]))
         elif path == "/api/calibration":
             self._json(cache_get("calib", 600) or _cache_and_return("calib", calibration_view))
+        elif path == "/api/scorecard":
+            self._json(cache_get("scorecard", 900) or _cache_and_return("scorecard", scorecard_view))
+        elif path == "/api/assumptions":
+            self._json(cache_get("assumptions", 900) or _cache_and_return("assumptions", assumptions_view))
+        elif path == "/api/drift":
+            self._json(cache_get("drift", 900) or _cache_and_return("drift", drift_view))
+        elif path == "/api/counterfactual":
+            self._json(cache_get("counterfactual", 1800) or _cache_and_return("counterfactual", counterfactual_view))
+        elif path == "/api/priorities":
+            self._json(cache_get("priorities", 900) or _cache_and_return("priorities", priorities_view))
+        elif path == "/api/committee":
+            self._json(cache_get("committee", 1800) or _cache_and_return("committee", committee_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
