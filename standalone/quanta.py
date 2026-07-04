@@ -4134,11 +4134,25 @@ def political_calendar():
             out["items"].append({"date": (e.get("time") or "")[:10],
                                  "event": "%s %s" % (e.get("country"), e.get("event")), "kind": "Economic",
                                  "sectors": "macro-wide", "source": "economic calendar feed"})
-    out["items"].sort(key=lambda x: x["date"])
-    out["items"] = out["items"][:40]
-    if not _key("congress_gov"):
+    ck = _key("congress_gov")
+    if ck:
+        try:
+            d = http_get_json("https://api.congress.gov/v3/bill?api_key=%s&format=json&limit=12"
+                              "&sort=updateDate+desc" % urllib.parse.quote(ck), timeout=25)
+            for b in d.get("bills", []):
+                out["items"].append({"date": (b.get("latestAction") or {}).get("actionDate") or b.get("updateDate", "")[:10],
+                                     "event": "Bill %s-%s: %s — %s" % (b.get("type", ""), b.get("number", ""),
+                                                                       (b.get("title") or "")[:90],
+                                                                       ((b.get("latestAction") or {}).get("text") or "")[:80]),
+                                     "kind": "Congress", "sectors": "see bill text",
+                                     "source": "congress.gov API (official)"})
+        except Exception as e:
+            out["notes"].append("congress.gov fetch failed (%s)" % e)
+    else:
         out["notes"].append("Bills/hearings/votes need a free congress.gov key "
                             "(api.congress.gov/sign-up) — set CONGRESS_GOV_API_KEY to enable.")
+    out["items"].sort(key=lambda x: x["date"], reverse=True)
+    out["items"] = out["items"][:50]
     return out
 
 
