@@ -199,7 +199,12 @@
       classification, historical base rates, analogs and validation. <b class="amber">A 2-year sample is one
       regime cycle</b>: every number carries its n and these are descriptions of this sample, never forecasts.
       Nothing enters the production composite until it survives the validation shown here.</div>
+    <div class="card" id="rs-registry"><div class="loading">Loading research control center…</div></div>
     <div class="card" id="rs-regime"><div class="loading">Classifying regime…</div></div>
+    <div class="card"><h2>Factor intelligence — what is driving each sector, and how stable is it</h2>
+      <div class="ctl"><span class="seg" id="fx-sel"></span></div>
+      <div id="rs-factors"><div class="loading">Computing factor attribution…</div></div></div>
+    <div class="card"><h2>Edge discovery lab — automated condition search</h2><div id="rs-edgelab"><div class="loading">…</div></div></div>
     <div class="cols cols2">
       <div class="card"><h2>Production-signal validation (live)</h2><div id="rs-validation"><div class="loading">…</div></div></div>
       <div class="card"><h2>P(beat SPY) by RS rank group — historical base rates</h2><div id="rs-probs"><div class="loading">…</div></div></div>
@@ -994,12 +999,83 @@ function drawGexCurve(d){
 }
 
 // ── RESEARCH TAB ──
+let _fx=null,fxSym="XLK",fxBuilt=false;
 async function loadResearch(){
   try{
-    const [reg,val,prob,ana]=await Promise.all(["regime","research","probabilities","analogs"]
+    const [reg,val,prob,ana,regy,fx,lab]=await Promise.all(
+      ["regime","research","probabilities","analogs","registry","factors","edgelab"]
       .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
-    renderRsRegime(reg); renderRsValidation(val); renderRsProbs(prob); renderRsAnalogs(ana);
+    renderRsRegistry(regy); renderRsRegime(reg); renderRsValidation(val); renderRsProbs(prob);
+    renderRsAnalogs(ana); _fx=fx; renderRsFactors(); renderRsEdgeLab(lab);
   }catch(e){document.getElementById("rs-regime").innerHTML='<div class="loading">Research engines failed to load.</div>';}
+}
+const stageBadge=s=>({production:'b-ready',validation:'b-appr',retired:'b-bear'}[s]||'b-neu');
+function renderRsRegistry(d){
+  const el=document.getElementById("rs-registry");
+  if(!d||d.error){el.innerHTML='<div class="loading">Control center warming…</div>';return;}
+  const q=d.dataQuality||{};
+  const dq=`<span class="badge ${q.bars&&q.bars.ready?'b-ready':'b-appr'}">bars ${q.bars?q.bars.have+'/'+q.bars.total:'—'}</span>
+    <span class="badge ${q.optionsSnapshotDays>=20?'b-ready':'b-appr'}">options history ${q.optionsSnapshotDays}d</span>
+    <span class="badge ${q.scoreHistoryDays>=5?'b-ready':'b-appr'}">score history ${q.scoreHistoryDays}d</span>
+    <span class="badge b-neu">journal ${q.journalClosedTrades} closed / ${q.openPositions} open</span>`;
+  const dis=(d.disagreement||[]).filter(x=>x.disagreement>0.5).slice(0,4);
+  const disLine=dis.length?`<div style="margin-top:6px;font-size:12px"><b>Model disagreement (information, not error):</b> ${
+    dis.map(x=>`<span class="amber">${x.symbol}</span> <span class="muted">(${Object.entries(x.votes).filter(([k,v])=>v!==0).map(([k,v])=>k+(v>0?'＋':'−')).join(" ")})</span>`).join(" · ")}</div>`
+    :`<div style="muted;margin-top:6px;font-size:12px" class="muted">Models currently agree (or abstain) on every sector.</div>`;
+  el.innerHTML=`<h2>Research control center</h2><div style="margin-bottom:6px">${dq}</div>
+    <div class="scrollx"><table><thead><tr><th>Model / signal</th><th>Stage</th><th>Evidence</th><th>Monitoring</th></tr></thead><tbody>
+    ${(d.models||[]).map(m2=>`<tr><td><b>${m2.name}</b></td><td><span class="badge ${stageBadge(m2.stage)}">${m2.stage}</span></td>
+      <td class="muted" style="white-space:normal;font-size:12px">${m2.evidence}</td>
+      <td class="muted" style="white-space:normal;font-size:12px">${m2.monitoring}</td></tr>`).join("")}</tbody></table></div>
+    ${disLine}
+    <div style="margin-top:6px;font-size:12px"><b>Backlog:</b> <span class="muted">${(d.backlog||[]).join(" · ")}</span></div>
+    <div class="note">${d.note||''}</div>`;
+}
+function renderRsFactors(){
+  const d=_fx;
+  const el=document.getElementById("rs-factors");
+  if(!d||d.error){el.innerHTML=`<div class="loading">${d?d.error:'…'}</div>`;return;}
+  if(!fxBuilt){
+    document.getElementById("fx-sel").innerHTML=(d.sectors||[]).map(s=>
+      `<button data-s="${s.symbol}" class="${s.symbol===fxSym?'on':''}">${s.symbol}</button>`).join("");
+    document.querySelectorAll("#fx-sel button").forEach(b=>b.onclick=()=>{
+      document.querySelectorAll("#fx-sel button").forEach(x=>x.classList.remove("on"));
+      b.classList.add("on");fxSym=b.dataset.s;renderRsFactors();});
+    fxBuilt=true;
+  }
+  const s=(d.sectors||[]).find(x=>x.symbol===fxSym);
+  if(!s){el.innerHTML='<div class="loading">…</div>';return;}
+  const drv=(r,sign)=>`<div style="font-size:12px" class="${sign>0?'up':'down'}">${sign>0?'✓':'✗'} ${r.name}
+    <span class="muted">(β ${r.beta} · ρ ${r.corr63}${r.deltaCorr!=null?' · Δρ '+(r.deltaCorr>0?'+':'')+r.deltaCorr:''} ·
+    factor ${r.factorTrend21>0?'+':''}${r.factorTrend21}% → contrib ${r.contrib21>0?'+':''}${r.contrib21}%
+    ${r.pPersist!=null?'· P(persist) '+r.pPersist+'%':''})</span></div>`;
+  const flags=(d.stabilityFlags||[]).filter(f=>f.startsWith(fxSym));
+  el.innerHTML=`<div style="font-size:13px"><b>${s.symbol}</b> moved <b class="${dir(s.move21)} mono">${pct(s.move21)}</b> over 21d ·
+      univariate attribution explains <span class="mono">${pct(s.explained21)}</span> (residual <span class="mono muted">${pct(s.residual21)}</span>) ·
+      attribution confidence <b class="mono">${s.confidence}%</b></div>
+    <div class="cols cols2" style="margin-top:8px">
+      <div><b style="font-size:12px">Primary drivers</b>${(s.primary||[]).map(r=>drv(r,1)).join("")||'<div class="muted" style="font-size:12px">none ≥ threshold</div>'}
+        <b style="font-size:12px;display:block;margin-top:8px">Conflicting</b>${(s.conflicting||[]).map(r=>drv(r,-1)).join("")||'<div class="muted" style="font-size:12px">none material</div>'}
+        <b style="font-size:12px;display:block;margin-top:8px">Supporting</b>${(s.supporting||[]).map(r=>drv(r,1)).join("")||'<div class="muted" style="font-size:12px">—</div>'}
+        <div class="muted" style="font-size:11px;margin-top:6px">weak (|ρ|<0.2): ${(s.weak||[]).join(", ")||"—"}</div></div>
+      <div>${flags.length?`<b style="font-size:12px" class="amber">Relationship breaks (|Δρ|≥0.4)</b>${flags.map(f=>`<div class="amber" style="font-size:12px">⚠ ${f}</div>`).join("")}`:'<div class="muted" style="font-size:12px">No relationship breaks flagged for this sector.</div>'}
+        <div style="margin-top:8px;font-size:11px" class="muted"><b>All flags:</b> ${(d.stabilityFlags||[]).length?d.stabilityFlags.map(f=>`<div>· ${f}</div>`).join(""):"none"}</div></div>
+    </div>
+    <div class="note">${d.note}</div>`;
+}
+function renderRsEdgeLab(d){
+  const el=document.getElementById("rs-edgelab");
+  if(!d||d.error){el.innerHTML=`<div class="loading">${d?d.error:'…'}</div>`;return;}
+  el.innerHTML=`<div style="font-size:13px">${d.tested} condition-combinations tested over ${d.weeks} weeks ·
+      <b class="${d.survivorCount?'up':'muted'}">${d.survivorCount} survived the gate</b></div>`+
+    ((d.survivors||[]).length?`<div class="scrollx"><table style="margin-top:6px"><thead><tr><th>Condition</th><th>Target</th>
+      <th>Train (n · mean · win · t)</th><th>Test (n · mean · win)</th><th>Baseline mean</th></tr></thead><tbody>
+      ${d.survivors.map(s=>`<tr><td style="white-space:normal">${s.condition}</td><td class="muted" style="white-space:normal;font-size:11px">${s.target}</td>
+        <td class="mono">${s.train.n} · ${s.train.mean>0?'+':''}${s.train.mean}% · ${s.train.win}% · t${s.train.t}</td>
+        <td class="mono ${s.test.mean>0?'up':'down'}">${s.test.n} · ${s.test.mean>0?'+':''}${s.test.mean}% · ${s.test.win}%</td>
+        <td class="mono muted">${s.baseline.mean>0?'+':''}${s.baseline.mean}%</td></tr>`).join("")}</tbody></table></div>`
+    :'<div class="muted" style="padding:6px;font-size:12px">No combination survived — the honest default outcome.</div>')+
+    `<div class="note">${d.note}</div>`;
 }
 function renderRsRegime(d){
   const el=document.getElementById("rs-regime");
@@ -1167,7 +1243,7 @@ async function loadPortfolio(){
           <td class="mono ${dir(r.avgPL)}">${signed(r.avgPL)}</td><td class="mono muted">${r.avgHoldDays!=null?r.avgHoldDays+'d':'—'}</td></tr>`).join("")}
         </tbody></table></div>`:"";
       document.getElementById("pf-journal").innerHTML=
-        jt("By symbol",d.journal.bySymbol)+jt("By direction",d.journal.byDir)+jt("By market regime at entry",d.journal.byRegime)+
+        jt("By symbol",d.journal.bySymbol)+jt("By direction",d.journal.byDir)+jt("By market regime at entry",d.journal.byRegime)+jt("By RS group at entry",d.journal.byEntryRS)+
         `<div class="note">${d.journal.note}</div>`;
     }
   }catch(e){document.getElementById("pf-summary").textContent="Portfolio failed to load.";}
