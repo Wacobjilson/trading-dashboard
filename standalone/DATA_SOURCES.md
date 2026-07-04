@@ -11,12 +11,12 @@ estimated.
 | **Tiingo** (added 2026-07-04) | key | deep-history fallback + cross-validation | on Yahoo failure / weekly | free tier: 1,000 req/day, 50/hr |
 | **FRED** (added 2026-07-04) | key | real macro factors: VIXCLS, DFII10 (real 10y), T10Y2Y (curve), BAMLH0A0HYM2 (HY spread), T10YIE (infl. expectations) | daily | official; levels carried as additive indices (trend ≈ change in pts); publication lags 1 day |
 | CBOE delayed chains | none | options intelligence (greeks/OI/IV) | 15 min per symbol sweep | ~15-min delayed; ≤90d expiries; no vanna/charm/dealer inventory |
-| Finnhub (free) | key | quotes, news, earnings calendar | 15-20s quotes | congressional endpoint is premium-gated (tested 403) |
+| Finnhub (configured 2026-07-04) | key | quotes (~60/min budget), news, earnings calendar | 15-20s quotes | congressional endpoint is premium-gated (tested 403) |
 | FairEconomy/ForexFactory | none | economic calendar | 30 min | weekly file granularity |
-| **FMP** (pending key) | key | congressional trade disclosures (senate-latest/house-latest) | 6h | free tier 250 req/day; disclosures inherently delayed 45+ days; committee data NOT included |
+| **FMP** (configured) | key | congressional trade disclosures (senate-latest live; house-latest is 402 premium-gated on free tier) | 6h | free tier 250 req/day; disclosures inherently delayed 45+ days; committee data NOT included |
 | **Federal Register API** | none | regulatory actions (SEC/EPA/DOE/FDA/HHS/FTC/DOJ/FCC/DoD/DOT/USDA/Fed/OCC) | 6h | publication ≠ market impact; agency→sector map is curated, not official |
 | **Treasury FiscalData** | none | upcoming Treasury auctions | 6h+ | schedule only |
-| congress.gov API | key (free, NOT configured) | bills, hearings, votes | — | sign up at api.congress.gov/sign-up → set CONGRESS_GOV_API_KEY |
+| congress.gov API (configured 2026-07-04) | key (free) | bills (latest actions) → Government tab legislative section + calendar | 6h | hearings/votes exist in the API but not yet wired; committee rosters not machine-readable |
 | Anthropic (optional) | key | AI market summary | 10 min cache | falls back to rule-based |
 
 ## Tested and rejected (2026-07-04)

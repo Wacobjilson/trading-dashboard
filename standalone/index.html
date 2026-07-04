@@ -76,6 +76,7 @@
   .pbar{position:relative;background:var(--panelAlt);border:1px solid var(--border);border-radius:4px;height:12px;width:110px;overflow:hidden;}
   .pbar>span{position:absolute;left:0;top:0;bottom:0;}
   .live-tag{font-size:10px;color:var(--up);letter-spacing:.08em;animation:pulse 2s infinite;}
+  .sechead{font-size:11px;letter-spacing:.14em;color:var(--muted);margin:18px 2px 6px;border-bottom:1px solid var(--border);padding-bottom:4px;}
   .scrollx{overflow-x:auto;}
   .sbar{display:inline-block;vertical-align:middle;background:var(--panelAlt);border:1px solid var(--border);border-radius:3px;height:10px;width:64px;position:relative;overflow:hidden;margin-right:6px;}
   .sbar>span{position:absolute;left:0;top:0;bottom:0;}
@@ -114,7 +115,7 @@
   <button data-tab="rotation">Rotation</button>
   <button data-tab="options">Options</button>
   <button data-tab="research">Research</button>
-  <button data-tab="congress">Congress</button>
+  <button data-tab="congress">Government</button>
   <button data-tab="entries">Entries</button>
   <button data-tab="portfolio">Portfolio</button>
   <button data-tab="chart">Chart</button>
@@ -226,23 +227,45 @@
     <div class="card"><h2>Historical analogs — the market states most similar to today</h2><div id="rs-analogs"><div class="loading">…</div></div></div>
   </section>
 
-  <!-- CONGRESSIONAL INTELLIGENCE -->
+  <!-- GOVERNMENT & POLICY INTELLIGENCE CENTER -->
   <section class="tab" id="tab-congress">
     <div class="card" style="font-size:13px"><span class="badge b-bear">DELAYED DISCLOSURES</span>
       &nbsp;Congressional trades are self-reported up to <b>45+ days after the transaction</b>, in wide dollar
-      ranges, unverified. Every row shows traded date, disclosed date, and the delay. This module is
-      <b>context only</b> — it never feeds the composite score or the allocation gate.
+      ranges, unverified. Every row shows traded date, disclosed date, and the delay. This entire tab is
+      <b>context only</b> — no government signal feeds the composite score or the allocation gate until it
+      passes the same pre-registered validation as every other model.
       <span id="cg-status" class="muted" style="font-size:11px"></span></div>
+
+    <div class="sechead">SECTOR GOVERNMENT EXPOSURE</div>
+    <div class="card"><h2>Structural policy sensitivity by sector <span class="muted" style="font-weight:normal;font-size:11px">(curated ratings + live activity — hover a row for the reasoning)</span></h2>
+      <div id="gv-exp" class="scrollx"><div class="loading">…</div></div></div>
+
+    <div class="sechead">CONGRESSIONAL ACTIVITY</div>
     <div class="card"><h2>Sector political heat (last 90 days)</h2><div id="cg-heat"><div class="loading">…</div></div></div>
     <div class="cols cols2">
       <div class="card"><h2>Conviction (cluster/repeat/size — explained)</h2><div id="cg-conv"><div class="loading">…</div></div></div>
       <div class="card"><h2>Member statistics (sample-size gated)</h2><div id="cg-members"><div class="loading">…</div></div></div>
     </div>
-    <div class="card"><h2>Recent disclosures</h2><div id="cg-recent" class="scrollx"><div class="loading">…</div></div></div>
+    <div class="card"><h2>Recent disclosures <span class="muted" style="font-weight:normal;font-size:11px">(click a ticker for its government profile)</span></h2><div id="cg-recent" class="scrollx"><div class="loading">…</div></div></div>
+    <div class="card" id="gv-profile-card" style="display:none"><h2>Company government profile — <span id="gv-profile-sym"></span></h2><div id="gv-profile"></div></div>
+
+    <div class="sechead">LEGISLATIVE INTELLIGENCE</div>
+    <div class="card"><h2>Bills — latest official activity (congress.gov)</h2><div id="gv-bills" class="scrollx"><div class="loading">…</div></div></div>
+
+    <div class="sechead">REGULATORY INTELLIGENCE &amp; CALENDAR</div>
     <div class="cols cols2">
-      <div class="card"><h2>Regulatory intelligence (Federal Register — official)</h2><div id="cg-reg"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Regulatory feed (Federal Register — official)</h2><div id="cg-reg"><div class="loading">…</div></div></div>
       <div class="card"><h2>Political calendar</h2><div id="cg-cal"><div class="loading">…</div></div></div>
     </div>
+
+    <div class="sechead">CATALYST DASHBOARD</div>
+    <div class="card"><h2>Active government catalysts
+      <span style="float:right;font-weight:normal"><input id="gv-cat-q" placeholder="filter: ticker, sector, agency…" style="font-size:11px;padding:2px 6px;background:#0c1219;border:1px solid var(--border);border-radius:4px;color:var(--text)">
+      <select id="gv-cat-kind" style="font-size:11px;padding:2px;background:#0c1219;border:1px solid var(--border);border-radius:4px;color:var(--text)"><option value="">all kinds</option></select></span></h2>
+      <div id="gv-cat" class="scrollx"><div class="loading">…</div></div></div>
+
+    <div class="sechead">GOVERNMENT RESEARCH</div>
+    <div class="card"><h2>Validation pipeline — same rules as every other model</h2><div id="gv-research"><div class="loading">…</div></div></div>
   </section>
 
   <!-- ENTRIES -->
@@ -598,6 +621,10 @@ async function chartLiveTick(){
     const q=(d.quotes||{})[chData.symbol];
     if(!q||!q.last)return;
     const bars=chData.bars,last=bars[bars.length-1];
+    // never merge fabricated quotes into real bars, and reject wild outliers
+    // (>12% off the last close = bad tick, not a price)
+    if(q.source==="mock"&&chData.source!=="synth")return;
+    if(Math.abs(q.last/last.c-1)>0.12)return;
     last.c=q.last; last.h=Math.max(last.h,q.last); last.l=Math.min(last.l,q.last);
     chLastPx=q.last; drawChart(chData,q.last);
   }catch(e){}
@@ -706,8 +733,9 @@ function futLiveTick(){
   // nudge the forming 15-min bar with the live proxy quote from the Markets feed
   if(!futData||!tabActive("futures"))return;
   const q=_q.find(x=>x.symbol===FUT_PROXY[futData.symbol]);
-  if(!q||!q.last||q.source==="mock"&&futData.state&&futData.state.source!=="synth")return;
+  if(!q||!q.last||(q.source||"").indexOf("mock")>=0||(q.source||"").indexOf("stale")>=0)return;
   const bars=futData.bars,last=bars[bars.length-1];
+  if(Math.abs(q.last/last.c-1)>0.12)return;
   last.c=q.last; last.h=Math.max(last.h,q.last); last.l=Math.min(last.l,q.last);
   drawFuturesChart(futData,q.last);
 }
@@ -1350,12 +1378,85 @@ function renderRsReplication(r,e){
     `<div class="note">${r.note} ${e&&e.note?e.note:''}</div>`;
 }
 
-// ── CONGRESSIONAL INTELLIGENCE ──
-let _cgHeat=null;
+// ── GOVERNMENT & POLICY INTELLIGENCE ──
+let _cgHeat=null,_gv=null;
+const EXPO_DIMS=[["govSpending","Spend"],["defense","Def"],["healthPolicy","Health"],["regulation","Reg"],["trade","Trade"],["rates","Rates"],["fiscal","Fiscal"],["election","Elect"]];
+const expoCell=v=>`<td class="mono" style="color:${["#3a4657","#7b8794","var(--amber)","var(--down)"][v]||"#3a4657"}">${["—","low","med","HIGH"][v]||"—"}</td>`;
+function govProfile(tk){
+  const g=(_gv&&_gv.graph||{})[tk];
+  document.getElementById("gv-profile-card").style.display="block";
+  document.getElementById("gv-profile-sym").textContent=tk;
+  document.getElementById("gv-profile").innerHTML=!g?
+    `<div class="muted" style="padding:6px;font-size:12px">${tk}: no congressional disclosures in the store — profile builds from disclosure activity.</div>`:
+    `<div style="font-size:12px;padding:4px 0">
+      <div><b>Sector:</b> ${g.sector||"unmapped"} · <b>disclosed trades on file:</b> ${g.trades}</div>
+      <div style="margin-top:4px"><b>Members who filed trades:</b> ${g.members.map(m=>`${m.member} (${m.n})`).join(" · ")||"—"}</div>
+      <div style="margin-top:4px"><b>Regulators active on this sector:</b> ${(g.agencies||[]).join(", ")||"—"}</div>
+      <div style="margin-top:4px"><b>Recent bills mapped to this sector:</b> ${(g.bills||[]).map(b=>b.url?`<a href="${b.url}" target="_blank" rel="noopener" style="color:var(--text)">${b.bill}</a> ${b.title}`:`${b.bill} ${b.title}`).join("<br>")||"—"}</div>
+      <div class="note">${g.note}</div></div>`;
+  document.getElementById("gv-profile-card").scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+function renderCatalysts(){
+  if(!_gv)return;
+  const q=(document.getElementById("gv-cat-q").value||"").toLowerCase();
+  const kind=document.getElementById("gv-cat-kind").value;
+  const rows=(_gv.catalysts||[]).filter(c=>(!kind||c.kind===kind)&&(!q||`${c.title} ${c.sectors} ${c.kind} ${c.policyArea||""}`.toLowerCase().includes(q)));
+  document.getElementById("gv-cat").innerHTML=rows.length?
+    `<table><thead><tr><th>Date</th><th>Catalyst</th><th>Kind</th><th>Priority</th><th>Sectors</th><th>Confidence</th></tr></thead><tbody>
+    ${rows.slice(0,40).map(c=>`<tr><td class="mono">${c.date}</td>
+      <td style="white-space:normal;font-size:12px">${c.url?`<a href="${c.url}" target="_blank" rel="noopener" style="color:var(--text)">${c.title}</a>`:c.title}${c.policyArea?` <span class="badge b-neu">${c.policyArea}</span>`:""}</td>
+      <td><span class="badge b-neu">${c.kind}</span></td>
+      <td class="${c.priority==='High'?'amber':'muted'}" style="font-size:11px">${c.priority}</td>
+      <td class="muted" style="font-size:11px;white-space:normal">${c.sectors}</td>
+      <td class="muted" style="font-size:10px;white-space:normal">${c.confidence}<div style="font-size:9px">${c.source}</div></td></tr>`).join("")}</tbody></table>
+    <div class="note">Priority is a display heuristic (scheduled Fed events > legislation/rules > delayed filings), not a measured impact estimate — no validated impact model exists.</div>`
+    :'<div class="muted" style="padding:8px">No catalysts match the filter.</div>';
+}
+document.getElementById("gv-cat-q").addEventListener("input",renderCatalysts);
+document.getElementById("gv-cat-kind").addEventListener("change",renderCatalysts);
 async function loadCongress(){
   try{
-    const [d,rg]=await Promise.all([fetch(`${API}/api/congress`).then(r=>r.json()),
-                                    fetch(`${API}/api/congress_reg`).then(r=>r.json())]);
+    const [d,rg,gv]=await Promise.all([fetch(`${API}/api/congress`).then(r=>r.json()),
+                                       fetch(`${API}/api/congress_reg`).then(r=>r.json()),
+                                       fetch(`${API}/api/government`).then(r=>r.json())]);
+    _gv=gv;
+    // sector exposure
+    document.getElementById("gv-exp").innerHTML=(gv.exposure&&gv.exposure.length)?
+      `<table><thead><tr><th>Sector</th>${EXPO_DIMS.map(x=>`<th>${x[1]}</th>`).join("")}<th>Reg 90d</th><th>CG B/S 90d</th><th>Bills</th></tr></thead><tbody>
+      ${gv.exposure.map(e=>`<tr class="clk" title="${(e.why||"").replace(/"/g,"'")}" onclick="openChart('${e.sector}')">
+        <td><b>${e.sector}</b> <span class="muted" style="font-size:10px">${e.name}</span></td>
+        ${EXPO_DIMS.map(x=>expoCell(e.scores[x[0]])).join("")}
+        <td class="mono muted">${e.live.regDocs90d}</td>
+        <td class="mono"><span class="up">${e.live.cgBuys90d}</span>/<span class="down">${e.live.cgSells90d}</span></td>
+        <td class="mono muted">${e.live.activeBills}</td></tr>`).join("")}</tbody></table>
+      <div class="note">${gv.exposureNote}</div>`
+      :'<div class="loading">…</div>';
+    // bills
+    const bl=gv.bills||{};
+    document.getElementById("gv-bills").innerHTML=(bl.items&&bl.items.length)?
+      `<table><thead><tr><th>Bill</th><th>Title</th><th>Latest action</th><th>Date</th><th>Policy area</th><th>Sectors</th></tr></thead><tbody>
+      ${bl.items.map(b=>`<tr><td class="mono">${b.url?`<a href="${b.url}" target="_blank" rel="noopener" style="color:var(--text)"><b>${b.bill}</b></a>`:`<b>${b.bill}</b>`}</td>
+        <td style="white-space:normal;font-size:12px">${b.title}</td>
+        <td class="muted" style="white-space:normal;font-size:11px">${b.status}</td>
+        <td class="mono">${b.actionDate||b.updateDate||"—"}</td>
+        <td>${b.policyArea?`<span class="badge b-neu">${b.policyArea}</span>`:'<span class="muted">—</span>'}</td>
+        <td class="muted" style="font-size:11px">${b.sectors}</td></tr>`).join("")}</tbody></table>
+      <div class="note">${bl.note||""} No passage-probability or impact numbers are shown — no validated model for either.</div>`
+      :`<div class="muted" style="padding:8px">${bl.error||bl.note||"No bill data."}</div>`;
+    // catalysts (populate kind filter once)
+    const kinds=[...new Set((gv.catalysts||[]).map(c=>c.kind))];
+    const sel=document.getElementById("gv-cat-kind");
+    if(sel.options.length<=1)kinds.forEach(k=>{const o=document.createElement("option");o.value=o.textContent=k;sel.appendChild(o);});
+    renderCatalysts();
+    // research pipeline
+    document.getElementById("gv-research").innerHTML=(gv.pipeline||[]).map(p=>{
+      const st=p.study||{};
+      return`<div style="padding:7px 0;border-top:1px solid var(--border);font-size:12px">
+        <b>${p.id}</b> <span class="badge ${p.stage&&p.stage.includes("pre-registered")?'b-appr':'b-neu'}">${p.stage}</span> ${p.hypothesis}
+        ${p.study?`<div class="muted" style="font-size:11px;margin-top:3px">${st.design||""} · n=${st.n}${st.meanExcess90dPct!=null?` · mean excess ${pct(st.meanExcess90dPct)} · hit ${st.hitRate}% (CI ${st.hitRateCI95[0]}–${st.hitRateCI95[1]}%)`:""}
+          <div><b>${st.status||""}</b> · gate: ${st.gate||""}</div></div>`
+        :`<div class="muted" style="font-size:11px">${p.status||""}</div>`}</div>`;}).join("")
+      +`<div class="note">${gv.policy||""}</div>`;
     _cgHeat=d.heat||null;
     const st=d.sourceStatus||{};
     document.getElementById("cg-status").innerHTML=` · trades: <b>${st.trades||'—'}</b> · regulatory: ${st.regulatory} · bills/hearings: ${st.billsHearings} · committees: ${st.committees}`
@@ -1371,7 +1472,7 @@ async function loadCongress(){
       :`<div class="muted" style="padding:8px">No trade data yet — ${st.trades||'source not configured'}.</div>`;
     document.getElementById("cg-conv").innerHTML=(d.conviction&&d.conviction.length)?
       d.conviction.map(c=>`<div style="padding:6px 0;border-top:1px solid var(--border);font-size:12px">
-        <b>${c.ticker}</b> ${c.sector?`<span class="muted">(${c.sector})</span>`:''}
+        <b class="clk" onclick="govProfile('${c.ticker}')">${c.ticker}</b> ${c.sector?`<span class="muted">(${c.sector})</span>`:''}
         <span class="badge ${c.grade==='Very High'?'b-ready':c.grade==='High'?'b-appr':'b-neu'}">${c.grade}</span>
         <div class="muted" style="font-size:11px">${c.why.join(" · ")}</div></div>`).join("")
       :'<div class="muted" style="padding:8px">Awaiting trade data.</div>';
@@ -1388,7 +1489,7 @@ async function loadCongress(){
       `<table><thead><tr><th>Member</th><th>Ticker</th><th>Side</th><th>Amount</th><th>Traded</th><th>Disclosed</th><th>Delay</th><th>Since trade</th><th>vs SPY</th><th>Sector</th></tr></thead><tbody>
       ${d.recent.map(t=>{const p=t.perf||{};return`<tr>
         <td style="white-space:normal;font-size:12px">${t.member} <span class="muted" style="font-size:10px">${t.chamber}${t.owner?' · '+t.owner:''}</span></td>
-        <td><b>${t.ticker}</b></td><td><span class="badge ${t.side==='buy'?'b-long':t.side==='sell'?'b-short':'b-neu'}">${t.side}</span></td>
+        <td><b class="clk" onclick="govProfile('${t.ticker}')">${t.ticker}</b></td><td><span class="badge ${t.side==='buy'?'b-long':t.side==='sell'?'b-short':'b-neu'}">${t.side}</span></td>
         <td class="mono muted" style="font-size:11px">${t.amount||'—'}</td>
         <td class="mono">${t.txnDate}</td><td class="mono">${t.discDate||'—'}</td>
         <td class="mono ${t.delayDays>45?'down':'muted'}">${t.delayDays!=null?t.delayDays+'d':'—'}</td>
@@ -1400,7 +1501,7 @@ async function loadCongress(){
     const reg=rg.regulatory||{};
     document.getElementById("cg-reg").innerHTML=(reg.items&&reg.items.length)?
       reg.items.slice(0,18).map(it=>`<div style="padding:5px 0;border-top:1px solid var(--border);font-size:12px">
-        <span class="badge ${it.significance==='rule'?'b-appr':'b-neu'}">${it.type||''}</span>
+        <span class="badge ${it.significance==='rule'?'b-appr':'b-neu'}">${it.type||''}</span>${it.policyArea?` <span class="badge b-neu">${it.policyArea}</span>`:''}
         <b>${it.agency}</b> <span class="muted">(${it.sectors})</span> · <span class="mono muted">${it.date}</span>
         <div><a href="${it.url}" target="_blank" rel="noopener" style="color:var(--text)">${it.title}</a></div></div>`).join("")
       +`<div class="note">${reg.source||''}</div>`

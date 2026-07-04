@@ -1,5 +1,8 @@
 # Congressional Data — pipeline reference
 
+Lives on the **Government** tab (the Government & Policy Intelligence Center —
+see GOVERNMENT_INTELLIGENCE.md for the other sections).
+
 ## Trade tracker (`congress_loop` → `/api/congress`)
 - **Source:** FMP `senate-latest` + `house-latest` (requires `FMP_API_KEY`,
   free tier). Fetched every 6h, 4 pages per chamber.
@@ -24,6 +27,9 @@
 
 ## Sector heat
 Last-90-day buy/sell counts by mapped sector (by TRADE date), distinct buyers,
+snapshotted daily into `congress_trades.json → heatHistory` (capped 750 days)
+so GOV-02/GOV-03 (EXPERIMENT_LOG.md) can ever be tested — no history means
+permanently untestable. Also shown:
 top tickers, plus Federal Register document counts per sector. The "read"
 column is a plain-language summary (net buying / net selling / balanced).
 

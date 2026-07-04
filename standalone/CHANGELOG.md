@@ -1,5 +1,25 @@
 # Changelog (standalone platform)
 
+## 2026-07-04 · Phase 10 — Government & Policy Intelligence Center
+- **Congress tab rebuilt as "Government"** (one tab, sectioned): sector
+  government exposure (curated 0–3 ratings + live counts), congressional
+  activity, legislative intelligence (congress.gov bills with policy-area
+  classification + sector mapping), regulatory feed with policy badges,
+  political calendar, filterable catalyst dashboard, company government
+  profiles (knowledge-graph lite), and a government research section.
+- **EXP-13 pre-registered** (follow-the-filing, gate fixed before results);
+  GOV-02/GOV-03 registered data-gated; daily sector-heat snapshots persist
+  so they can mature. New endpoint `/api/government`. Everything descriptive —
+  nothing government-derived feeds scores or allocation.
+- **Chart integrity fix:** failed quote fetches were silently replaced by
+  mock random-walk prices (seeded from stale levels) and merged into real
+  charts — the "giant red bar". Real-data mode now lets quotes go stale
+  instead of fabricating; UI additionally rejects mock/±12% outlier ticks
+  before touching the forming candle. Mock quotes remain demo-mode only.
+- Finnhub key configured (real quotes, ~60/min budget); corrected
+  congress.gov key.
+- Doc rename: LEGISLATIVE_INTELLIGENCE.md → GOVERNMENT_INTELLIGENCE.md.
+
 ## 2026-07-04 · Phase 7 — research-director cycle
 - **Deep history**: research matrices now use Yahoo v8 adjusted daily (~25y per
   symbol; ~8y common window bounded by XLC), quality-checked against the

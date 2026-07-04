@@ -126,3 +126,22 @@ Format: Question / Hypothesis / Method / Data / Result / Limitations / Decision 
 - 54 weekly cross-sections is enough to reject categories but not to condition on regime — rejection is cheaper than confirmation.
 - **Per-instrument baselines** beat absolute thresholds (EXP-05).
 - Partial correlation (SPY control, added 2026-07-04) demotes beta-in-disguise factor links — raw ρ overstated driver counts.
+
+## EXP-13 - registered 2026-07-04 - follow-the-filing (congressional buys)
+- **Status: PRE-REGISTERED, data accumulating. Written BEFORE results exist.**
+- **Q:** Does buying at the DISCLOSURE date of a congressional BUY filing
+  (the first date a follower can act - never the trade date) earn positive
+  90-calendar-day excess return vs SPY?
+- **Method:** every BUY record in congress_trades.json with a disclosure date
+  >= 95 days old and loaded price history; entry at first close on/after the
+  disclosure date; exit at first close on/after +90d; excess vs SPY over the
+  same window. Live readout: /api/government -> pipeline EXP-13.
+- **Acceptance gate (fixed now):** n >= 40 matured trades AND hit-rate Wilson
+  95% CI excluding 50% AND mean excess > 0. If passed: replicate on NEW
+  disclosures (post-pass only) before any production discussion.
+- **Prior expectation (recorded for honesty):** academic literature finds
+  most of any signal decays before disclosure; base-rate expectation is FAIL.
+- Companions (registered, further data-gated): GOV-02 sector-level net
+  congressional buying vs forward sector-relative returns (needs >= 26 weekly
+  heat snapshots; daily snapshots started 2026-07-04); GOV-03 Federal
+  Register rule-count spikes vs sector vol/returns (same snapshot store).

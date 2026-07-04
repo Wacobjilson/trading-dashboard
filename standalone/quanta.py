@@ -223,20 +223,30 @@ _quotes_lock, _quotes_cache, _status = threading.Lock(), [], {"provider": active
 
 
 def quotes_loop():
+    global _quotes_cache
     provider = active_provider(); fn = QUOTE_FNS[provider]
     while True:
+        with _quotes_lock:
+            prev = {q["symbol"]: q for q in _quotes_cache}
         out = []
         for sym, name, klass, vendors in INSTRUMENTS:
             try:
                 q = fn(sym, vendors.get(provider, sym)); src = provider
             except Exception:
+                # Real-data mode: carry the last real quote marked stale (or
+                # drop the row) instead of inventing prices. Mock is demo-only.
+                if not (FORCE_SYNTH or not API_KEYS.get("polygon")):
+                    p = prev.get(sym)
+                    if p:
+                        p = dict(p); p["source"] = p["source"].replace(" (stale)", "") + " (stale)"
+                        out.append(p)
+                    continue
                 q = quote_mock(sym, sym); src = "mock"
             q.update({"symbol": sym, "name": name, "assetClass": klass, "source": src})
             out.append(q)
             if provider == "alphavantage":
                 time.sleep(13)
         with _quotes_lock:
-            global _quotes_cache
             _quotes_cache = out; _status["updated"] = int(time.time())
         time.sleep(REFRESH_SECONDS)
 
@@ -4068,6 +4078,76 @@ def _congress_perf(rec):
     return out
 
 
+# Policy-area classification — keyword rules over official titles/actions.
+# An analytic convenience, labeled as such: it routes documents to sectors,
+# it does NOT estimate market impact (no validated model exists for that).
+POLICY_AREAS = [
+    ("Antitrust", ["antitrust", "merger", "monopol", "competition act", "consolidation"]),
+    ("Drug approvals", ["drug", "biologic", "pharmaceutic", "clinical", "medical device", "medicare", "medicaid", "fda"]),
+    ("Energy policy", ["energy", "petroleum", "pipeline", "drilling", "renewable", "solar", "wind power", "nuclear", "lng"]),
+    ("Defense", ["defense", "military", "weapon", "armed forces", "munition", "missile"]),
+    ("Banking & financial regulation", ["bank", "capital requirement", "securities", "swap", "derivativ",
+                                        "broker", "credit union", "lending", "consumer financial", "insurance"]),
+    ("AI", ["artificial intelligence", "machine learning", " ai "]),
+    ("Telecommunications", ["spectrum", "broadband", "telecommunication", "wireless", "satellite"]),
+    ("Trade & tariffs", ["tariff", "trade agreement", "import", "customs", "duty", "trade act"]),
+    ("Sanctions & export controls", ["sanction", "export control", "export administration", "entity list", "embargo"]),
+    ("Tax policy", ["tax", "internal revenue", "revenue procedure"]),
+    ("Environmental regulation", ["emission", "clean air", "clean water", "environmental", "climate", "pollut", "epa"]),
+]
+POLICY_SECTOR = {
+    "Antitrust": "XLK/XLC", "Drug approvals": "XLV", "Energy policy": "XLE/XLU",
+    "Defense": "XLI", "Banking & financial regulation": "XLF", "AI": "XLK/XLC",
+    "Telecommunications": "XLC", "Trade & tariffs": "XLI/XLB/XLK",
+    "Sanctions & export controls": "XLK/XLI/XLE", "Tax policy": "all sectors",
+    "Environmental regulation": "XLE/XLB/XLU",
+}
+
+
+def _policy_area(text):
+    t = " %s " % (text or "").lower()
+    for name, words in POLICY_AREAS:
+        if any(w in t for w in words):
+            return name
+    return None
+
+
+_BILL_SLUG = {"HR": "house-bill", "S": "senate-bill", "HRES": "house-resolution",
+              "SRES": "senate-resolution", "HJRES": "house-joint-resolution",
+              "SJRES": "senate-joint-resolution", "HCONRES": "house-concurrent-resolution",
+              "SCONRES": "senate-concurrent-resolution"}
+
+
+def fetch_bills():
+    """Most recently updated bills from the official congress.gov API, with
+    status, timeline, keyword policy area and mapped sectors. No 'passage
+    probability' or 'market impact' numbers — no validated model for either."""
+    ck = _key("congress_gov")
+    if not ck:
+        return {"items": [], "note": "free key at api.congress.gov/sign-up → set CONGRESS_GOV_API_KEY"}
+    try:
+        d = http_get_json("https://api.congress.gov/v3/bill?api_key=%s&format=json&limit=20"
+                          "&sort=updateDate+desc" % urllib.parse.quote(ck), timeout=25)
+    except Exception as e:
+        return {"items": [], "error": "congress.gov: %s" % e}
+    items = []
+    for b in d.get("bills", []):
+        title = b.get("title") or ""
+        la = b.get("latestAction") or {}
+        pa = _policy_area(title + " " + (la.get("text") or ""))
+        typ, num, cong = (b.get("type") or "").upper(), b.get("number", ""), b.get("congress", "")
+        slug = _BILL_SLUG.get(typ)
+        items.append({"bill": "%s %s" % (typ, num), "congress": cong, "title": title[:170],
+                      "status": (la.get("text") or "no action recorded")[:130],
+                      "actionDate": la.get("actionDate"), "updateDate": (b.get("updateDate") or "")[:10],
+                      "policyArea": pa, "sectors": POLICY_SECTOR.get(pa, "unmapped"),
+                      "chamber": b.get("originChamber") or "",
+                      "url": ("https://www.congress.gov/bill/%sth-congress/%s/%s" % (cong, slug, num)) if slug else None,
+                      "source": "congress.gov API (official)"})
+    return {"items": items, "source": "congress.gov v3 API (official)", "fetchedAt": time.time(),
+            "note": "sector mapping is keyword-based on the title — read the bill before acting on it"}
+
+
 AGENCY_SECTOR = {
     "securities-and-exchange-commission": ("SEC", "XLF"),
     "federal-reserve-system": ("Federal Reserve", "XLF"),
@@ -4101,6 +4181,7 @@ def fetch_fedreg():
         items.append({"date": r.get("publication_date"), "type": r.get("type"),
                       "agency": ag[0] or ", ".join(a.get("name", "") for a in (r.get("agencies") or [])[:1]),
                       "sectors": ag[1], "title": (r.get("title") or "")[:140], "url": r.get("html_url"),
+                      "policyArea": _policy_area(r.get("title")),
                       "significance": "rule" if "Rule" in (r.get("type") or "") else "notice"})
     return {"items": items, "source": "Federal Register API (official, keyless)", "fetchedAt": time.time()}
 
@@ -4134,23 +4215,16 @@ def political_calendar():
             out["items"].append({"date": (e.get("time") or "")[:10],
                                  "event": "%s %s" % (e.get("country"), e.get("event")), "kind": "Economic",
                                  "sectors": "macro-wide", "source": "economic calendar feed"})
-    ck = _key("congress_gov")
-    if ck:
-        try:
-            d = http_get_json("https://api.congress.gov/v3/bill?api_key=%s&format=json&limit=12"
-                              "&sort=updateDate+desc" % urllib.parse.quote(ck), timeout=25)
-            for b in d.get("bills", []):
-                out["items"].append({"date": (b.get("latestAction") or {}).get("actionDate") or b.get("updateDate", "")[:10],
-                                     "event": "Bill %s-%s: %s — %s" % (b.get("type", ""), b.get("number", ""),
-                                                                       (b.get("title") or "")[:90],
-                                                                       ((b.get("latestAction") or {}).get("text") or "")[:80]),
-                                     "kind": "Congress", "sectors": "see bill text",
-                                     "source": "congress.gov API (official)"})
-        except Exception as e:
-            out["notes"].append("congress.gov fetch failed (%s)" % e)
-    else:
-        out["notes"].append("Bills/hearings/votes need a free congress.gov key "
-                            "(api.congress.gov/sign-up) — set CONGRESS_GOV_API_KEY to enable.")
+    bills = cache_get("bills", 6 * 3600) or _cache_and_return("bills", fetch_bills)
+    for b in (bills.get("items") or [])[:12]:
+        out["items"].append({"date": b.get("actionDate") or b.get("updateDate") or "",
+                             "event": "Bill %s: %s — %s" % (b["bill"], b["title"][:90], b["status"][:80]),
+                             "kind": "Congress", "sectors": b.get("sectors") or "see bill text",
+                             "source": b["source"]})
+    if bills.get("error"):
+        out["notes"].append("congress.gov fetch failed (%s)" % bills["error"])
+    elif bills.get("note") and not bills.get("items"):
+        out["notes"].append("Bills/hearings/votes: %s" % bills["note"])
     out["items"].sort(key=lambda x: x["date"], reverse=True)
     out["items"] = out["items"][:50]
     return out
@@ -4284,6 +4358,182 @@ def congress_reg_view():
             "calendar": political_calendar()}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Government & Policy Intelligence Center — exposure profiles, catalysts,
+# entity links, and the government research pipeline. All DESCRIPTIVE: nothing
+# here feeds scores or the allocation gate (see DISCLOSURE_LIMITATIONS.md).
+# ─────────────────────────────────────────────────────────────────────────────
+# Curated 0–3 exposure ratings (0 minimal · 3 high). These are analyst
+# judgments about STRUCTURAL policy sensitivity, stated as such — they are not
+# measured coefficients. Rates sensitivity is the one dimension with live
+# measured support (factor library fredRealY10/fredCurve betas).
+SECTOR_GOV_EXPOSURE = {
+    "XLK": {"govSpending": 1, "defense": 1, "healthPolicy": 0, "regulation": 2, "trade": 3, "rates": 2, "fiscal": 1, "election": 2,
+            "why": "chip export controls & China trade are first-order; antitrust vs mega-caps; long-duration cash flows → rate-sensitive"},
+    "XLC": {"govSpending": 0, "defense": 0, "healthPolicy": 0, "regulation": 3, "trade": 1, "rates": 2, "fiscal": 0, "election": 2,
+            "why": "FCC spectrum/broadband rules, Section 230 & antitrust exposure for platforms, content regulation fights"},
+    "XLY": {"govSpending": 0, "defense": 0, "healthPolicy": 0, "regulation": 1, "trade": 3, "rates": 3, "fiscal": 2, "election": 1,
+            "why": "tariffs hit import-heavy retail/autos; consumer credit & mortgage rates drive demand; EV subsidies for autos"},
+    "XLF": {"govSpending": 0, "defense": 0, "healthPolicy": 0, "regulation": 3, "trade": 1, "rates": 3, "fiscal": 2, "election": 2,
+            "why": "capital rules (Fed/OCC/SEC), curve shape is the revenue driver, CFPB/bank-merger policy swings with administrations"},
+    "XLV": {"govSpending": 3, "defense": 0, "healthPolicy": 3, "regulation": 3, "trade": 1, "rates": 1, "fiscal": 2, "election": 3,
+            "why": "Medicare/Medicaid set revenue; FDA approvals gate products; drug-pricing legislation is a recurring repricing event"},
+    "XLI": {"govSpending": 3, "defense": 3, "healthPolicy": 0, "regulation": 1, "trade": 3, "rates": 1, "fiscal": 3, "election": 2,
+            "why": "defense primes (LMT/RTX/NOC/GD) live on DoD budgets; infrastructure bills; tariffs cut both ways for machinery"},
+    "XLE": {"govSpending": 1, "defense": 0, "healthPolicy": 0, "regulation": 3, "trade": 2, "rates": 1, "fiscal": 1, "election": 3,
+            "why": "drilling/permitting/EPA emissions rules flip with administrations; sanctions move crude; strategic reserve policy"},
+    "XLB": {"govSpending": 1, "defense": 0, "healthPolicy": 0, "regulation": 2, "trade": 3, "rates": 1, "fiscal": 2, "election": 1,
+            "why": "tariffs (steel/aluminum) are direct P&L; EPA rules on chemicals/mining; infrastructure spending demand"},
+    "XLP": {"govSpending": 0, "defense": 0, "healthPolicy": 1, "regulation": 1, "trade": 2, "rates": 1, "fiscal": 1, "election": 0,
+            "why": "least policy-exposed sector; FDA food labeling, tobacco regulation, agricultural tariffs at the margin"},
+    "XLU": {"govSpending": 1, "defense": 0, "healthPolicy": 0, "regulation": 3, "trade": 0, "rates": 3, "fiscal": 1, "election": 1,
+            "why": "state/federal rate-setting IS the business model; EPA power-plant rules; bond-proxy → highest rate sensitivity"},
+    "XLRE": {"govSpending": 0, "defense": 0, "healthPolicy": 0, "regulation": 1, "trade": 0, "rates": 3, "fiscal": 1, "election": 0,
+             "why": "financing costs dominate (bond proxy); 1031/REIT tax treatment; remote-work policy second-order"},
+}
+_EXPO_DIMS = [("govSpending", "Gov spending"), ("defense", "Defense"), ("healthPolicy", "Health policy"),
+              ("regulation", "Regulation"), ("trade", "Trade/tariffs"), ("rates", "Rates"),
+              ("fiscal", "Fiscal policy"), ("election", "Election")]
+
+GOV_PIPELINE_NOTE = ("Government signals are DESCRIPTIVE. None enters the composite score, probability "
+                     "engine or allocation gate until it passes the same pre-registered train/test "
+                     "validation as every other model (MODEL_REGISTRY.md rules).")
+
+
+def _gov_follow_study():
+    """EXP-13 (pre-registered, EXPERIMENT_LOG.md): follow-the-filing. Entry at
+    the DISCLOSURE date (first day a follower could act), 90-calendar-day hold,
+    excess return vs SPY. Acceptance gate: n≥40 matured trades AND hit-rate
+    Wilson CI excluding 50% AND mean excess > 0 — then an OOS split on new
+    disclosures before any production consideration."""
+    with _congress_lock:
+        trades = list(_congress["trades"].values())
+    spy = get_deep_bars(BENCH)
+    rets, today = [], dt.date.today()
+    for t in trades:
+        if t["side"] != "buy" or not t.get("discDate"):
+            continue
+        d0 = dt.date.fromisoformat(t["discDate"])
+        if (today - d0).days < 95:
+            continue                       # holding window not matured
+        bars = get_deep_bars(t["ticker"]) if (t["ticker"] in _deep or
+                                              os.path.exists(_deep_path(t["ticker"])) or
+                                              t["ticker"] in BAR_UNIVERSE) else None
+        if not bars or not spy:
+            continue
+        d90 = (d0 + dt.timedelta(days=90)).isoformat()
+        p0, p1 = _px_from(bars, t["discDate"]), _px_from(bars, d90)
+        s0, s1 = _px_from(spy, t["discDate"]), _px_from(spy, d90)
+        if p0 and p1 and s0 and s1:
+            rets.append((p1 / p0 - s1 / s0) * 100)
+    n = len(rets)
+    out = {"design": "buy at disclosure close, 90d hold, excess vs SPY — the only entry a follower can actually get",
+           "n": n, "gate": "n≥40, Wilson CI excl. 50%, mean>0; then OOS split on new disclosures"}
+    if n == 0:
+        out["status"] = "no matured observations yet — needs BUY disclosures ≥95 days old with price history (store started 2026-07-03)"
+        return out
+    mean = sum(rets) / n
+    wins = sum(1 for r in rets if r > 0)
+    lo, hi = _wilson(wins / n, n)
+    out.update({"meanExcess90dPct": round(mean, 2), "hitRate": round(100 * wins / n),
+                "hitRateCI95": [round(lo * 100), round(hi * 100)]})
+    if n < 40:
+        out["status"] = "INSUFFICIENT SAMPLE (n=%d of 40) — descriptive only" % n
+    elif lo <= 0.5 <= hi:
+        out["status"] = "gate FAILED so far: hit-rate CI includes 50%% (n=%d) — no detectable post-disclosure edge" % n
+    else:
+        out["status"] = ("gate stage 1 passed (n=%d) — requires pre-registered OOS confirmation on NEW "
+                         "disclosures before any production discussion" % n)
+    return out
+
+
+def government_view():
+    cg = cache_get("congress", 900) or _cache_and_return("congress", congress_view)
+    reg = cache_get("fedreg", 6 * 3600) or _cache_and_return("fedreg", fetch_fedreg)
+    bills = cache_get("bills", 6 * 3600) or _cache_and_return("bills", fetch_bills)
+    cal = political_calendar()
+    heat = {h["sector"]: h for h in cg.get("heat", [])}
+    bill_secs = {}
+    for b in bills.get("items", []):
+        for s in (b.get("sectors") or "").split("/"):
+            if s.startswith("XL"):
+                bill_secs[s] = bill_secs.get(s, 0) + 1
+    # sector exposure: curated structural ratings + live activity counts
+    exposure = []
+    for s, name in SECTORS:
+        e = SECTOR_GOV_EXPOSURE.get(s, {})
+        h = heat.get(s, {})
+        exposure.append({"sector": s, "name": name,
+                         "scores": {k: e.get(k, 0) for k, _l in _EXPO_DIMS},
+                         "why": e.get("why", ""),
+                         "live": {"regDocs90d": h.get("regDocs", 0),
+                                  "cgBuys90d": h.get("buys90d", 0), "cgSells90d": h.get("sells90d", 0),
+                                  "activeBills": bill_secs.get(s, 0)}})
+    exposure.sort(key=lambda x: -sum(x["scores"].values()))
+    # catalyst dashboard: everything dated, one list, filter client-side
+    catalysts = []
+    for it in cal.get("items", []):
+        pri = "High" if it["kind"] in ("Fed",) else "Medium" if it["kind"] in ("Congress", "Economic") else "Low"
+        catalysts.append({"date": it["date"], "title": it["event"], "kind": it["kind"],
+                          "sectors": it.get("sectors", ""), "priority": pri, "source": it["source"],
+                          "confidence": "scheduled (official)" if it["kind"] in ("Fed", "Treasury") else "keyword-mapped"})
+    for it in (reg.get("items") or []):
+        if it.get("significance") == "rule":
+            catalysts.append({"date": it["date"], "title": "%s: %s" % (it["agency"], it["title"]),
+                              "kind": "Regulatory", "sectors": it.get("sectors", ""),
+                              "priority": "Medium", "source": "Federal Register (official)",
+                              "confidence": "agency→sector mapping (curated)",
+                              "policyArea": it.get("policyArea"), "url": it.get("url")})
+    for c in (cg.get("conviction") or [])[:6]:
+        if c["grade"] in ("High", "Very High"):
+            catalysts.append({"date": dt.date.today().isoformat(),
+                              "title": "Congressional cluster buying: %s (%s)" % (c["ticker"], ", ".join(c["why"][:2])),
+                              "kind": "Congress-trades", "sectors": c.get("sector") or "—",
+                              "priority": "Low", "source": "FMP disclosures (delayed filings)",
+                              "confidence": "context only — delayed, unvalidated"})
+    catalysts.sort(key=lambda x: x["date"], reverse=True)
+    # knowledge-graph lite: entity links for the most-disclosed tickers
+    sec_agencies = {}
+    for slug, (nm, secs) in AGENCY_SECTOR.items():
+        for s in secs.split("/"):
+            sec_agencies.setdefault(s, []).append(nm)
+    counts, members = {}, {}
+    with _congress_lock:
+        trs = list(_congress["trades"].values())
+    for t in trs:
+        counts[t["ticker"]] = counts.get(t["ticker"], 0) + 1
+        members.setdefault(t["ticker"], {})
+        members[t["ticker"]][t["member"]] = members[t["ticker"]].get(t["member"], 0) + 1
+    graph = {}
+    for tk in sorted(counts, key=counts.get, reverse=True)[:40]:
+        sec = CONGRESS_SECTOR_MAP.get(tk)
+        mem = sorted(members[tk], key=members[tk].get, reverse=True)
+        graph[tk] = {"sector": sec, "trades": counts[tk],
+                     "members": [{"member": m, "n": members[tk][m]} for m in mem[:6]],
+                     "agencies": sec_agencies.get(sec, []),
+                     "bills": [{"bill": b["bill"], "title": b["title"][:90], "url": b.get("url")}
+                               for b in bills.get("items", []) if sec and sec in (b.get("sectors") or "")][:4],
+                     "note": "committee memberships, contracts and investigations have no free machine-readable "
+                             "source — links shown are sector-level, not company-verified"}
+    # research pipeline: same rules as every other model
+    with _congress_lock:
+        heat_days = len(_congress.get("heatHistory", {}))
+    pipeline = [
+        {"id": "EXP-13", "hypothesis": "Buying at congressional BUY disclosure (90d hold) beats SPY",
+         "stage": "pre-registered, accumulating", "study": _gov_follow_study()},
+        {"id": "GOV-02", "hypothesis": "Sector-level congressional net buying (90d) predicts sector-relative forward returns",
+         "stage": "data-gated", "status": "needs ≥26 weekly heat observations — have %d daily snapshots (started 2026-07-04)" % heat_days},
+        {"id": "GOV-03", "hypothesis": "Federal Register rule-count spikes per sector precede sector vol/underperformance",
+         "stage": "data-gated", "status": "reg-doc history accumulates with the heat snapshots — same gate"},
+    ]
+    return {"disclaimer": CONGRESS_DISCLAIMER, "policy": GOV_PIPELINE_NOTE,
+            "exposure": exposure,
+            "exposureNote": "0–3 structural ratings are curated analyst judgments (hover 'why'); LIVE columns are "
+                            "measured counts. Rates sensitivity has independent measured support in the factor library.",
+            "bills": bills, "catalysts": catalysts[:80], "graph": graph, "pipeline": pipeline,
+            "generatedAt": time.time()}
+
+
 _congress_seen = set()
 
 
@@ -4306,6 +4556,20 @@ def congress_loop():
                 _congress["sourceStatus"] = err or "not configured"
                 fresh = []
         if new is not None:
+            # daily sector-heat snapshot — the raw series GOV-02/GOV-03 need to
+            # ever get tested (no history = permanently untestable)
+            today = dt.date.today().isoformat()
+            cutoff = (dt.date.today() - dt.timedelta(days=90)).isoformat()
+            snap = {}
+            with _congress_lock:
+                for t in _congress["trades"].values():
+                    sec = t.get("sector")
+                    if sec and t["txnDate"] >= cutoff and t["side"] in ("buy", "sell"):
+                        snap.setdefault(sec, {"b": 0, "s": 0})["b" if t["side"] == "buy" else "s"] += 1
+                hh = _congress.setdefault("heatHistory", {})
+                hh[today] = snap
+                for k in sorted(hh)[:-750] if len(hh) > 750 else []:
+                    del hh[k]
             _congress_save()
             # top disclosed tickers get price history so performance is computable
             counts = {}
@@ -4559,6 +4823,10 @@ def _seed_mock_from_bars(sym):
                         "o": base, "h": base, "l": base, "v": 10_000_000}
 
 
+def _demo_mode():
+    return FORCE_SYNTH or not API_KEYS.get("polygon")
+
+
 def live_loop():
     provider = active_provider()
     fn = QUOTE_FNS[provider]
@@ -4570,6 +4838,12 @@ def live_loop():
                 q = fn(sym, sym)
                 src = provider
             except Exception:
+                # Real-data mode: a failed quote (rate limit, outage) must go
+                # stale, not get replaced by a random walk — mock prices seeded
+                # from stale levels were painting fake wicks onto real charts
+                # and could trip alerts. Mock fallback is demo-mode only.
+                if not _demo_mode():
+                    continue
                 _seed_mock_from_bars(sym)
                 q = quote_mock(sym, sym)
                 src = "mock"
@@ -5148,6 +5422,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("congress", 900) or _cache_and_return("congress", congress_view))
         elif path == "/api/congress_reg":
             self._json(cache_get("congress_reg", 3600) or _cache_and_return("congress_reg", congress_reg_view))
+        elif path == "/api/government":
+            self._json(cache_get("government", 900) or _cache_and_return("government", government_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
