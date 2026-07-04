@@ -101,9 +101,19 @@ SECTOR_NAME = dict(SECTORS)
 WATCHLIST = [s.strip().upper() for s in os.environ.get(
     "SCREENER_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD,JPM,NFLX").split(",") if s.strip()]
 
-# Everything we keep historical bars for.
+# Macro/context proxies (all liquid ETFs, so free-tier bars work). Used for the
+# correlation columns, the macro-tailwind score category, and equal-weight RS.
+# RSP = equal-weight S&P (breadth), TLT = long Treasuries (rates, inverted),
+# UUP = dollar, USO = crude, GLD = gold, CPER = copper, VIXY = VIX-futures proxy.
+MACRO_PROXIES = [
+    ("RSP", "Equal-weight S&P 500"), ("TLT", "20y+ Treasuries (rates ↓)"),
+    ("UUP", "US Dollar"), ("USO", "Crude Oil"), ("GLD", "Gold"),
+    ("CPER", "Copper"), ("VIXY", "VIX futures (proxy)"),
+]
+
+# Everything we keep historical bars for (sectors first so the UI warms fastest).
 BAR_UNIVERSE = []
-for _s in [BENCH, "QQQ", "IWM"] + [s for s, _ in SECTORS] + WATCHLIST:
+for _s in [BENCH, "QQQ", "IWM"] + [s for s, _ in SECTORS] + WATCHLIST + [s for s, _ in MACRO_PROXIES]:
     if _s not in BAR_UNIVERSE:
         BAR_UNIVERSE.append(_s)
 
@@ -413,6 +423,59 @@ def atr(bars, n=14):
     return a
 
 
+def adx(bars, n=14):
+    """Wilder ADX — trend quality (>25 trending, <20 chop)."""
+    if len(bars) < 2 * n + 2:
+        return None
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(bars)):
+        up = bars[i]["h"] - bars[i - 1]["h"]
+        dn = bars[i - 1]["l"] - bars[i]["l"]
+        plus_dm.append(up if (up > dn and up > 0) else 0.0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+        trs.append(max(bars[i]["h"] - bars[i]["l"], abs(bars[i]["h"] - bars[i - 1]["c"]),
+                       abs(bars[i]["l"] - bars[i - 1]["c"])))
+    atr_s, pdm, mdm = sum(trs[:n]), sum(plus_dm[:n]), sum(minus_dm[:n])
+    dxs = []
+    for i in range(n, len(trs)):
+        atr_s = atr_s - atr_s / n + trs[i]
+        pdm = pdm - pdm / n + plus_dm[i]
+        mdm = mdm - mdm / n + minus_dm[i]
+        pdi = 100 * pdm / atr_s if atr_s else 0.0
+        mdi = 100 * mdm / atr_s if atr_s else 0.0
+        dxs.append(100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0)
+    if len(dxs) < n:
+        return None
+    a = sum(dxs[:n]) / n
+    for d in dxs[n:]:
+        a = (a * (n - 1) + d) / n
+    return a
+
+
+def correlation(c1, c2, n=63):
+    """Pearson correlation of daily returns over the last n days."""
+    m = min(len(c1), len(c2), n + 1)
+    if m < 21:
+        return None
+    r1 = [c1[-i] / c1[-i - 1] - 1 for i in range(1, m) if c1[-i - 1]]
+    r2 = [c2[-i] / c2[-i - 1] - 1 for i in range(1, m) if c2[-i - 1]]
+    m = min(len(r1), len(r2))
+    r1, r2 = r1[:m], r2[:m]
+    mu1, mu2 = sum(r1) / m, sum(r2) / m
+    cov = sum((a - mu1) * (b - mu2) for a, b in zip(r1, r2)) / m
+    s1 = (sum((a - mu1) ** 2 for a in r1) / m) ** 0.5
+    s2 = (sum((b - mu2) ** 2 for b in r2) / m) ** 0.5
+    return cov / (s1 * s2) if s1 > 0 and s2 > 0 else None
+
+
+def updown_volume(bars, n=20):
+    """Up-day volume / down-day volume over n days — crude accumulation gauge."""
+    seg = bars[-n:]
+    upv = sum(b.get("v", 0) for b in seg if b["c"] >= b["o"])
+    dnv = sum(b.get("v", 0) for b in seg if b["c"] < b["o"])
+    return (upv / dnv) if dnv > 0 else None
+
+
 def macd_hist(closes):
     """Return (hist_now, hist_prev) for MACD(12,26,9)."""
     if len(closes) < 35:
@@ -641,6 +704,13 @@ def rotation():
         a, b = pct_return(closes, n), pct_return(spc, n)
         return round(a - b, 2) if (a is not None and b is not None) else None
 
+    # reference series for equal-weight RS and the correlation columns
+    refs = {}
+    for rsym in ("RSP", "QQQ", "TLT", "VIXY"):
+        rb = get_bars(rsym)
+        if rb:
+            refs[rsym] = [b["c"] for b in rb]
+
     for sym, name in SECTORS:
         bars = get_bars(sym)
         if not bars:
@@ -662,14 +732,29 @@ def rotation():
         vols = [b.get("v", 0) for b in bars]
         v20 = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else None
         rel_vol = round(vols[-1] / v20, 2) if v20 else None
+        # equal-weight RS (vs RSP), trend quality (ADX), correlations, options read
+        rs_ew = None
+        if "RSP" in refs:
+            a, b2 = pct_return(c, 63), pct_return(refs["RSP"], 63)
+            rs_ew = round(a - b2, 2) if (a is not None and b2 is not None) else None
+        ax = adx(bars, 14)
+        corrs = {r: correlation(c, refs[r], 63) for r in refs}
+        cspy = correlation(c, spc, 63)
+        opt = get_options(sym) or {}
         out["sectors"].append({
             "symbol": sym, "name": name, "price": round(c[-1], 2),
             "chg1d": round(pct_return(c, 1) or 0, 2), "rs1w": r1w, "rs1m": r1m, "rs3m": r3m,
-            "rs6m": r6m, "rs1y": r1y,
+            "rs6m": r6m, "rs1y": r1y, "rsEW3m": rs_ew,
             "rsRatio": round(ratio, 2), "rsMom": round(mom, 2), "quadrant": quad,
             "trend": "up" if (s50 and c[-1] > s50) else "down",
             "above20": bool(s20 and c[-1] > s20), "above50": bool(s50 and c[-1] > s50),
             "above200": bool(s200 and c[-1] > s200), "volAdj": vol_adj, "relVol": rel_vol,
+            "adx": round(ax, 1) if ax is not None else None,
+            "corrSPY": round(cspy, 2) if cspy is not None else None,
+            "corrQQQ": round(corrs["QQQ"], 2) if corrs.get("QQQ") is not None else None,
+            "corrTLT": round(corrs["TLT"], 2) if corrs.get("TLT") is not None else None,
+            "corrVIX": round(corrs["VIXY"], 2) if corrs.get("VIXY") is not None else None,
+            "pcrOI": opt.get("pcrOI"), "netGEX": opt.get("netGEX"),
         })
     ranked = [s for s in out["sectors"] if s.get("rs3m") is not None]
     ranked.sort(key=lambda s: s["rs3m"], reverse=True)
@@ -706,6 +791,410 @@ def rotation():
             "ewMinusSpy1m": round(sum(rs1ms) / len(rs1ms), 2) if rs1ms else None,
         }
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market Intelligence Engine — one explainable 0-100 score per sector, blending
+# eight independent evidence categories. Weights are configurable (env
+# QUANTA_SCORE_WEIGHTS as JSON, or ?weights=trend:0.2,rs:0.3 on /api/scores);
+# categories with no data (e.g. options before the chain feed loads) are
+# EXCLUDED and the rest renormalized — never silently defaulted. Every category
+# returns a `detail` string with the numbers behind it, and confidence reflects
+# both data coverage and cross-category agreement. News/ETF-flow categories are
+# intentionally absent: no reliable per-sector source on the free tier.
+# ─────────────────────────────────────────────────────────────────────────────
+SCORE_WEIGHTS = {"trend": 0.16, "rs": 0.18, "momentum": 0.12, "volume": 0.08,
+                 "volatility": 0.08, "breadth": 0.10, "options": 0.12, "macro": 0.16}
+try:
+    SCORE_WEIGHTS.update({k: float(v) for k, v in
+                          json.loads(os.environ.get("QUANTA_SCORE_WEIGHTS", "{}")).items()
+                          if k in SCORE_WEIGHTS})
+except (ValueError, AttributeError):
+    pass
+
+# How each macro proxy's 1-month trend maps onto sectors (directional context,
+# blended with the *measured* 63-day correlation — the correlation carries the
+# sign if the two disagree).
+MACRO_INFLUENCE = {
+    "TLT": {"helps": ["XLU", "XLRE", "XLP", "XLK"], "hurts": ["XLF"],
+            "note": "TLT up = yields down: helps rate-sensitive Utilities/REITs/Staples and long-duration Tech; compresses bank margins (XLF)."},
+    "UUP": {"helps": [], "hurts": ["XLB", "XLE", "XLI"],
+            "note": "Strong dollar pressures commodities and multinational earnings (Materials, Energy, Industrials)."},
+    "USO": {"helps": ["XLE"], "hurts": ["XLY", "XLI"],
+            "note": "Crude up lifts Energy; taxes the consumer (XLY) and transport-heavy Industrials."},
+    "GLD": {"helps": ["XLB"], "hurts": [],
+            "note": "Gold up often signals falling real yields / risk hedging; mild Materials tailwind."},
+    "CPER": {"helps": ["XLB", "XLI"], "hurts": [],
+             "note": "Copper up = global growth impulse: Materials and Industrials lead."},
+    "VIXY": {"helps": ["XLP", "XLU", "XLV"], "hurts": ["XLK", "XLY", "XLF"],
+             "note": "Vol regime rising favors defensives (Staples/Utilities/Health) over high-beta cyclicals."},
+}
+
+
+def _pct_rank(vals, v):
+    """Percentile rank of v within vals (0..1)."""
+    vs = [x for x in vals if x is not None]
+    if v is None or not vs:
+        return None
+    return sum(1 for x in vs if x <= v) / len(vs)
+
+
+def _cat(score, detail):
+    return {"score": round(clamp(score), 1), "detail": detail}
+
+
+def _bar_categories(bars, spy_closes, rs_rank, atr_rank):
+    """The five categories derivable from bars alone (also used for history)."""
+    c = [b["c"] for b in bars]
+    close = c[-1]
+    s20, s50, s200 = sma(c, 20), sma(c, 50), sma(c, 200)
+    s20p = sma(c[:-5], 20) if len(c) > 30 else None
+    ax = adx(bars, 14)
+    t = 0.0
+    t += 15 if (s20 and close > s20) else 0
+    t += 15 if (s50 and close > s50) else 0
+    t += 20 if (s200 and close > s200) else 0
+    t += 10 if (s50 and s200 and s50 > s200) else 0
+    t += 10 if (s20p and s20 and s20 > s20p) else 0
+    t += min(30.0, ax or 0)
+    trend = _cat(t, "px %s SMA20/50/200: %s%s%s · SMA50%sSMA200 · ADX %.0f"
+                 % (">" if (s20 and close > s20) else "≤",
+                    "✓" if (s20 and close > s20) else "✗",
+                    "✓" if (s50 and close > s50) else "✗",
+                    "✓" if (s200 and close > s200) else "✗",
+                    ">" if (s50 and s200 and s50 > s200) else "≤", ax or 0))
+    rs = _cat((rs_rank or 0.5) * 100,
+              "RS blend rank %.0f%% of sectors (0.5·1m + 0.3·3m + 0.2·6m vs SPY)" % ((rs_rank or 0.5) * 100))
+    r14 = rsi(c, 14)
+    hist_now, hist_prev = macd_hist(c)
+    roc21 = pct_return(c, 21)
+    m = 50.0
+    m += clamp((r14 or 50) - 50, -25, 25)
+    if hist_now is not None and hist_prev is not None:
+        m += 15 if hist_now > hist_prev else -15
+        m += 5 if hist_now > 0 else -5
+    m += clamp((roc21 or 0) * 1.5, -10, 10)
+    momentum = _cat(m, "RSI14 %.0f · MACD hist %s%s · 21d ROC %+.1f%%"
+                    % (r14 or 0, "rising" if (hist_now or 0) > (hist_prev or 0) else "falling",
+                       " >0" if (hist_now or 0) > 0 else " <0", roc21 or 0))
+    ud = updown_volume(bars, 20)
+    v = 50.0 if ud is None else clamp(50 + (ud - 1) * 40)
+    volume = _cat(v, "up/down volume 20d = %s (accumulation >1)" % ("n/a" if ud is None else "%.2f" % ud))
+    av = atr(bars, 14)
+    atrp = (av / close * 100) if (av and close) else None
+    rets = [c[i] / c[i - 1] - 1 for i in range(max(1, len(c) - 63), len(c))]
+    vol_ann = _stdev(rets) * (252 ** 0.5)
+    va = ((pct_return(c, 63) or 0) / 100 / vol_ann) if vol_ann else 0
+    vscore = clamp(50 + va * 18 - ((atr_rank if atr_rank is not None else 0.5) - 0.5) * 40)
+    volatility = _cat(vscore, "σ-adj 3m ret %.2f · ATR%% %s (rank %.0f%% — calmer scores higher)"
+                      % (va, "%.2f%%" % atrp if atrp else "n/a",
+                         (atr_rank if atr_rank is not None else 0.5) * 100))
+    return {"trend": trend, "rs": rs, "momentum": momentum, "volume": volume, "volatility": volatility}
+
+
+def _options_category(sym):
+    o = get_options(sym)
+    if not o or o.get("error") or not o.get("pcrOI"):
+        return None
+    s, why = 50.0, []
+    pcr = o["pcrOI"]
+    d = clamp((0.9 - pcr) * 40, -18, 18)
+    s += d
+    why.append("P/C OI %.2f (%+.0f)" % (pcr, d))
+    if o.get("netGEX") is not None:
+        s += 8 if o["netGEX"] > 0 else -8
+        why.append("net GEX %+.0fM$ (%s)" % (o["netGEX"], "stabilizing" if o["netGEX"] > 0 else "destabilizing"))
+    if o.get("skew25d") is not None and o["skew25d"] > 6:
+        s -= 7
+        why.append("steep 25Δ skew %.1f (-7)" % o["skew25d"])
+    if o.get("oiChangePct") is not None:
+        d = clamp(o["oiChangePct"] * 2, -6, 6)
+        s += d
+        why.append("OI %+0.1f%% d/d (%+.0f)" % (o["oiChangePct"], d))
+    return _cat(s, " · ".join(why))
+
+
+def _macro_category(sym):
+    drivers = []
+    total = 0.0
+    used = 0
+    sec_bars = get_bars(sym)
+    if not sec_bars:
+        return None
+    sc = [b["c"] for b in sec_bars]
+    for proxy, infl in MACRO_INFLUENCE.items():
+        pb = get_bars(proxy)
+        if not pb:
+            continue
+        pc = [b["c"] for b in pb]
+        r1m = pct_return(pc, 21)
+        if r1m is None:
+            continue
+        corr = correlation(sc, pc, 63)
+        if corr is None:
+            continue
+        # measured correlation × proxy trend = tailwind/headwind, nudged by the
+        # domain map when it agrees in direction
+        base = corr * clamp(r1m, -8, 8)
+        if sym in infl["helps"] and r1m > 0:
+            base += 0.5
+        if sym in infl["hurts"] and r1m > 0:
+            base -= 0.5
+        total += base
+        used += 1
+        if abs(base) >= 0.4:
+            drivers.append("%s %+.1f%%×ρ%+.2f" % (proxy, r1m, corr))
+    if used < 3:
+        return None
+    drivers.sort(key=lambda s: -abs(float(s.split("×ρ")[0].split()[-1].rstrip("%"))))
+    return _cat(50 + clamp(total * 6, -35, 35),
+                "tailwind Σ(ρ×1m trend) over %d proxies: %s" % (used, "; ".join(drivers[:3]) or "flat"))
+
+
+def sector_scores(weights_qs=None):
+    w = dict(SCORE_WEIGHTS)
+    if weights_qs:
+        try:
+            for pair in weights_qs.split(","):
+                k, v = pair.split(":")
+                if k.strip() in w:
+                    w[k.strip()] = float(v)
+        except ValueError:
+            pass
+    rot = cache_get("sectors", 120) or _cache_and_return("sectors", rotation)
+    rotmap = {s["symbol"]: s for s in rot.get("sectors", []) if not s.get("warming")}
+    breadth = rot.get("breadth") or {}
+    out = {"warm": warm_status(), "weights": w, "sectors": [],
+           "notes": ["options category: CBOE delayed chains, naive +call/−put GEX convention",
+                     "news & ETF-flow categories intentionally excluded — no reliable free per-sector source",
+                     "history sparkline uses the five bar-derived categories only"]}
+    # pass 1: raw cross-sectional values for ranking
+    raw = {}
+    for sym, name in SECTORS:
+        bars = get_bars(sym)
+        r = rotmap.get(sym)
+        if not bars or len(bars) < 210 or not r:
+            continue
+        blend = None
+        if r.get("rs1m") is not None and r.get("rs3m") is not None:
+            blend = 0.5 * r["rs1m"] + 0.3 * r["rs3m"] + 0.2 * (r.get("rs6m") or 0)
+        av = atr(bars, 14)
+        raw[sym] = {"bars": bars, "name": name, "rot": r, "blend": blend,
+                    "atrp": (av / bars[-1]["c"] * 100) if av else None}
+    blends = [v["blend"] for v in raw.values()]
+    atrps = [v["atrp"] for v in raw.values()]
+    spyc = _tf_closes(BENCH, "daily")
+    b_base = None
+    if breadth.get("n"):
+        n = breadth["n"]
+        b_base = 100 * (0.3 * breadth["above20"] / n + 0.4 * breadth["above50"] / n + 0.3 * breadth["above200"] / n)
+    for sym, v in raw.items():
+        cats = _bar_categories(v["bars"], spyc, _pct_rank(blends, v["blend"]), _pct_rank(atrps, v["atrp"]))
+        if b_base is not None:
+            adj = {"Leading": 10, "Improving": 5, "Weakening": -5, "Lagging": -10}.get(v["rot"].get("quadrant"), 0)
+            cats["breadth"] = _cat(b_base + adj, "market: %d/%d>50d %d/%d>200d (base %.0f) · %s %+d"
+                                   % (breadth["above50"], breadth["n"], breadth["above200"], breadth["n"],
+                                      b_base, v["rot"].get("quadrant"), adj))
+        oc = _options_category(sym)
+        if oc:
+            cats["options"] = oc
+        mc = _macro_category(sym)
+        if mc:
+            cats["macro"] = mc
+        avail_w = sum(w[k] for k in cats)
+        contribs = {k: {"score": cats[k]["score"], "weight": w[k],
+                        "contrib": round(w[k] / avail_w * cats[k]["score"], 1),
+                        "detail": cats[k]["detail"]} for k in cats}
+        total = round(sum(c["contrib"] for c in contribs.values()), 1)
+        bull = round(sum(w[k] / avail_w * max(0.0, cats[k]["score"] - 50) * 2 for k in cats), 1)
+        bear = round(sum(w[k] / avail_w * max(0.0, 50 - cats[k]["score"]) * 2 for k in cats), 1)
+        scores_only = [cats[k]["score"] for k in cats]
+        agree = 1 - min(1.0, _stdev(scores_only) / 35) if len(scores_only) > 1 else 0.5
+        conf = round(100 * avail_w / sum(w.values()) * (0.5 + 0.5 * agree), 1)
+        # risk (separate, higher = riskier): realized vol rank, drawdown, IV rank
+        c = [b["c"] for b in v["bars"]]
+        hi90 = max(c[-90:])
+        dd = (hi90 - c[-1]) / hi90 * 100 if hi90 else 0
+        o = get_options(sym) or {}
+        ivr = o.get("ivRank")
+        risk = clamp(45 * (_pct_rank(atrps, v["atrp"]) or 0.5) + min(30.0, dd * 2)
+                     + (0.25 * ivr if ivr is not None else 0)
+                     + (10 if v["rot"].get("quadrant") == "Lagging" else 0))
+        out["sectors"].append({
+            "symbol": sym, "name": v["name"], "price": round(c[-1], 2),
+            "total": total, "bull": bull, "bear": bear, "confidence": conf,
+            "risk": round(risk, 1),
+            "riskDetail": "ATR rank %.0f%% · 90d drawdown %.1f%% · IV rank %s · %s"
+                          % ((_pct_rank(atrps, v["atrp"]) or 0.5) * 100, dd,
+                             ("%.0f" % ivr) if ivr is not None else "n/a", v["rot"].get("quadrant")),
+            "quadrant": v["rot"].get("quadrant"),
+            "categories": contribs,
+            "history": _score_history(v["bars"], blends, atrps, v["blend"], v["atrp"]),
+        })
+    out["sectors"].sort(key=lambda s: -s["total"])
+    return out
+
+
+def _score_history(bars, blends, atrps, blend, atrp, points=13, step=5):
+    """Weekly composite of the five bar-based categories over ~a quarter.
+    Cross-sectional ranks are frozen at today's values — a simplification, noted
+    in the UI; recomputing full cross-sections per snapshot isn't worth the cost."""
+    hist = []
+    rs_r, atr_r = _pct_rank(blends, blend), _pct_rank(atrps, atrp)
+    wsub = {k: SCORE_WEIGHTS[k] for k in ("trend", "rs", "momentum", "volume", "volatility")}
+    tw = sum(wsub.values())
+    for k in range(points - 1, -1, -1):
+        sub = bars[:len(bars) - k * step]
+        if len(sub) < 210:
+            hist.append(None)
+            continue
+        cats = _bar_categories(sub, None, rs_r, atr_r)
+        hist.append(round(sum(wsub[c] / tw * cats[c]["score"] for c in wsub), 1))
+    return hist
+
+
+def macro_view():
+    """Macro proxies with measured trends + the sector-influence context notes."""
+    rows = []
+    for proxy, pname in MACRO_PROXIES:
+        b = get_bars(proxy)
+        infl = MACRO_INFLUENCE.get(proxy, {})
+        if not b:
+            rows.append({"symbol": proxy, "name": pname, "warming": True, "note": infl.get("note", "")})
+            continue
+        c = [x["c"] for x in b]
+        rows.append({"symbol": proxy, "name": pname, "price": round(c[-1], 2),
+                     "r1w": round(pct_return(c, 5) or 0, 2), "r1m": round(pct_return(c, 21) or 0, 2),
+                     "r3m": round(pct_return(c, 63) or 0, 2),
+                     "above50": bool(sma(c, 50) and c[-1] > sma(c, 50)),
+                     "helps": infl.get("helps", []), "hurts": infl.get("hurts", []),
+                     "note": infl.get("note", "")})
+    # crude regime read: defensives-vs-cyclicals RS spread + vol trend
+    rot = cache_get("sectors", 120) or _cache_and_return("sectors", rotation)
+    rotmap = {s["symbol"]: s for s in rot.get("sectors", []) if not s.get("warming")}
+    regime = None
+    defs = [rotmap[s]["rs1m"] for s in ("XLP", "XLU", "XLV") if s in rotmap and rotmap[s].get("rs1m") is not None]
+    cycs = [rotmap[s]["rs1m"] for s in ("XLK", "XLY", "XLF", "XLI") if s in rotmap and rotmap[s].get("rs1m") is not None]
+    if defs and cycs:
+        spread = sum(cycs) / len(cycs) - sum(defs) / len(defs)
+        vix = next((r for r in rows if r["symbol"] == "VIXY" and not r.get("warming")), None)
+        regime = {"cycMinusDef1m": round(spread, 2),
+                  "read": ("risk-on: cyclicals leading defensives by %.1f%% (1m RS)" % spread) if spread > 0.5
+                          else ("risk-off: defensives leading by %.1f%%" % -spread) if spread < -0.5
+                          else "neutral: no clear cyclical/defensive leadership",
+                  "volTrend": (vix or {}).get("r1m")}
+    return {"proxies": rows, "regime": regime, "warm": warm_status(),
+            "note": "All macro series are liquid-ETF proxies (free-tier honest): no direct 2Y/10Y/30Y or spot-VIX history. Treasury auctions not available on free feeds."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market summary — synthesizes scores + rotation + breadth + options + macro
+# into prose where EVERY sentence carries its numbers. Deterministic rule-based
+# generator by default; if ANTHROPIC_API_KEY is set, the same data bundle is
+# sent to Claude with strict grounding instructions (falls back on any error).
+# ─────────────────────────────────────────────────────────────────────────────
+def _summary_bundle():
+    sc = cache_get("scores", 120) or _cache_and_return("scores", sector_scores)
+    rot = cache_get("sectors", 120) or _cache_and_return("sectors", rotation)
+    mac = macro_view()
+    opts = {s: {k: (get_options(s) or {}).get(k) for k in
+                ("pcrOI", "netGEX", "ivRank", "expMovePct", "skew25d")}
+            for s in OPTIONS_UNIVERSE if get_options(s) and not (get_options(s) or {}).get("error")}
+    return sc, rot, mac, opts
+
+
+def _rule_based_summary(sc, rot, mac, opts):
+    secs = sc.get("sectors") or []
+    if len(secs) < 6:
+        return {"text": "Not enough sector data yet — bars are still warming.", "engine": "rules"}
+    lines = []
+    top, bot = secs[:3], secs[-3:]
+    lines.append("STRENGTH — %s lead the composite: %s. Weakest: %s."
+                 % (", ".join(s["symbol"] for s in top),
+                    "; ".join("%s %s (bull %s/bear %s, conf %s%%)" %
+                              (s["symbol"], s["total"], s["bull"], s["bear"], s["confidence"]) for s in top),
+                    "; ".join("%s %s" % (s["symbol"], s["total"]) for s in bot)))
+    b = rot.get("breadth") or {}
+    if b.get("n"):
+        ew = b.get("ewMinusSpy1m")
+        lines.append("BREADTH — %d/%d sectors above the 50-day, %d/%d above the 200-day; "
+                     "equal-weight minus SPY over 1m is %+.2f%%, so leadership is %s."
+                     % (b["above50"], b["n"], b["above200"], b["n"], ew or 0,
+                        "broadening" if (ew or 0) >= 0 else "narrowing"))
+    conf_opts, conflict = [], []
+    for s in secs[:4] + secs[-2:]:
+        o = opts.get(s["symbol"])
+        if not o or o.get("pcrOI") is None:
+            continue
+        bullish_px = s["total"] >= 55
+        bullish_opt = o["pcrOI"] < 0.95
+        (conf_opts if bullish_px == bullish_opt else conflict).append(
+            "%s (score %s vs P/C OI %.2f, GEX %+.0fM$)" % (s["symbol"], s["total"], o["pcrOI"], o.get("netGEX") or 0))
+    if conf_opts or conflict:
+        lines.append("OPTIONS — positioning agrees with price for %s%s."
+                     % (", ".join(conf_opts) or "none",
+                        ("; conflicts: " + ", ".join(conflict)) if conflict else ""))
+    else:
+        lines.append("OPTIONS — chain data not loaded yet (CBOE delayed feed warms within ~1 min of start).")
+    reg = (mac or {}).get("regime")
+    if reg:
+        drivers = [r for r in mac["proxies"] if not r.get("warming") and abs(r.get("r1m") or 0) >= 2]
+        lines.append("MACRO — %s. Notable 1m proxy moves: %s."
+                     % (reg["read"], "; ".join("%s %+.1f%%" % (r["symbol"], r["r1m"]) for r in drivers[:4]) or "none ≥2%"))
+    risks = []
+    if (b.get("ewMinusSpy1m") or 0) < -1:
+        risks.append("narrow leadership (EW−SPY %.1f%%)" % b["ewMinusSpy1m"])
+    vix = next((r for r in (mac or {}).get("proxies", []) if r["symbol"] == "VIXY" and not r.get("warming")), None)
+    if vix and (vix.get("r1m") or 0) > 5:
+        risks.append("vol regime rising (VIXY +%.1f%% 1m)" % vix["r1m"])
+    hi_risk = [s for s in secs[:3] if s.get("risk", 0) >= 60]
+    if hi_risk:
+        risks.append("leaders carry elevated risk scores (%s)" %
+                     ", ".join("%s %s" % (s["symbol"], s["risk"]) for s in hi_risk))
+    negg = [s for s in OPTIONS_UNIVERSE if opts.get(s, {}).get("netGEX") is not None and opts[s]["netGEX"] < 0]
+    if negg:
+        risks.append("negative net GEX (dealer-hedging amplification, naive convention) in " + ", ".join(negg[:4]))
+    lines.append("RISKS — " + ("; ".join(risks) if risks else
+                               "no acute flags from breadth, vol regime, or options positioning right now") + ".")
+    return {"text": "\n\n".join(lines), "engine": "rules",
+            "disclaimer": "Deterministic synthesis of the numbers shown elsewhere in this dashboard; not advice."}
+
+
+def _claude_summary(sc, rot, mac, opts):
+    key = _key("anthropic")
+    if not key:
+        return None
+    compact = {"scores": [{k: s[k] for k in ("symbol", "total", "bull", "bear", "confidence", "risk", "quadrant")}
+                          for s in sc.get("sectors", [])],
+               "breadth": rot.get("breadth"), "regime": (mac or {}).get("regime"),
+               "macro": [{k: p.get(k) for k in ("symbol", "r1m", "r3m", "note")}
+                         for p in (mac or {}).get("proxies", []) if not p.get("warming")],
+               "options": opts}
+    body = json.dumps({
+        "model": "claude-sonnet-4-6", "max_tokens": 900,
+        "system": "You are a sell-side market strategist. Write a concise sector-rotation brief from the JSON. "
+                  "HARD RULES: every claim must cite specific numbers from the data; never invent data; if a field "
+                  "is null/missing say it is unavailable; sections: STRENGTH, BREADTH, OPTIONS, MACRO, RISKS; "
+                  "plain text, no markdown headers beyond the section words.",
+        "messages": [{"role": "user", "content": json.dumps(compact)}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body,
+                                 headers={"Content-Type": "application/json", "x-api-key": key,
+                                          "anthropic-version": "2023-06-01"})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        d = json.loads(resp.read().decode())
+    return {"text": d["content"][0]["text"], "engine": "claude",
+            "disclaimer": "AI synthesis of dashboard data (grounding-checked prompt); not advice."}
+
+
+def market_summary():
+    sc, rot, mac, opts = _summary_bundle()
+    try:
+        ai = _claude_summary(sc, rot, mac, opts)
+        if ai:
+            return ai
+    except Exception as e:
+        print("warn: claude summary failed (%s) — using rule-based" % e)
+    return _rule_based_summary(sc, rot, mac, opts)
 
 
 # Out-of-sample validated stats for the RSI(2) mean-reversion edge (from research.py
@@ -778,8 +1267,20 @@ def chart_data(symbol, tf="daily", n=120):
 
     # pivots within the shown window (x = index in show)
     pv = [{"x": i - offset, "price": round(p, 2), "type": t} for (i, p, t) in pivots if i >= offset]
+    # anchored VWAP from the last confirmed swing pivot (the institutional
+    # "who's underwater since the turn" line); falls back to window start
+    anchor = pivots[-1][0] if pivots else offset
+    avwap = [None] * len(show)
+    cpv = cv = 0.0
+    for i in range(anchor, len(bars)):
+        b = bars[i]
+        cpv += (b["h"] + b["l"] + b["c"]) / 3 * b.get("v", 0)
+        cv += b.get("v", 0)
+        if i >= offset and cv:
+            avwap[i - offset] = round(cpv / cv, 2)
     return {"symbol": symbol, "tf": tf, "ok": a.get("ok", False), "setup": a,
             "bars": show, "sma20": sma_series(20), "sma50": sma_series(50), "pivots": pv,
+            "avwap": avwap,
             "source": _bars_meta.get(symbol, {}).get("source", "?")}
 
 
@@ -949,6 +1450,234 @@ def futures_chart(sym, nsess=2):
             "newSession": new_session, "ema9": e9[-tail:], "ema20": e20[-tail:],
             "orh": st.get("orh"), "orl": st.get("orl"),
             "priorHigh": st.get("priorHigh"), "priorLow": st.get("priorLow"), "state": st}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Options intelligence — CBOE delayed chains (keyless, ~15-min delayed).
+# The feed provides per-contract greeks (delta/gamma/vega/theta), IV, OI and
+# volume, so everything below is CALCULATED from quoted data, never estimated:
+#   GEX / DEX / vega exposure, call & put walls, gamma flip (strike-profile
+#   approximation), max pain, put/call ratios, expected move (ATM straddle),
+#   ATM IV + 25Δ skew + term structure, volume/OI, unusual activity.
+# GEX sign uses the standard naive dealer convention (+calls / −puts) — actual
+# dealer inventory is NOT observable; the UI says so. IV rank/percentile and
+# OI change need history, so daily snapshots accumulate in options_history.json
+# and those metrics switch on once enough days exist. NOT derivable from this
+# feed (shown as unavailable): vanna, charm, true dealer positioning, block
+# trades, ETF flows.
+# ─────────────────────────────────────────────────────────────────────────────
+OPTIONS_UNIVERSE = [s for s, _ in SECTORS] + [BENCH]
+OPTIONS_UNAVAILABLE = ["vanna", "charm", "true dealer positioning (GEX shown with naive +call/−put convention)",
+                       "block trades", "ETF fund flows"]
+_options_lock, _options = threading.Lock(), {}
+OPT_HISTORY_DAYS_MIN = 20
+
+
+def _parse_occ(code):
+    """OCC code like XLK260918C00149000 -> (expiry_date, 'C'|'P', strike)."""
+    strike = int(code[-8:]) / 1000.0
+    cp = code[-9]
+    d = code[-15:-9]
+    exp = dt.date(2000 + int(d[:2]), int(d[2:4]), int(d[4:6]))
+    return exp, cp, strike
+
+
+def fetch_options_summary(symbol):
+    raw = http_get_json("https://cdn.cboe.com/api/global/delayed_quotes/options/%s.json"
+                        % urllib.parse.quote(symbol), timeout=25)
+    data = raw.get("data") or {}
+    spot = data.get("current_price") or data.get("close")
+    chain = data.get("options") or []
+    if not spot or not chain:
+        raise ValueError("empty chain for %s" % symbol)
+    today = dt.date.today()
+    con = []
+    for o in chain:
+        try:
+            exp, cp, strike = _parse_occ(o["option"])
+        except (KeyError, ValueError, IndexError):
+            continue
+        dte = (exp - today).days
+        if dte < 0 or dte > 90:
+            continue
+        con.append({"exp": exp, "dte": dte, "cp": cp, "k": strike,
+                    "oi": o.get("open_interest") or 0, "vol": o.get("volume") or 0,
+                    "iv": o.get("iv") or 0, "delta": o.get("delta") or 0,
+                    "gamma": o.get("gamma") or 0, "vega": o.get("vega") or 0,
+                    "bid": o.get("bid") or 0, "ask": o.get("ask") or 0})
+    if not con:
+        raise ValueError("no <=90d contracts for %s" % symbol)
+
+    # exposures (per 1% move for GEX; naive dealer sign: +calls / −puts)
+    gex = dex = vega_exp = 0.0
+    call_oi = put_oi = call_vol = put_vol = 0.0
+    by_strike = {}
+    for c in con:
+        g = c["gamma"] * c["oi"] * 100 * spot * spot * 0.01
+        gex += g if c["cp"] == "C" else -g
+        dex += c["delta"] * c["oi"] * 100 * spot
+        vega_exp += c["vega"] * c["oi"] * 100
+        s = by_strike.setdefault(c["k"], {"gex": 0.0, "coi": 0, "poi": 0})
+        s["gex"] += g if c["cp"] == "C" else -g
+        if c["cp"] == "C":
+            call_oi += c["oi"]; call_vol += c["vol"]; s["coi"] += c["oi"]
+        else:
+            put_oi += c["oi"]; put_vol += c["vol"]; s["poi"] += c["oi"]
+
+    # gamma flip: zero crossing of cumulative net GEX across strikes (approx.)
+    ks = sorted(by_strike)
+    flip = None
+    cum = 0.0
+    prev_k, prev_cum = None, None
+    total_neg = sum(v["gex"] for v in by_strike.values() if v["gex"] < 0)
+    for k in ks:
+        cum += by_strike[k]["gex"]
+        if prev_cum is not None and prev_cum < 0 <= cum:
+            flip = prev_k + (k - prev_k) * (-prev_cum) / (cum - prev_cum)
+        prev_k, prev_cum = k, cum
+    if total_neg == 0:
+        flip = None   # all-positive profile: no flip below — leave unset
+
+    near = [k for k in ks if 0.8 * spot <= k <= 1.2 * spot]
+    call_wall = max(near, key=lambda k: by_strike[k]["coi"], default=None)
+    put_wall = max(near, key=lambda k: by_strike[k]["poi"], default=None)
+
+    # front expiry (nearest with >=1 DTE): max pain, expected move, ATM IV, skew
+    front = min((c["exp"] for c in con if c["dte"] >= 1), default=None)
+    fcon = [c for c in con if c["exp"] == front]
+    max_pain = exp_move = atm_iv = skew = None
+    fdte = None
+    if fcon:
+        fdte = fcon[0]["dte"]
+        fks = sorted(set(c["k"] for c in fcon))
+        def payout(kx):
+            tot = 0.0
+            for c in fcon:
+                if c["cp"] == "C" and kx > c["k"]:
+                    tot += (kx - c["k"]) * c["oi"]
+                elif c["cp"] == "P" and kx < c["k"]:
+                    tot += (c["k"] - kx) * c["oi"]
+            return tot
+        max_pain = min(fks, key=payout) if fks else None
+        atm_k = min(fks, key=lambda k: abs(k - spot)) if fks else None
+        if atm_k is not None:
+            ac = next((c for c in fcon if c["k"] == atm_k and c["cp"] == "C"), None)
+            ap = next((c for c in fcon if c["k"] == atm_k and c["cp"] == "P"), None)
+            if ac and ap:
+                mid = lambda c: (c["bid"] + c["ask"]) / 2 if (c["bid"] and c["ask"]) else 0
+                straddle = mid(ac) + mid(ap)
+                exp_move = round(straddle / spot * 100, 2) if straddle else None
+                ivs = [c["iv"] for c in (ac, ap) if c["iv"]]
+                atm_iv = round(sum(ivs) / len(ivs) * 100, 1) if ivs else None
+        p25 = min((c for c in fcon if c["cp"] == "P" and c["iv"]),
+                  key=lambda c: abs(c["delta"] + 0.25), default=None)
+        c25 = min((c for c in fcon if c["cp"] == "C" and c["iv"]),
+                  key=lambda c: abs(c["delta"] - 0.25), default=None)
+        if p25 and c25 and abs(p25["delta"] + 0.25) < 0.12 and abs(c25["delta"] - 0.25) < 0.12:
+            skew = round((p25["iv"] - c25["iv"]) * 100, 1)
+
+    # term structure: ATM IV of the first 6 expiries
+    term = []
+    for e in sorted(set(c["exp"] for c in con))[:6]:
+        ec = [c for c in con if c["exp"] == e and c["iv"]]
+        if not ec:
+            continue
+        kk = min(set(c["k"] for c in ec), key=lambda k: abs(k - spot))
+        ivs = [c["iv"] for c in ec if c["k"] == kk]
+        term.append({"exp": e.isoformat(), "dte": (e - today).days,
+                     "atmIV": round(sum(ivs) / len(ivs) * 100, 1)})
+
+    unusual = sorted([c for c in con if c["vol"] >= 300 and c["vol"] >= 2 * max(c["oi"], 1)],
+                     key=lambda c: c["vol"], reverse=True)[:5]
+
+    return {
+        "symbol": symbol, "spot": spot, "updated": time.time(), "source": "cboe-delayed",
+        "iv30": data.get("iv30"), "contracts": len(con), "windowDays": 90,
+        "netGEX": round(gex / 1e6, 1), "netDEX": round(dex / 1e6, 1),          # $M
+        "vegaExp": round(vega_exp / 1e6, 2),                                    # $M per IV pt
+        "gammaFlip": round(flip, 2) if flip else None,
+        "callWall": call_wall, "putWall": put_wall, "maxPain": max_pain,
+        "pcrOI": round(put_oi / call_oi, 2) if call_oi else None,
+        "pcrVol": round(put_vol / call_vol, 2) if call_vol else None,
+        "totalOI": int(call_oi + put_oi), "totalVol": int(call_vol + put_vol),
+        "volOverOI": round((call_vol + put_vol) / (call_oi + put_oi), 3) if (call_oi + put_oi) else None,
+        "expMovePct": exp_move, "expMoveDTE": fdte, "atmIV": atm_iv, "skew25d": skew,
+        "term": term,
+        "unusual": [{"cp": c["cp"], "k": c["k"], "exp": c["exp"].isoformat(),
+                     "vol": int(c["vol"]), "oi": int(c["oi"]),
+                     "iv": round(c["iv"] * 100, 1) if c["iv"] else None} for c in unusual],
+        "profile": [{"k": k, "gex": round(by_strike[k]["gex"] / 1e6, 2),
+                     "coi": int(by_strike[k]["coi"]), "poi": int(by_strike[k]["poi"])}
+                    for k in near],
+        "unavailable": OPTIONS_UNAVAILABLE,
+    }
+
+
+# ── daily history (IV rank / OI change switch on as snapshots accumulate) ────
+OPT_HIST_PATH = os.path.join(os.environ.get("QUANTA_DATA", "") or
+                             os.path.dirname(os.path.abspath(__file__)), "options_history.json")
+_opt_hist_lock = threading.Lock()
+
+
+def _opt_history_update(summ):
+    day = dt.date.today().isoformat()
+    try:
+        with _opt_hist_lock:
+            try:
+                with open(OPT_HIST_PATH) as f:
+                    hist = json.load(f)
+            except (FileNotFoundError, ValueError):
+                hist = {}
+            h = hist.setdefault(summ["symbol"], {})
+            h[day] = {"iv30": summ.get("iv30"), "oi": summ.get("totalOI"), "pcr": summ.get("pcrOI")}
+            for d in sorted(h)[:-260]:      # keep ~1yr
+                del h[d]
+            with open(OPT_HIST_PATH + ".tmp", "w") as f:
+                json.dump(hist, f)
+            os.replace(OPT_HIST_PATH + ".tmp", OPT_HIST_PATH)
+    except OSError:
+        return {}
+    return hist.get(summ["symbol"], {})
+
+
+def _opt_enrich_from_history(summ, h):
+    days = sorted(h)
+    ivs = [h[d]["iv30"] for d in days if h[d].get("iv30")]
+    summ["ivHistDays"] = len(ivs)
+    if len(ivs) >= OPT_HISTORY_DAYS_MIN and summ.get("iv30"):
+        lo, hi = min(ivs), max(ivs)
+        summ["ivRank"] = round((summ["iv30"] - lo) / (hi - lo) * 100, 1) if hi > lo else 50.0
+        summ["ivPctile"] = round(100 * sum(1 for v in ivs if v <= summ["iv30"]) / len(ivs), 1)
+    else:
+        summ["ivRank"] = summ["ivPctile"] = None   # needs >=20 daily snapshots
+    prev = [d for d in days if d < dt.date.today().isoformat()]
+    if prev and h[prev[-1]].get("oi") and summ.get("totalOI"):
+        summ["oiChange"] = summ["totalOI"] - h[prev[-1]]["oi"]
+        summ["oiChangePct"] = round((summ["totalOI"] / h[prev[-1]]["oi"] - 1) * 100, 1)
+    else:
+        summ["oiChange"] = summ["oiChangePct"] = None
+    return summ
+
+
+def get_options(symbol):
+    with _options_lock:
+        return _options.get(symbol)
+
+
+def options_loop():
+    while True:
+        for sym in OPTIONS_UNIVERSE:
+            try:
+                summ = fetch_options_summary(sym)
+                summ = _opt_enrich_from_history(summ, _opt_history_update(summ))
+                with _options_lock:
+                    _options[sym] = summ
+            except Exception as e:
+                with _options_lock:
+                    if sym not in _options:
+                        _options[sym] = {"symbol": sym, "error": str(e), "source": "cboe-delayed"}
+            time.sleep(3)
+        time.sleep(900)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1295,7 +2024,52 @@ def positions_view():
     for c in closed:
         by_sym.setdefault(c["symbol"], 0.0)
         by_sym[c["symbol"]] += c.get("pl") or 0
-    return {"open": rows, "closed": closed[::-1],
+
+    # risk analytics from 63d daily returns (positions without bar history are
+    # excluded and said so — no guessing betas)
+    def _rets(sym, n=63):
+        b = get_bars(sym)
+        if not b or len(b) < n + 1:
+            return None
+        cc = [x["c"] for x in b][-(n + 1):]
+        return [cc[i] / cc[i - 1] - 1 for i in range(1, len(cc))]
+
+    def _cov(a, b):
+        m = min(len(a), len(b))
+        a, b = a[-m:], b[-m:]
+        ma, mb = sum(a) / m, sum(b) / m
+        return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / m
+
+    analytics = {"beta": None, "expDailyVolPct": None, "avgPairCorr": None, "excluded": []}
+    spy_r = _rets(BENCH)
+    held = []
+    for r_ in rows:
+        if not (r_.get("last") and tot_val):
+            continue
+        rr = _rets(r_["symbol"])
+        if rr is None:
+            analytics["excluded"].append(r_["symbol"])
+            continue
+        w_ = r_["last"] * (r_.get("qty") or 1) / tot_val * (1 if r_["dir"] == "long" else -1)
+        held.append((r_["symbol"], w_, rr))
+    if held and spy_r:
+        var_spy = _cov(spy_r, spy_r)
+        if var_spy > 0:
+            analytics["beta"] = round(sum(w * _cov(rr, spy_r) / var_spy for _s, w, rr in held), 2)
+        pvar = sum(w1 * w2 * _cov(r1, r2) for _s1, w1, r1 in held for _s2, w2, r2 in held)
+        if pvar >= 0:
+            analytics["expDailyVolPct"] = round((pvar ** 0.5) * 100, 2)
+        if len(held) > 1:
+            cs = []
+            for i in range(len(held)):
+                for j in range(i + 1, len(held)):
+                    v1, v2 = _cov(held[i][2], held[i][2]), _cov(held[j][2], held[j][2])
+                    if v1 > 0 and v2 > 0:
+                        cs.append(_cov(held[i][2], held[j][2]) / (v1 ** 0.5 * v2 ** 0.5))
+            if cs:
+                analytics["avgPairCorr"] = round(sum(cs) / len(cs), 2)
+    analytics["note"] = "63d daily returns; weights = share of gross exposure (shorts negative)"
+    return {"open": rows, "closed": closed[::-1], "analytics": analytics,
             "totalValue": round(tot_val, 2), "openPL": round(tot_pl, 2),
             "realizedPL": round(sum(by_sym.values()), 2),
             "realizedBySymbol": [{"symbol": k, "pl": round(v, 2)} for k, v in
@@ -1544,6 +2318,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"alerts": items, "priceAlerts": pending, "serverTime": time.time()})
         elif path == "/api/portfolio":
             self._json(positions_view())
+        elif path == "/api/scores":
+            wq = qs.get("weights", [None])[0]
+            if wq:
+                self._json(sector_scores(wq))       # custom weights: never cached
+            else:
+                self._json(cache_get("scores", 120) or _cache_and_return("scores", sector_scores))
+        elif path == "/api/options":
+            sym = (qs.get("symbol", [BENCH])[0]).upper()
+            self._json(get_options(sym) or {"symbol": sym, "error": "options not loaded yet (feed warms ~3s/symbol)",
+                                            "unavailable": OPTIONS_UNAVAILABLE})
+        elif path == "/api/options_all":
+            with _options_lock:
+                self._json({"options": {k: {kk: v.get(kk) for kk in
+                                            ("spot", "netGEX", "netDEX", "pcrOI", "pcrVol", "iv30", "ivRank",
+                                             "expMovePct", "gammaFlip", "callWall", "putWall", "maxPain",
+                                             "oiChangePct", "error", "updated")}
+                                        for k, v in _options.items()}})
+        elif path == "/api/macro":
+            self._json(cache_get("macro", 300) or _cache_and_return("macro", macro_view))
+        elif path == "/api/summary":
+            self._json(cache_get("summary", 600) or _cache_and_return("summary", market_summary))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -1604,7 +2399,8 @@ def main():
     print("  state    : %s (%d open positions, %d price alerts)" % (STATE_PATH, n_pos, n_pa))
     print("  alerts   : signals · setups · position stop/target · price levels (checked ~30s)")
     print("  open     : http://localhost:%d/" % PORT)
-    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop):
+    print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
+    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop):
         threading.Thread(target=fn, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:

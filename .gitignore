@@ -43,3 +43,4 @@ dist/
 # Quanta runtime state (positions/price alerts) — user data, never commit
 standalone/data/
 quanta_state.json
+options_history.json

@@ -76,11 +76,16 @@
   .pbar{position:relative;background:var(--panelAlt);border:1px solid var(--border);border-radius:4px;height:12px;width:110px;overflow:hidden;}
   .pbar>span{position:absolute;left:0;top:0;bottom:0;}
   .live-tag{font-size:10px;color:var(--up);letter-spacing:.08em;animation:pulse 2s infinite;}
+  .scrollx{overflow-x:auto;}
+  .sbar{display:inline-block;vertical-align:middle;background:var(--panelAlt);border:1px solid var(--border);border-radius:3px;height:10px;width:64px;position:relative;overflow:hidden;margin-right:6px;}
+  .sbar>span{position:absolute;left:0;top:0;bottom:0;}
+  .cat-row{display:grid;grid-template-columns:92px 70px 1fr;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--border);font-size:12px;}
+  kbd{background:var(--panelAlt);border:1px solid var(--border);border-radius:3px;padding:0 5px;font-size:10px;}
 </style>
 </head>
 <body>
 <header>
-  <div><span class="brand">QUANTA</span><span class="sub">SWING COMPANION · sector rotation · 50% retracement entries</span></div>
+  <div><span class="brand">QUANTA</span><span class="sub">SWING COMPANION · sector intelligence · rotation · options · <kbd>1</kbd>–<kbd>0</kbd> tabs · <kbd>/</kbd> chart</span></div>
   <div style="display:flex;align-items:center">
     <div class="status" id="status">connecting…</div>
     <button id="al-bell" title="Alerts">🔔<span id="al-count" class="al-count al-hide"></span></button>
@@ -104,8 +109,10 @@
   <div id="al-feed"><div class="loading">No alerts yet — they fire on RSI(2) triggers, setups going Ready, and near your stops/targets.</div></div>
 </div>
 <nav id="nav">
-  <button data-tab="signals" class="active">Signals</button>
+  <button data-tab="intel" class="active">Intel</button>
+  <button data-tab="signals">Signals</button>
   <button data-tab="rotation">Rotation</button>
+  <button data-tab="options">Options</button>
   <button data-tab="entries">Entries</button>
   <button data-tab="portfolio">Portfolio</button>
   <button data-tab="chart">Chart</button>
@@ -116,8 +123,22 @@
 </nav>
 <div id="countdown" class="cd-bar cd-hidden"></div>
 <main>
+  <!-- INTEL (market intelligence engine — the synthesis view) -->
+  <section class="tab active" id="tab-intel">
+    <div class="card" id="intel-summary" style="font-size:13px;white-space:pre-line">Loading market summary…</div>
+    <div class="card"><h2>Sector intelligence scores <span class="muted" style="text-transform:none;letter-spacing:0" id="intel-weights"></span></h2>
+      <div class="scrollx" id="intel-table"><div class="loading">Scoring sectors…</div></div>
+      <div class="note">Composite of up to 8 evidence categories (trend, relative strength, momentum, volume,
+        volatility, breadth, options positioning, macro tailwind). Categories without data are <b>excluded and the
+        rest renormalized</b> — never guessed. <b>Conf</b> = data coverage × cross-category agreement.
+        <b>Risk</b> is separate (higher = riskier), so a strong-but-extended sector shows both. Click a row for the
+        full per-category breakdown with the numbers behind every score. Spark = 13-week score history
+        (bar-based categories only). News/ETF-flow categories are intentionally absent: no reliable free per-sector source.</div></div>
+    <div class="card" id="intel-detail" style="display:none"></div>
+  </section>
+
   <!-- SIGNALS (RSI2 mean-reversion — the out-of-sample validated edge) -->
-  <section class="tab active" id="tab-signals">
+  <section class="tab" id="tab-signals">
     <div id="sig-edge" class="card" style="font-size:13px">Loading signals…</div>
     <div class="card"><h2>RSI(2) mean-reversion signals — sector ETFs</h2>
       <div id="sig-table"></div>
@@ -138,6 +159,28 @@
         <div class="note">X = 3-month relative strength · Y = 1-month relative momentum. Money flows
           counter-clockwise: Improving → Leading → Weakening → Lagging.</div></div>
       <div class="card"><h2>Sector strength ranking</h2><div id="rot-table"></div></div>
+    </div>
+  </section>
+
+  <!-- OPTIONS -->
+  <section class="tab" id="tab-options">
+    <div class="card" style="font-size:13px">
+      <span class="badge b-appr">CBOE DELAYED</span> &nbsp;Per-contract greeks/IV/OI from CBOE's free delayed feed
+      (~15 min lag, expiries ≤ 90d). GEX/DEX use the <b>naive dealer convention (+calls / −puts)</b> — true dealer
+      inventory is not observable. <b class="amber">Not derivable from this feed (never estimated):</b>
+      vanna, charm, true dealer positioning, block trades, ETF flows. IV rank and OI change activate automatically
+      once ≥ 20 daily snapshots accumulate.
+    </div>
+    <div class="card">
+      <div class="ctl"><span class="seg" id="opt-sel"></span><span id="opt-meta" class="muted" style="font-size:12px"></span></div>
+      <div class="grid" id="opt-cards" style="grid-template-columns:repeat(2,1fr)"></div>
+      <div id="opt-profile"></div>
+      <div class="note">Bars = net GEX by strike ($M, green +/red −); amber line = spot; C/P = call & put walls
+        (max OI strike within ±20% of spot); MP = front-expiry max pain.</div>
+    </div>
+    <div class="cols cols2">
+      <div class="card"><h2>Term structure (ATM IV by expiry)</h2><div id="opt-term"></div></div>
+      <div class="card"><h2>Unusual activity (vol ≥ 2× OI, ≥300)</h2><div id="opt-unusual"></div></div>
     </div>
   </section>
 
@@ -216,6 +259,7 @@
     <h2>Macro Overview</h2>
     <div class="grid" id="tiles"></div>
     <table><thead><tr id="mk-head"></tr></thead><tbody id="mk-body"></tbody></table>
+    <div class="card" id="macro-insight" style="margin-top:16px"><div class="loading">Loading macro insight…</div></div>
   </section>
 
   <!-- NEWS -->
@@ -264,13 +308,15 @@ document.querySelectorAll("#nav button").forEach(b=>b.onclick=()=>{
   b.classList.add("active"); document.getElementById("tab-"+b.dataset.tab).classList.add("active"); activate(b.dataset.tab);
 });
 function activate(t){
+  if(t==="intel")loadIntel();
   if(t==="signals")loadSignals();
   if(t==="rotation")loadRotation();
+  if(t==="options")loadOptions();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
   if(t==="portfolio")loadPortfolio();
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
   if(t==="futures"){loadFutures();}
-  if(t==="markets"&&!loaded.markets){loadQuotes();loaded.markets=true;}
+  if(t==="markets"){if(!loaded.markets){loadQuotes();loaded.markets=true;}loadMacro();}
   if(t==="news"&&!loaded.news){loadNews();loaded.news=true;}
   if(t==="calendar"){ if(!loaded.calendar){loadCalendarData();loaded.calendar=true;} else renderCalendar(); }
 }
@@ -369,16 +415,31 @@ const ROT_COLS=[
   {k:"rs3m",l:"RS 3m",r:o=>`<span class="mono ${dir(o.rs3m)}">${pct(o.rs3m)}</span>`},
   {k:"rs6m",l:"RS 6m",r:o=>`<span class="mono ${dir(o.rs6m)}">${pct(o.rs6m)}</span>`},
   {k:"rs1y",l:"RS 1y",r:o=>`<span class="mono ${dir(o.rs1y)}">${pct(o.rs1y)}</span>`},
+  {k:"rsEW3m",l:"vs EW 3m",r:o=>`<span class="mono ${dir(o.rsEW3m)}" title="vs equal-weight S&P (RSP)">${pct(o.rsEW3m)}</span>`},
   {k:"above50",l:">20/50/200",r:o=>`<span class="mono" title="above the 20 / 50 / 200-day SMA">
     <span class="${o.above20?'up':'muted'}">●</span><span class="${o.above50?'up':'muted'}">●</span><span class="${o.above200?'up':'muted'}">●</span></span>`},
+  {k:"adx",l:"ADX",r:o=>`<span class="mono ${o.adx==null?'muted':o.adx>=25?'up':o.adx<20?'muted':'amber'}" title="trend quality: >25 trending, <20 chop">${o.adx==null?'—':o.adx.toFixed(0)}</span>`},
   {k:"volAdj",l:"σ-adj 3m",r:o=>`<span class="mono ${dir(o.volAdj)}" title="3-month return / annualized volatility (Sharpe-ish)">${o.volAdj==null?'—':o.volAdj.toFixed(2)}</span>`},
   {k:"relVol",l:"RelVol",r:o=>`<span class="mono ${o.relVol!=null&&o.relVol>1.5?'amber':'muted'}" title="last bar volume vs 20-day average">${o.relVol==null?'—':o.relVol.toFixed(2)+'×'}</span>`},
+  {k:"corrSPY",l:"ρSPY",r:o=>`<span class="mono muted" title="63d daily-return correlation">${o.corrSPY==null?'—':o.corrSPY.toFixed(2)}</span>`},
+  {k:"corrQQQ",l:"ρQQQ",r:o=>`<span class="mono muted">${o.corrQQQ==null?'—':o.corrQQQ.toFixed(2)}</span>`},
+  {k:"corrTLT",l:"ρTLT",r:o=>`<span class="mono muted" title="TLT = long Treasuries (yields inverted)">${o.corrTLT==null?'—':o.corrTLT.toFixed(2)}</span>`},
+  {k:"corrVIX",l:"ρVIX",r:o=>`<span class="mono muted" title="VIXY proxy">${o.corrVIX==null?'—':o.corrVIX.toFixed(2)}</span>`},
+  {k:"pcrOI",l:"P/C",r:o=>`<span class="mono ${o.pcrOI==null?'muted':o.pcrOI<0.9?'up':o.pcrOI>1.2?'down':'muted'}" title="put/call open-interest ratio (CBOE, ≤90d)${o.netGEX!=null?' · net GEX '+(o.netGEX>0?'+':'')+o.netGEX+'M$':''}">${o.pcrOI==null?'—':o.pcrOI.toFixed(2)}</span>`},
   {k:"quadrant",l:"Quadrant",r:o=>`<span class="q-${o.quadrant}">${o.quadrant}</span>`},
 ];
+let _rot=[],rotSort={k:"rs3m",d:-1};
 function renderRotTable(secs){
-  const head="<thead><tr>"+ROT_COLS.map(c=>`<th>${c.l}</th>`).join("")+"</tr></thead>";
-  const body="<tbody>"+secs.map(o=>`<tr class="clk" onclick="openChart('${o.symbol}')">`+ROT_COLS.map(c=>`<td>${c.r(o)}</td>`).join("")+"</tr>").join("")+"</tbody>";
-  document.getElementById("rot-table").innerHTML="<table>"+head+body+"</table>";
+  if(secs)_rot=secs;
+  const rows=[..._rot].sort((a,b)=>{let x=a[rotSort.k],y=b[rotSort.k];
+    if(x==null)return 1;if(y==null)return -1;
+    return (typeof x==="string")?String(x).localeCompare(y)*rotSort.d:((x||0)-(y||0))*rotSort.d;});
+  const head="<thead><tr>"+ROT_COLS.map(c=>`<th data-k="${c.k}">${c.l}${rotSort.k===c.k?(rotSort.d>0?" ▲":" ▼"):""}</th>`).join("")+"</tr></thead>";
+  const body="<tbody>"+rows.map(o=>`<tr class="clk" onclick="openChart('${o.symbol}')">`+ROT_COLS.map(c=>`<td>${c.r(o)}</td>`).join("")+"</tr>").join("")+"</tbody>";
+  const el=document.getElementById("rot-table");
+  el.innerHTML='<div class="scrollx"><table>'+head+body+"</table></div>";
+  el.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;
+    if(rotSort.k===k)rotSort.d*=-1;else{rotSort.k=k;rotSort.d=(k==="symbol"||k==="name"||k==="quadrant")?1:-1;}renderRotTable();});
 }
 
 // ── ENTRIES ──
@@ -504,7 +565,7 @@ function drawChart(d,livePx){
     g+=`<rect x="${(x-bw/2).toFixed(1)}" y="${y0.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${col}"/>`;});
   // SMA polylines
   const poly=(arr,col)=>{let pts=arr.map((v,i)=>v==null?null:`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean).join(" ");return pts?`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.2" opacity=".9"/>`:"";};
-  g+=poly(d.sma20,"#3b82f6"); g+=poly(d.sma50,"#a855f7");
+  g+=poly(d.sma20,"#3b82f6"); g+=poly(d.sma50,"#a855f7"); g+=poly(d.avwap,"#2dd4bf");
   // ZigZag pivots + connecting line (the detected swing structure)
   const pv=d.pivots||[];
   if(pv.length){
@@ -512,7 +573,7 @@ function drawChart(d,livePx){
     g+=`<polyline points="${pts}" fill="none" stroke="#8893a3" stroke-width="1" opacity=".55"/>`;
     pv.forEach(p=>{const col=p.type==='H'?"var(--down)":"var(--up)";g+=`<circle cx="${X(p.x).toFixed(1)}" cy="${Y(p.price).toFixed(1)}" r="3" fill="${col}"/>`;});
   }
-  g+=`<text x="${padL+2}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+54}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text><text x="${padL+106}" y="${H-6}" fill="#8893a3" font-size="10">ZigZag swings</text>`;
+  g+=`<text x="${padL+2}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+54}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text><text x="${padL+106}" y="${H-6}" fill="#2dd4bf" font-size="10">AVWAP (last pivot)</text><text x="${padL+214}" y="${H-6}" fill="#8893a3" font-size="10">ZigZag swings</text>`;
   // live price tag on the right axis
   if(livePx!=null&&livePx>=lo&&livePx<=hi){
     const y=Y(livePx);
@@ -709,6 +770,170 @@ function tickCountdown(){
 }
 setInterval(tickCountdown,1000);
 
+// ── INTEL (scoring engine + market summary) ──
+let _intel=[],intelSort={k:"total",d:-1},intelSel=null;
+const scoreCol=v=>v>=60?'var(--up)':v>=45?'var(--amber)':'var(--down)';
+const sbar=(v,col)=>`<span class="sbar"><span style="width:${Math.max(0,Math.min(100,v))}%;background:${col||scoreCol(v)}"></span></span>`;
+function spark(hist){
+  const h=(hist||[]).filter(x=>x!=null);
+  if(h.length<2)return'<span class="muted">—</span>';
+  const w=90,ht=22,lo=Math.min(...h),hi=Math.max(...h),span=Math.max(hi-lo,1e-6);
+  const pts=h.map((v,i)=>`${(i/(h.length-1)*w).toFixed(1)},${(ht-2-(v-lo)/span*(ht-4)).toFixed(1)}`).join(" ");
+  const up=h[h.length-1]>=h[0];
+  return `<svg width="${w}" height="${ht}" style="vertical-align:middle"><polyline points="${pts}" fill="none" stroke="${up?'var(--up)':'var(--down)'}" stroke-width="1.3"/></svg>`;
+}
+const INTEL_COLS=[
+  {k:"symbol",l:"Sector",r:o=>`<b>${o.symbol}</b> <span class="muted" style="font-size:11px">${o.name}</span>`},
+  {k:"price",l:"Price",r:o=>`<span class="mono">${fmt(o.price)}</span>`},
+  {k:"total",l:"Score",r:o=>`${sbar(o.total)}<b class="mono" style="color:${scoreCol(o.total)}">${o.total.toFixed(0)}</b>`},
+  {k:"bull",l:"Bull",r:o=>`<span class="mono up">${o.bull.toFixed(0)}</span>`},
+  {k:"bear",l:"Bear",r:o=>`<span class="mono down">${o.bear.toFixed(0)}</span>`},
+  {k:"confidence",l:"Conf",r:o=>`<span class="mono ${o.confidence>=70?'up':o.confidence>=50?'amber':'muted'}">${o.confidence.toFixed(0)}%</span>`},
+  {k:"risk",l:"Risk",r:o=>`<span class="mono ${o.risk>=60?'down':o.risk>=40?'amber':'up'}" title="${o.riskDetail||''}">${o.risk.toFixed(0)}</span>`},
+  {k:"quadrant",l:"Quad",r:o=>`<span class="q-${o.quadrant}">${o.quadrant||'—'}</span>`},
+  {k:"_spark",l:"13w trend",r:o=>spark(o.history)},
+];
+async function loadIntel(){
+  loadSummary();
+  try{
+    const d=await(await fetch(`${API}/api/scores`)).json();
+    _intel=d.sectors||[];
+    const w=d.weights||{};
+    document.getElementById("intel-weights").textContent="· weights: "+Object.entries(w).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(" · ");
+    if(!_intel.length){document.getElementById("intel-table").innerHTML=`<div class="loading">Warming bars ${d.warm?d.warm.have:0}/${d.warm?d.warm.total:'?'}… scores need ~210 daily bars/sector.</div>`;return;}
+    renderIntel();
+    if(intelSel)renderIntelDetail(intelSel);
+  }catch(e){document.getElementById("intel-table").innerHTML='<div class="loading">Scores failed to load.</div>';}
+}
+function renderIntel(){
+  const rows=[..._intel].sort((a,b)=>{let x=a[intelSort.k],y=b[intelSort.k];
+    return (typeof x==="string")?String(x).localeCompare(y)*intelSort.d:((x||0)-(y||0))*intelSort.d;});
+  const head="<thead><tr>"+INTEL_COLS.map(c=>`<th data-k="${c.k}">${c.l}${intelSort.k===c.k?(intelSort.d>0?" ▲":" ▼"):""}</th>`).join("")+"</tr></thead>";
+  const body="<tbody>"+rows.map(o=>`<tr class="clk" onclick="renderIntelDetail('${o.symbol}')">`+INTEL_COLS.map(c=>`<td>${c.r(o)}</td>`).join("")+"</tr>").join("")+"</tbody>";
+  const el=document.getElementById("intel-table");
+  el.innerHTML="<table>"+head+body+"</table>";
+  el.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;
+    if(intelSort.k===k)intelSort.d*=-1;else{intelSort.k=k;intelSort.d=(k==="symbol")?1:-1;}renderIntel();});
+}
+function renderIntelDetail(sym){
+  intelSel=sym;
+  const o=_intel.find(s=>s.symbol===sym);
+  const el=document.getElementById("intel-detail");
+  if(!o){el.style.display="none";return;}
+  const cats=Object.entries(o.categories||{}).sort((a,b)=>b[1].contrib-a[1].contrib);
+  el.style.display="block";
+  el.innerHTML=`<h2>${o.symbol} — ${o.name} · score ${o.total} (bull ${o.bull} / bear ${o.bear} / conf ${o.confidence}%)
+      <button class="mini" style="float:right" onclick="openChart('${o.symbol}')">chart →</button></h2>`+
+    cats.map(([k,c])=>`<div class="cat-row"><b>${k}</b><span>${sbar(c.score)}<span class="mono">${c.score.toFixed(0)}</span></span>
+      <span class="muted">w ${(c.weight*100).toFixed(0)}% → contrib ${c.contrib} · ${c.detail}</span></div>`).join("")+
+    `<div class="cat-row"><b class="down">risk</b><span>${sbar(o.risk,'var(--down)')}<span class="mono">${o.risk.toFixed(0)}</span></span>
+      <span class="muted">${o.riskDetail||''} (separate from composite)</span></div>`;
+}
+async function loadSummary(){
+  try{
+    const d=await(await fetch(`${API}/api/summary`)).json();
+    document.getElementById("intel-summary").innerHTML=
+      `<span class="badge ${d.engine==='claude'?'b-ready':'b-neu'}">${d.engine==='claude'?'AI (Claude)':'RULE-BASED'} SUMMARY</span>
+       <span class="muted" style="font-size:11px">${d.disclaimer||''}</span>\n\n${d.text||''}`;
+  }catch(e){document.getElementById("intel-summary").textContent="Summary unavailable.";}
+}
+
+// ── OPTIONS ──
+let optSym="SPY",optBuilt=false;
+async function loadOptions(){
+  if(!optBuilt){
+    const syms=["SPY","XLK","XLC","XLY","XLF","XLV","XLI","XLE","XLB","XLP","XLU","XLRE"];
+    document.getElementById("opt-sel").innerHTML=syms.map((s,i)=>`<button data-s="${s}" class="${i===0?'on':''}">${s}</button>`).join("");
+    document.querySelectorAll("#opt-sel button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#opt-sel button").forEach(x=>x.classList.remove("on"));b.classList.add("on");optSym=b.dataset.s;loadOptions();});
+    optBuilt=true;
+  }
+  try{
+    const d=await(await fetch(`${API}/api/options?symbol=${optSym}`)).json();
+    if(d.error){
+      document.getElementById("opt-cards").innerHTML="";
+      document.getElementById("opt-profile").innerHTML=`<div class="loading">${optSym}: ${d.error}</div>`;
+      document.getElementById("opt-term").innerHTML=document.getElementById("opt-unusual").innerHTML="";
+      document.getElementById("opt-meta").textContent="";
+      return;
+    }
+    document.getElementById("opt-meta").textContent=`spot ${fmt(d.spot)} · ${d.contracts} contracts ≤${d.windowDays}d · updated ${ago(d.updated)} · ${d.source}`;
+    const card=(l,v,extra,cls)=>`<div class="tile"><div class="name">${l}</div><div class="price mono ${cls||''}">${v}</div><div class="name">${extra||''}</div></div>`;
+    const M=v=>v==null?'—':(v>0?'+':'')+fmt(v,1)+'M$';
+    document.getElementById("opt-cards").innerHTML=
+      card("Net GEX (per 1%)",M(d.netGEX),d.netGEX!=null?(d.netGEX>0?'stabilizing (naive conv.)':'destabilizing (naive conv.)'):'',d.netGEX>0?'up':'down')+
+      card("Net DEX",M(d.netDEX),"delta × OI × 100 × spot")+
+      card("Gamma flip",d.gammaFlip!=null?fmt(d.gammaFlip):'n/a (net GEX positive at all strikes)',"cum. GEX zero-cross (approx.)")+
+      card("Call / Put wall",`${d.callWall!=null?fmt(d.callWall,0):'—'} / ${d.putWall!=null?fmt(d.putWall,0):'—'}`,"max OI strikes ±20%")+
+      card("Max pain (front)",d.maxPain!=null?fmt(d.maxPain,0):'—',`front expiry ${d.expMoveDTE!=null?d.expMoveDTE+'d':''}`)+
+      card("Expected move",d.expMovePct!=null?'±'+d.expMovePct+'%':'—',"front ATM straddle / spot")+
+      card("P/C ratio",`${d.pcrOI!=null?d.pcrOI.toFixed(2):'—'} OI · ${d.pcrVol!=null?d.pcrVol.toFixed(2):'—'} vol`,"",d.pcrOI!=null?(d.pcrOI<0.9?'up':d.pcrOI>1.2?'down':''):'')+
+      card("Open interest",vol(d.totalOI),d.oiChangePct!=null?`Δ ${d.oiChangePct>0?'+':''}${d.oiChangePct}% d/d`:`Δ needs 2 daily snapshots`)+
+      card("Vol / OI",d.volOverOI!=null?d.volOverOI.toFixed(3):'—',"turnover today")+
+      card("IV30 / ATM IV",`${d.iv30!=null?d.iv30.toFixed(1):'—'} / ${d.atmIV!=null?d.atmIV.toFixed(1):'—'}`,"")+
+      card("IV rank / pctile",d.ivRank!=null?`${d.ivRank} / ${d.ivPctile}`:`needs ≥20 snapshots (have ${d.ivHistDays||0})`,"of accumulated iv30 history")+
+      card("25Δ skew",d.skew25d!=null?d.skew25d.toFixed(1)+' pts':'—',"put IV − call IV (front)")+
+      card("Vega exposure",d.vegaExp!=null?fmt(d.vegaExp,1)+'M$/IVpt':'—',"")+
+      card("Unavailable",(d.unavailable||[]).length+" metrics","vanna/charm/dealer inv./blocks/flows — feed can't derive");
+    drawOptProfile(d);
+    document.getElementById("opt-term").innerHTML=(d.term&&d.term.length)?
+      "<table><thead><tr><th>Expiry</th><th>DTE</th><th>ATM IV</th></tr></thead><tbody>"+
+      d.term.map(t=>`<tr><td class="mono">${t.exp}</td><td class="mono">${t.dte}</td><td class="mono">${t.atmIV}%</td></tr>`).join("")+"</tbody></table>"
+      :'<div class="muted" style="padding:8px">—</div>';
+    document.getElementById("opt-unusual").innerHTML=(d.unusual&&d.unusual.length)?
+      "<table><thead><tr><th>Type</th><th>Strike</th><th>Expiry</th><th>Vol</th><th>OI</th><th>IV</th></tr></thead><tbody>"+
+      d.unusual.map(u=>`<tr><td><span class="badge ${u.cp==='C'?'b-long':'b-short'}">${u.cp==='C'?'CALL':'PUT'}</span></td>
+        <td class="mono">${fmt(u.k,0)}</td><td class="mono">${u.exp}</td><td class="mono amber">${vol(u.vol)}</td>
+        <td class="mono muted">${vol(u.oi)}</td><td class="mono">${u.iv!=null?u.iv+'%':'—'}</td></tr>`).join("")+"</tbody></table>"
+      :'<div class="muted" style="padding:8px">Nothing ≥ 2× OI with ≥300 volume today.</div>';
+  }catch(e){document.getElementById("opt-profile").innerHTML='<div class="loading">Options failed to load.</div>';}
+}
+function drawOptProfile(d){
+  const prof=(d.profile||[]).filter(p=>Math.abs(p.gex)>0.005);
+  if(!prof.length){document.getElementById("opt-profile").innerHTML='<div class="muted" style="padding:8px">No meaningful GEX profile.</div>';return;}
+  const W=960,H=260,padL=8,padR=56,padT=12,padB=20,n=prof.length,iw=(W-padL-padR)/n;
+  let mx=0;prof.forEach(p=>mx=Math.max(mx,Math.abs(p.gex)));mx*=1.1;
+  const Y=v=>padT+(mx-v)/(2*mx)*(H-padT-padB),X=i=>padL+i*iw+iw/2,y0=Y(0);
+  let g=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="background:#0c1219;border:1px solid var(--border);border-radius:6px">`;
+  g+=`<line x1="${padL}" y1="${y0}" x2="${W-padR}" y2="${y0}" stroke="#2a3645"/>`;
+  g+=`<text x="${W-padR+4}" y="${padT+8}" fill="var(--muted)" font-size="9">+${mx.toFixed(0)}M$</text><text x="${W-padR+4}" y="${H-padB}" fill="var(--muted)" font-size="9">−${mx.toFixed(0)}M$</text>`;
+  prof.forEach((p,i)=>{const y=Y(p.gex),up=p.gex>=0;
+    g+=`<rect x="${(X(i)-Math.max(1,iw*0.4)/2).toFixed(1)}" y="${Math.min(y,y0).toFixed(1)}" width="${Math.max(1,iw*0.4).toFixed(1)}" height="${Math.max(0.5,Math.abs(y-y0)).toFixed(1)}" fill="${up?'var(--up)':'var(--down)'}" opacity=".85"><title>${p.k}: GEX ${p.gex}M$ · call OI ${p.coi} · put OI ${p.poi}</title></rect>`;});
+  const mark=(k,lbl,col)=>{if(k==null)return"";const i=prof.findIndex(p=>p.k>=k);if(i<0)return"";
+    return `<line x1="${X(i).toFixed(1)}" y1="${padT}" x2="${X(i).toFixed(1)}" y2="${H-padB}" stroke="${col}" stroke-dasharray="3 3"/><text x="${(X(i)+3).toFixed(1)}" y="${padT+9}" fill="${col}" font-size="9">${lbl}</text>`;};
+  g+=mark(d.spot,"spot","var(--amber)");g+=mark(d.callWall,"C","var(--up)");g+=mark(d.putWall,"P","var(--down)");g+=mark(d.maxPain,"MP","#a855f7");g+=mark(d.gammaFlip,"flip","#3b82f6");
+  const step=Math.max(1,Math.floor(n/10));
+  prof.forEach((p,i)=>{if(i%step===0)g+=`<text x="${X(i).toFixed(1)}" y="${H-6}" fill="var(--muted)" font-size="9" text-anchor="middle">${p.k}</text>`;});
+  g+=`</svg>`;
+  document.getElementById("opt-profile").innerHTML=g;
+}
+
+// ── MACRO INSIGHT (Markets tab) ──
+async function loadMacro(){
+  try{
+    const d=await(await fetch(`${API}/api/macro`)).json();
+    const el=document.getElementById("macro-insight");
+    const reg=d.regime?`<div style="font-size:13px;margin-bottom:8px"><b>Regime:</b> <span class="${(d.regime.cycMinusDef1m||0)>0.5?'up':(d.regime.cycMinusDef1m||0)<-0.5?'down':'muted'}">${d.regime.read}</span></div>`:"";
+    const rows=(d.proxies||[]).map(p=>p.warming?
+      `<tr><td><b>${p.symbol}</b></td><td colspan="4" class="muted">warming…</td><td class="muted" style="white-space:normal">${p.note||''}</td></tr>`:
+      `<tr class="clk" onclick="openChart('${p.symbol}')"><td><b>${p.symbol}</b> <span class="muted" style="font-size:11px">${p.name}</span></td>
+       <td class="mono">${fmt(p.price)}</td><td class="mono ${dir(p.r1w)}">${pct(p.r1w)}</td>
+       <td class="mono ${dir(p.r1m)}">${pct(p.r1m)}</td><td class="mono ${dir(p.r3m)}">${pct(p.r3m)}</td>
+       <td class="muted" style="white-space:normal;font-size:11px">${p.note||''} ${p.helps&&p.helps.length?'<span class="up">+'+p.helps.join(",")+'</span>':''} ${p.hurts&&p.hurts.length?'<span class="down">−'+p.hurts.join(",")+'</span>':''}</td></tr>`).join("");
+    el.innerHTML=`<h2>Macro → sector influence</h2>${reg}<div class="scrollx"><table><thead><tr><th>Proxy</th><th>Price</th><th>1w</th><th>1m</th><th>3m</th><th>Sector influence</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="note">${d.note||''}</div>`;
+  }catch(e){document.getElementById("macro-insight").innerHTML='<div class="loading">Macro insight failed.</div>';}
+}
+
+// ── keyboard shortcuts: 1-9,0,- switch tabs · / focuses chart symbol ──
+const NAV_BTNS=[...document.querySelectorAll("#nav button")];
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT"||e.ctrlKey||e.metaKey||e.altKey)return;
+  const keys="1234567890-";
+  const i=keys.indexOf(e.key);
+  if(i>=0&&i<NAV_BTNS.length){NAV_BTNS[i].click();e.preventDefault();}
+  if(e.key==="/"){NAV_BTNS.find(b=>b.dataset.tab==="chart").click();document.getElementById("ch-sym").select();e.preventDefault();}
+});
+
 // ── PORTFOLIO ──
 async function post(path,body){return await(await fetch(API+path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();}
 document.querySelectorAll("#pf-dir button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#pf-dir button").forEach(x=>x.classList.remove("on"));b.classList.add("on");});
@@ -728,12 +953,19 @@ async function loadPortfolio(){
   try{
     const d=await(await fetch(`${API}/api/portfolio`)).json();
     const alloc=(d.alloc||[]).map(a=>`<span class="badge b-neu">${a.symbol} ${a.pct}%</span>`).join(" ");
+    const an=d.analytics||{};
+    const anLine=(an.beta!=null||an.expDailyVolPct!=null)?
+      ` · <b>β vs SPY:</b> <span class="mono">${an.beta!=null?an.beta:'—'}</span>
+        · <b>exp. daily vol:</b> <span class="mono">${an.expDailyVolPct!=null?an.expDailyVolPct+'%':'—'}</span>
+        · <b>avg pair ρ:</b> <span class="mono">${an.avgPairCorr!=null?an.avgPairCorr:'—'}</span>
+        ${an.excluded&&an.excluded.length?`<span class="muted">(no bar history: ${an.excluded.join(", ")})</span>`:""}`:"";
     document.getElementById("pf-summary").innerHTML=
       `<b>Open P&L:</b> <span class="${dir(d.openPL)} mono">${signed(d.openPL)}</span> ·
        <b>Realized:</b> <span class="${dir(d.realizedPL)} mono">${signed(d.realizedPL)}</span> ·
        <b>Exposure:</b> <span class="mono">${fmt(d.totalValue)}</span>
-       ${alloc?` · <b>Allocation:</b> ${alloc}`:""}
-       <div class="note">Live prices refresh ~30s server-side. Alerts fire automatically at 85% of the move to target and 75% of risk used, and when a stop/target is actually hit.</div>`;
+       ${alloc?` · <b>Allocation:</b> ${alloc}`:""}${anLine}
+       <div class="note">Live prices refresh ~30s server-side. Alerts fire automatically at 85% of the move to target and 75% of risk used, and when a stop/target is actually hit.
+       ${an.note?` Risk analytics: ${an.note}.`:''}</div>`;
     const open=d.open||[];
     document.getElementById("pf-open").innerHTML=open.length?
       "<table><thead><tr><th>Sym</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Last</th><th>P&L</th><th>P&L %</th><th>R</th><th>Stop</th><th>Target</th><th>→ target</th><th></th></tr></thead><tbody>"+
@@ -822,11 +1054,13 @@ async function pollAlerts(){
 setInterval(pollAlerts,20000);
 
 // ── boot ──
-loadSignals(); loadQuotes(); loadCalendarData(); pollAlerts();   // signals is the default tab; calendar at boot so the countdown runs anywhere
+loadIntel(); loadQuotes(); loadCalendarData(); pollAlerts();   // Intel is the default tab; calendar at boot so the countdown runs anywhere
 setInterval(loadQuotes,5000);
 setInterval(()=>{
+  if(tabActive("intel"))loadIntel();
   if(tabActive("signals"))loadSignals();
   if(tabActive("rotation"))loadRotation();
+  if(tabActive("options"))loadOptions();
 },60000);
 setInterval(loadCalendarData,300000);   // refresh calendar (and actuals) every 5 min
 </script>

@@ -9,3 +9,4 @@ Dockerfile
 docker-compose.yml
 data/
 quanta_state.json
+options_history.json
