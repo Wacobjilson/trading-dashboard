@@ -322,6 +322,122 @@ def warm_status():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Deep history (research data) — Yahoo v8 chart, keyless, ~25y adjusted daily.
+# Purpose: the research engines (regimes, analogs, ICs, probabilities,
+# counterfactuals, replays) were starved on Polygon's 2yr free window — one
+# regime cycle. Deep bars extend them to the common-inception window of the 11
+# sectors (~2018+, bounded by XLC) covering the 2020 crash and 2022 bear.
+# LIVE signal paths (Signals/Entries/Rotation tabs) stay on the Polygon bars
+# they were validated on; only the research matrix upgrades. Files cache in
+# DATA_DIR/deep/ (7-day refresh); a Polygon-overlap agreement check is stored
+# with each file so data quality is measured, not assumed.
+# ─────────────────────────────────────────────────────────────────────────────
+DEEP_DIR = os.path.join(os.environ.get("QUANTA_DATA", "") or
+                        os.path.dirname(os.path.abspath(__file__)), "deep")
+_deep_lock, _deep = threading.Lock(), {}
+
+
+def fetch_yahoo_daily(symbol, rng="25y"):
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=1d"
+           % (urllib.parse.quote(symbol), rng))
+    d = http_get_json(url, timeout=30)
+    r = (d.get("chart", {}).get("result") or [None])[0]
+    if not r:
+        raise ValueError("no yahoo chart for %s" % symbol)
+    ts = r["timestamp"]
+    q = r["indicators"]["quote"][0]
+    adj = (r["indicators"].get("adjclose") or [{}])[0].get("adjclose") or q["close"]
+    bars = []
+    for i, t in enumerate(ts):
+        c, a = q["close"][i], adj[i]
+        if c is None or a is None or q["open"][i] is None:
+            continue
+        k = a / c if c else 1.0     # back-adjust OHLC by the adjclose ratio
+        bars.append({"t": int(t * 1000), "o": round(q["open"][i] * k, 4),
+                     "h": round(q["high"][i] * k, 4), "l": round(q["low"][i] * k, 4),
+                     "c": round(a, 4), "v": int(q["volume"][i] or 0)})
+    if len(bars) < 300:
+        raise ValueError("yahoo history too short for %s (%d bars)" % (symbol, len(bars)))
+    return bars
+
+
+def _deep_quality(deep_bars, polygon_bars):
+    """Mean |%| close difference on the overlapping dates — adjustment sanity."""
+    if not polygon_bars:
+        return None
+    dmap = {dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date(): b["c"] for b in deep_bars}
+    diffs = []
+    for b in polygon_bars[-200:]:
+        d = dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date()
+        if d in dmap and b["c"]:
+            diffs.append(abs(dmap[d] / b["c"] - 1))
+    return round(sum(diffs) / len(diffs) * 100, 3) if len(diffs) >= 20 else None
+
+
+def _deep_path(sym):
+    return os.path.join(DEEP_DIR, "%s.json" % sym)
+
+
+def get_deep_bars(sym):
+    """Deep research bars: cached Yahoo history + any newer Polygon bars.
+    Falls back to the regular (Polygon/synth) bars when deep is unavailable."""
+    with _deep_lock:
+        d = _deep.get(sym)
+    if d is None:
+        try:
+            with open(_deep_path(sym)) as f:
+                d = json.load(f)
+            with _deep_lock:
+                _deep[sym] = d
+        except (FileNotFoundError, ValueError):
+            return get_bars(sym)
+    bars = d["bars"]
+    live = get_bars(sym)
+    if live:
+        last = bars[-1]["t"]
+        tail = [b for b in live if b["t"] > last]
+        if tail:
+            bars = bars + tail
+    return bars
+
+
+def deep_meta(sym):
+    with _deep_lock:
+        d = _deep.get(sym)
+    return {k: d[k] for k in ("fetched", "quality", "bars_n", "first")} if d else None
+
+
+def deep_loop():
+    if FORCE_SYNTH:
+        return                      # research on synthetic bars stays synthetic
+    time.sleep(20)                  # let the polygon warmers start first
+    while True:
+        for sym in BAR_UNIVERSE:
+            path = _deep_path(sym)
+            try:
+                fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < 7 * 86400
+                if fresh:
+                    if sym not in _deep:
+                        get_deep_bars(sym)      # warm the in-memory cache
+                    continue
+                bars = fetch_yahoo_daily(sym)
+                d = {"bars": bars, "fetched": time.time(), "bars_n": len(bars),
+                     "first": dt.datetime.fromtimestamp(bars[0]["t"] / 1000, dt.timezone.utc).date().isoformat(),
+                     "quality": _deep_quality(bars, get_bars(sym))}
+                os.makedirs(DEEP_DIR, exist_ok=True)
+                with open(path + ".tmp", "w") as f:
+                    json.dump(d, f)
+                os.replace(path + ".tmp", path)
+                with _deep_lock:
+                    _deep[sym] = d
+                _research_cache.clear()          # matrices rebuild on next request
+            except Exception as e:
+                print("warn: deep history %s failed: %s" % (sym, e))
+            time.sleep(2.5)
+        time.sleep(6 * 3600)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Analytics: SMA, returns, swing detection, Fibonacci, entry setup
 # ─────────────────────────────────────────────────────────────────────────────
 def sma(vals, n):
@@ -1236,15 +1352,17 @@ _research_cache = {}
 
 
 def _sector_matrix():
-    """Date-aligned closes for the 11 sectors + SPY from cached bars."""
-    spy_bars = get_bars(BENCH)
+    """Date-aligned closes for the 11 sectors + SPY. Uses DEEP research bars
+    (Yahoo ~25y) when available — the common window is bounded by XLC's 2018
+    inception — else the regular 2yr bars. Source is reported."""
+    spy_bars = get_deep_bars(BENCH)
     if not spy_bars or len(spy_bars) < 300:
         return None
     def dts(bars):
         return [dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date() for b in bars]
     per = {}
     for sym, _n in SECTORS:
-        b = get_bars(sym)
+        b = get_deep_bars(sym)
         if not b:
             return None
         per[sym] = (b, dts(b))
@@ -1258,7 +1376,11 @@ def _sector_matrix():
     for sym, (b, d) in per.items():
         ix = {dd: i for i, dd in enumerate(d)}
         C[sym] = [b[ix[dd]]["c"] for dd in common]
-    return {"dates": common, "C": C, "spy": spy}
+    deep = deep_meta(BENCH)
+    return {"dates": common, "C": C, "spy": spy,
+            "source": ("yahoo-deep + polygon tail (%d sessions from %s, polygon-overlap diff %s%%)"
+                       % (len(common), common[0].isoformat(), (deep or {}).get("quality"))
+                       if deep else "polygon 2yr (%d sessions)" % len(common))}
 
 
 def _ret(c, i, n):
@@ -1552,7 +1674,7 @@ def research_view():
                "re-run as history accumulates." % (max((r["n"] for r in regs), default=0))
                if not enough else
                "Buckets with n≥30 exist — compare their mean ICs before considering adaptive weights.")
-    return {"weeklyIC": ics[-26:], "rollingIC": roll, "icOverall": round(sum(vals) / len(vals), 3) if vals else None,
+    return {"weeklyIC": ics, "rollingIC": roll, "icOverall": round(sum(vals) / len(vals), 3) if vals else None,
             "byRegime": regs, "adaptiveWeightingVerdict": verdict,
             "note": "RS blend vs forward 10d SPY-relative return, Spearman per week (11 sectors). "
                     "This is the LIVE version of research_categories.py's test."}
@@ -1636,7 +1758,7 @@ def _factor_matrix():
     dates = m["dates"]
 
     def series_for(sym):
-        b = get_bars(sym)
+        b = get_deep_bars(sym)
         if not b:
             return None
         dmap = {dt.datetime.fromtimestamp(x["t"] / 1000, dt.timezone.utc).date(): x["c"] for x in b}
@@ -1681,6 +1803,31 @@ def _beta_corr(cs, cf, i, w=63):
     return beta, corr
 
 
+def _partial_corr(cs, cf, cm, i, w=63):
+    """Correlation of sector vs factor AFTER removing what the market (SPY)
+    explains from both — the robustness check that separates 'this factor
+    moves this sector' from 'everything is just beta'."""
+    if i - w < 1:
+        return None
+    def rets(c):
+        return [c[k] / c[k - 1] - 1 for k in range(i - w + 1, i + 1)]
+    rs, rf, rm = rets(cs), rets(cf), rets(cm)
+    mm = sum(rm) / w
+    vm = sum((x - mm) ** 2 for x in rm) / w
+    if vm <= 0:
+        return None
+    def resid(r):
+        mr = sum(r) / w
+        b = sum((a - mr) * (b2 - mm) for a, b2 in zip(r, rm)) / w / vm
+        return [a - mr - b * (b2 - mm) for a, b2 in zip(r, rm)]
+    es, ef = resid(rs), resid(rf)
+    vs = sum(x * x for x in es) / w
+    vf = sum(x * x for x in ef) / w
+    if vs <= 0 or vf <= 0:
+        return None
+    return sum(a * b for a, b in zip(es, ef)) / w / (vs ** 0.5) / (vf ** 0.5)
+
+
 def factors_view():
     fm = _factor_matrix()
     if not fm:
@@ -1710,11 +1857,16 @@ def factors_view():
             _b2, prior = _beta_corr(cs, cf, i - 63)
             if beta is None or corr is None:
                 continue
+            # robustness: does the relationship survive after controlling for SPY?
+            # (ratio factors are already market-relative — no control needed)
+            pc = None if fid in FACTOR_RATIOS else _partial_corr(cs, cf, m["spy"], i)
             f21 = factors[fid]["trend21"]
             contrib = beta * f21
             dcorr = (corr - prior) if prior is not None else None
             rows.append({"factor": fid, "name": names[fid], "beta": round(beta, 2),
                          "corr63": round(corr, 2), "corrPrior63": round(prior, 2) if prior is not None else None,
+                         "corrPartialSPY": round(pc, 2) if pc is not None else None,
+                         "betaOnly": bool(pc is not None and abs(pc) < 0.15 and abs(corr) >= 0.25),
                          "deltaCorr": round(dcorr, 2) if dcorr is not None else None,
                          "factorTrend21": f21, "contrib21": round(contrib, 2),
                          "pPersist": factors[fid]["pPersist"]})
@@ -1723,10 +1875,14 @@ def factors_view():
                              % (sym, fid, prior, corr, dcorr))
         rows.sort(key=lambda r: -abs(r["contrib21"]))
         thresh = max(0.15, abs(sec21) * 0.2)
+
+        def _real(r):
+            """Driver must survive the SPY control (or be a market-relative ratio)."""
+            return r["corrPartialSPY"] is None or abs(r["corrPartialSPY"]) >= 0.15
         primary = [r for r in rows if abs(r["contrib21"]) >= thresh and r["contrib21"] * sec21 > 0
-                   and abs(r["corr63"]) >= 0.25][:3]
+                   and abs(r["corr63"]) >= 0.25 and _real(r)][:3]
         conflicting = [r for r in rows if abs(r["contrib21"]) >= thresh and r["contrib21"] * sec21 < 0
-                       and abs(r["corr63"]) >= 0.25][:3]
+                       and abs(r["corr63"]) >= 0.25 and _real(r)][:3]
         used = {r["factor"] for r in primary + conflicting}
         supporting = [r for r in rows if r["factor"] not in used and abs(r["corr63"]) >= 0.25][:3]
         weak = [r["factor"] for r in rows if abs(r["corr63"]) < 0.2]
@@ -1740,9 +1896,11 @@ def factors_view():
                         "primary": primary, "conflicting": conflicting, "supporting": supporting,
                         "weak": weak, "confidence": conf})
     return {"asOf": m["dates"][i].isoformat(), "factors": factors, "sectors": sectors,
-            "stabilityFlags": flags,
+            "stabilityFlags": flags, "dataSource": m.get("source"),
             "note": "Univariate beta attribution over 63d returns — factors overlap, so contributions don't "
-                    "sum to the move (residual shown). ΔCorr compares the last 63d vs the prior 63d; |Δ|≥0.4 is "
+                    "sum to the move (residual shown). Drivers must SURVIVE a partial-correlation control for "
+                    "SPY (|ρ_partial|≥0.15) — raw correlations that vanish after removing market beta are "
+                    "labeled beta-only and demoted. ΔCorr compares the last 63d vs the prior 63d; |Δ|≥0.4 is "
                     "flagged as a relationship break. pPersist = historical P(21d factor trend keeps its sign "
                     "another 21d). Proxies only — real yields/CPI/ISM/credit-spread indices have no free source."}
 
@@ -1854,22 +2012,22 @@ def registry_view():
         n_open = len(_state["positions"])
     models = [
         {"name": "RSI(2) mean-reversion (Signals)", "stage": "production",
-         "version": "v1 · deployed 2026-07-01 · trained/validated 60/40 split of 2yr Polygon daily",
-         "limitations": "pre-cost close fills; bull-heavy sample; 200-SMA gate untested in a real bear",
-         "evidence": "walk-forward OOS: 74.7% win, PF 2.05, n=87 (research.py)",
+         "version": "v1 · deployed 2026-07-01 · 2yr 60/40 walk-forward; RE-VALIDATED 2026-07-04 on ~8yr deep history",
+         "limitations": "pre-cost close fills; deep replay now spans the 2020 crash and 2022 bear",
+         "evidence": "2yr OOS: 74.7% win PF 2.05 n=87; DEEP replay: +0.42%/tr, 71% win, PF 1.77, n=639 (EXP-10) — the strongest-evidenced edge on the platform",
          "monitoring": "live daily + scorecard replay windows; regime-expectancy pending journal trades"},
         {"name": "RS rotation top-3/1m (Rotation model)", "stage": "production",
-         "version": "v1 · deployed 2026-07-02 · trained/validated 60/40 split; 1m lookback chosen of 6 variants (multiple-comparison risk noted)",
-         "limitations": "n=30 test trades; 3m/6m variants decayed — lookback choice may be luck",
-         "evidence": "train PF 2.88 → test PF 2.92, 67% win, n=30 (small sample)",
+         "version": "v1 · deployed 2026-07-02 · ROLE REVISED 2026-07-04 after deep re-validation",
+         "limitations": "deep counterfactual: top-3 (+107%) did NOT beat SPY-only (+113%) over 352w — its measured value is RISK-SHAPING (maxDD −26.6% vs SPY −31.2%), not selection alpha",
+         "evidence": "2yr: train PF 2.88 → test 2.92 n=30; DEEP replay: +1.23%/position, 59% win, PF 1.73, n=252 — absolute edge holds, relative edge does not (EXP-10)",
          "monitoring": "weekly IC %.3f overall · rolling13w %s%s" % (
              rs_live["overallIC"] or 0, rs_live["rolling13w"],
              " · ⚠ DEGRADING (rolling<0)" if rs_live["degrading"] else "")},
-        {"name": "Composite: rs category (w 0.70)", "stage": "production",
-         "version": "v2 · reweighted 2026-07-03 after IC validation (v1 had 8 equal-ish arbitrary weights)",
-         "limitations": "IC ~0.02-0.03 is weak; 54-week sample",
-         "evidence": "IC +0.031 train / +0.017 test; only ablation survivor",
-         "monitoring": "continuous (Research tab rolling IC + scorecard)"},
+        {"name": "Composite: rs category (w 0.70)", "stage": "UNDER REVIEW",
+         "version": "v2 · reweighted 2026-07-03 after 2yr IC validation · flagged 2026-07-04 by deep re-validation",
+         "limitations": "DEEP-SAMPLE weekly IC ≈ 0 (−0.012 over 352w; no regime bucket positive with confidence) — 2yr IC (+0.02/+0.017) looks sample-specific. Retained for ranking/risk-shaping while EXP-11 tests longer horizons; the allocation P>50% gate now runs on deep base rates and self-corrects.",
+         "evidence": "2yr IC +0.031/+0.017 (only ablation survivor); 8yr IC −0.012 (EXP-10)",
+         "monitoring": "continuous rolling IC on the deep matrix + scorecard; EXP-11 queued (21/60d horizons, risk-adjusted IC)"},
         {"name": "Composite: options category (w 0.15)", "stage": "validation",
          "evidence": "UNVALIDATED — %d/60 snapshot days toward the IC test" % opt_days,
          "monitoring": "PCR z calibrating (%d/20 days)" % opt_days},
@@ -2271,6 +2429,88 @@ def priorities_view():
     return {"items": items,
             "note": "Score = expected improvement × readiness ÷ effort (heuristic, shown transparently). "
                     "unblockPct is LIVE — data-gated projects rise automatically as their data accumulates."}
+
+
+# ── Hypothesis generator — research questions proposed from live anomalies ───
+# Institutional memory: topics already researched (EXPERIMENT_LOG.md) so the
+# generator references prior findings instead of proposing duplicate work.
+RESEARCHED_TOPICS = {
+    "momentum": "EXP-04: momentum category failed IC validation (train −0.06)",
+    "breakout": "EXP-01: breakout20 failed OOS (PF 1.6, 33% win)",
+    "volatility": "EXP-04: volatility category wrong-signed; inverted version pre-registered (EXP-08)",
+    "intraday": "EXP-02: no robust 15-min edge net of costs",
+    "trend": "EXP-04: trend ρ0.81-redundant with RS",
+    "lookback": "EXP-03: 3m/6m rotation lookbacks decayed OOS",
+}
+
+
+def hypotheses_view():
+    out = []
+    regy = cache_get("registry", 300) or _cache_and_return("registry", registry_view)
+    for x in (regy.get("disagreement") or [])[:3]:
+        if x["disagreement"] > 0.5:
+            models = ", ".join(k + ("+" if v > 0 else "−") for k, v in x["votes"].items() if v)
+            out.append({"hypothesis": "On %s the models disagree (%s) — does one side carry information the "
+                                      "composite is discarding?" % (x["symbol"], models),
+                        "trigger": "model-disagreement score %.2f (registry)" % x["disagreement"],
+                        "proposedTest": "conditional IC: composite performance on agreement-days vs disagreement-days",
+                        "value": 70, "dataGated": "needs prediction-log maturity to split by day type"})
+    fx = cache_get("factors", 600) or _cache_and_return("factors", factors_view)
+    if not fx.get("error"):
+        worst = max(fx["sectors"], key=lambda s: abs(s["residual21"]), default=None)
+        if worst and abs(worst["residual21"]) >= max(1.5, abs(worst["move21"]) * 0.5):
+            out.append({"hypothesis": "%s moved %+0.1f%% but the factor set explains only %+0.1f%% — a driver "
+                                      "is missing from the library" % (worst["symbol"], worst["move21"],
+                                                                       worst["explained21"]),
+                        "trigger": "largest attribution residual (%+0.1f%%)" % worst["residual21"],
+                        "proposedTest": "candidate factors: industry sub-ETF (e.g. SMH/KRE/XOP), earnings-window "
+                                        "dummy; add to FACTOR_DEFS and re-check residual",
+                        "value": 60, "dataGated": None})
+        beta_only = [(s["symbol"], r["factor"]) for s in fx["sectors"]
+                     for r in s.get("supporting", []) + s.get("primary", []) if r.get("betaOnly")]
+        if beta_only:
+            out.append({"hypothesis": "Some factor links are pure market beta in disguise (%s) — attribution "
+                                      "was overstating factor influence" %
+                                      ", ".join("%s↔%s" % p for p in beta_only[:3]),
+                        "trigger": "partial-correlation control (new this cycle) demoted them",
+                        "proposedTest": "already enforced in driver classification; monitor whether macro-category "
+                                        "IC improves once its history allows the test",
+                        "value": 50, "dataGated": None})
+    asm = cache_get("assumptions", 900) or _cache_and_return("assumptions", assumptions_view)
+    if not asm.get("error"):
+        for a in asm["assumptions"]:
+            st = str(a["status"])
+            if not st.startswith("holding") and not st.startswith("UNTESTED"):
+                out.append({"hypothesis": "Assumption under stress: %s" % a["assumption"],
+                            "trigger": "%s → %s" % (a["reading"], a["status"]),
+                            "proposedTest": a["test"] + " — split by regime and by year on the deep matrix",
+                            "value": 80, "dataGated": None})
+    lab = cache_get("edgelab", 900) or _cache_and_return("edgelab", edge_lab)
+    for s in (lab.get("survivors") or [])[:2]:
+        out.append({"hypothesis": "Edge-lab survivor may be real: %s → %s" % (s["condition"], s["target"]),
+                    "trigger": "train %s%% (t=%s) / test %s%% both positive" %
+                               (s["train"]["mean"], s["train"]["t"], s["test"]["mean"]),
+                    "proposedTest": "hold out until next quarter's data; re-verify before any production use",
+                    "value": 65, "dataGated": "a quarter of new data"})
+    ana = cache_get("analogs", 600) or _cache_and_return("analogs", analogs_view)
+    sc = cache_get("scores", 120) or _cache_and_return("scores", sector_scores)
+    if not ana.get("error") and sc.get("sectors"):
+        agg = (ana.get("aggregate") or {}).get("top3ContinuationRel21")
+        if agg and agg["median"] < 0:
+            out.append({"hypothesis": "Historical analogs say top-3 leadership FADED in similar states (median "
+                                      "%+0.2f%%) — the RS ranking may be late here" % agg["median"],
+                        "trigger": "analog top-3 continuation negative (win %s%%, n=%d)" % (agg["win"], agg["n"]),
+                        "proposedTest": "condition the rotation model on analog-continuation sign; walk-forward it",
+                        "value": 75, "dataGated": None})
+    for h in out:
+        for kw, ref in RESEARCHED_TOPICS.items():
+            if kw in h["hypothesis"].lower():
+                h["priorResearch"] = ref
+    out.sort(key=lambda h: -h["value"])
+    return {"hypotheses": out[:8],
+            "note": "Auto-generated from live anomalies (disagreements, unexplained moves, stressed "
+                    "assumptions, analog conflicts, lab survivors), ranked by heuristic research value. "
+                    "priorResearch links stop duplicate work — see EXPERIMENT_LOG.md."}
 
 
 # ── Weekly investment-committee report — auto-generated minutes ──────────────
@@ -4131,6 +4371,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("priorities", 900) or _cache_and_return("priorities", priorities_view))
         elif path == "/api/committee":
             self._json(cache_get("committee", 1800) or _cache_and_return("committee", committee_view))
+        elif path == "/api/hypotheses":
+            self._json(cache_get("hypotheses", 900) or _cache_and_return("hypotheses", hypotheses_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -4175,7 +4417,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _cache_and_return(key, fn):
-    val = fn(); cache_set(key, val); return val
+    val = fn()
+    # never cache an error payload — a still-warming engine would otherwise
+    # serve its failure for the full TTL after the data arrives
+    if not (isinstance(val, dict) and val.get("error")):
+        cache_set(key, val)
+    return val
 
 
 def main():
@@ -4192,7 +4439,7 @@ def main():
     print("  alerts   : signals · setups · position stop/target · price levels (checked ~30s)")
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
-    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop):
+    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop):
         threading.Thread(target=fn, daemon=True).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

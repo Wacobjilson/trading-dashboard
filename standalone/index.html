@@ -206,6 +206,7 @@
       <div class="card"><h2>Assumption monitor</h2><div id="rs-assumptions"><div class="loading">…</div></div></div>
       <div class="card"><h2>Drift detection — is this still the market our sample described?</h2><div id="rs-drift"><div class="loading">…</div></div></div>
     </div>
+    <div class="card"><h2>Hypothesis generator — research the platform proposes for itself</h2><div id="rs-hypotheses"><div class="loading">…</div></div></div>
     <div class="card"><h2>Counterfactual baselines — would something simpler have done better?</h2><div id="rs-counterfactual"><div class="loading">…</div></div></div>
     <div class="card"><h2>Weekly committee minutes (auto-generated)</h2><div id="rs-committee"><div class="loading">…</div></div></div>
     <div class="card" id="rs-regime"><div class="loading">Classifying regime…</div></div>
@@ -1077,11 +1078,11 @@ async function loadResearch(){
     renderRsRegistry(regy); renderRsRegime(reg); renderRsValidation(val); renderRsProbs(prob);
     renderRsAnalogs(ana); _fx=fx; renderRsFactors(); renderRsEdgeLab(lab); renderRsCalib(cal);
     // self-evaluation engines (heavier — loaded after the first paint)
-    const [scd,asm,drf,cft,cmt,pri]=await Promise.all(
-      ["scorecard","assumptions","drift","counterfactual","committee","priorities"]
+    const [scd,asm,drf,cft,cmt,pri,hyp]=await Promise.all(
+      ["scorecard","assumptions","drift","counterfactual","committee","priorities","hypotheses"]
       .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
     renderRsScorecard(scd); renderRsAssumptions(asm); renderRsDrift(drf);
-    renderRsCounterfactual(cft); renderRsCommittee(cmt); window._pri=pri;
+    renderRsCounterfactual(cft); renderRsCommittee(cmt); window._pri=pri; renderRsHypotheses(hyp);
   }catch(e){document.getElementById("rs-regime").innerHTML='<div class="loading">Research engines failed to load.</div>';}
 }
 const stageBadge=s=>({production:'b-ready',validation:'b-appr',retired:'b-bear'}[s]||'b-neu');
@@ -1252,6 +1253,17 @@ function renderRsDrift(d){
       <td class="mono">${f.current}</td><td class="mono ${f.drifting?'amber':'muted'}">${f.pctile??'—'}</td>
       <td>${f.drifting?'<span class="badge b-appr">DRIFT</span>':''}</td></tr>`).join("")}</tbody></table>`+
     (d.modelsAtRisk.length?`<div class="amber" style="font-size:12px;margin-top:6px"><b>Models at risk:</b> ${d.modelsAtRisk.join("; ")}</div>`:'')+
+    `<div class="note">${d.note}</div>`;
+}
+function renderRsHypotheses(d){
+  const el=document.getElementById("rs-hypotheses");
+  if(!d||!d.hypotheses){el.innerHTML='<div class="loading">…</div>';return;}
+  el.innerHTML=(d.hypotheses.length?d.hypotheses.map((h,i)=>`<div style="padding:7px 0;border-top:1px solid var(--border);font-size:12px">
+      <b>H${i+1}.</b> ${h.hypothesis} <span class="badge b-neu">value ${h.value}</span>
+      <div class="muted" style="font-size:11px">trigger: ${h.trigger}</div>
+      <div class="muted" style="font-size:11px">proposed test: ${h.proposedTest}${h.dataGated?` · <span class="amber">gated: ${h.dataGated}</span>`:''}</div>
+      ${h.priorResearch?`<div class="amber" style="font-size:11px">⚑ prior research: ${h.priorResearch}</div>`:''}</div>`).join("")
+    :'<div class="muted" style="padding:6px">No anomalies worth a hypothesis right now — itself informative.</div>')+
     `<div class="note">${d.note}</div>`;
 }
 function renderRsCounterfactual(d){
