@@ -132,14 +132,15 @@
     <div class="card" id="intel-summary" style="font-size:13px;white-space:pre-line">Loading market summary…</div>
     <div class="card"><h2>Sector intelligence scores <span class="muted" style="text-transform:none;letter-spacing:0" id="intel-weights"></span></h2>
       <div class="scrollx" id="intel-table"><div class="loading">Scoring sectors…</div></div>
-      <div class="note"><b>Evidence-based composite</b> (research_categories.py, 54 weekly cross-sections):
-        <b>relative strength</b> is the only bar category whose forward-10d IC survived train/test, so it carries
-        the weight; <b>options</b> and <b>macro</b> are small and flagged <span class="amber">unvalidated</span>
-        until their snapshot history allows the same test. Trend/momentum/volume/volatility <b>failed validation</b>
-        (trend is ρ0.81-redundant with RS; volatility was wrong-signed, IC21 −0.21) — they're shown in the
-        drill-down as zero-weight context, not composited. Categories without data are excluded and the rest
-        renormalized — never guessed. <b>Conf</b> = coverage × agreement; <b>Risk</b> is separate. Click a row for
-        the full breakdown. Spark = stored daily score history (RS-trajectory fallback until ≥5 days accumulate).</div></div>
+      <div class="note"><b class="amber">DESCRIPTIVE RANKING — not an alpha forecast.</b> Pre-registered EXP-11
+        (2026-07-04, 8yr data) rejected cross-sectional selection alpha at every tested horizon (10/21/60d;
+        permutation p≈0.91) — the earlier 2yr validation was sample-specific. The composite remains useful as a
+        <b>strength/context ranking and for risk-shaping</b> (top-3 rotation showed the shallowest drawdowns), and
+        the allocation gate runs on measured base rates so it won't convert this ranking into overweight bets the
+        evidence doesn't support. The platform's demonstrated edge is <b>RSI(2) timing</b> (Signals tab; replicated
+        across years, parameters, costs, and execution delay — see Research → Replication). Options/macro
+        categories stay flagged unvalidated pending snapshot history; failed categories remain visible as
+        zero-weight context. <b>Conf</b> = coverage × agreement; <b>Risk</b> separate. Click a row for the breakdown.</div></div>
     <div class="card" id="intel-detail" style="display:none"></div>
   </section>
 
@@ -201,6 +202,8 @@
       regime cycle</b>: every number carries its n and these are descriptions of this sample, never forecasts.
       Nothing enters the production composite until it survives the validation shown here.</div>
     <div class="card" id="rs-registry"><div class="loading">Loading research control center…</div></div>
+    <div class="card"><h2>Scientific integrity — beliefs as probabilities, with the evidence that moved them</h2><div id="rs-integrity"><div class="loading">…</div></div></div>
+    <div class="card"><h2>Replication &amp; falsification — production models under attack</h2><div id="rs-replication"><div class="loading">Running replication grid + EXP-11…</div></div></div>
     <div class="card"><h2>Model scorecard — every model earns its place, continuously</h2><div id="rs-scorecard"><div class="loading">Replaying models…</div></div></div>
     <div class="cols cols2">
       <div class="card"><h2>Assumption monitor</h2><div id="rs-assumptions"><div class="loading">…</div></div></div>
@@ -1083,6 +1086,9 @@ async function loadResearch(){
       .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
     renderRsScorecard(scd); renderRsAssumptions(asm); renderRsDrift(drf);
     renderRsCounterfactual(cft); renderRsCommittee(cmt); window._pri=pri; renderRsHypotheses(hyp);
+    const [intg,repl,exp11]=await Promise.all(["integrity","replication","exp11"]
+      .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
+    renderRsIntegrity(intg); renderRsReplication(repl,exp11);
   }catch(e){document.getElementById("rs-regime").innerHTML='<div class="loading">Research engines failed to load.</div>';}
 }
 const stageBadge=s=>({production:'b-ready',validation:'b-appr',retired:'b-bear'}[s]||'b-neu');
@@ -1282,6 +1288,41 @@ function renderRsCommittee(d){
   if(!d||!d.text){el.innerHTML='<div class="loading">Report warming…</div>';return;}
   el.innerHTML=`<pre style="white-space:pre-wrap;font-size:12px;line-height:1.5;color:var(--text);font-family:'JetBrains Mono',monospace;margin:0">${d.text.replace(/</g,"&lt;")}</pre>
     <div class="note">Auto-generated from the live engines · regenerates every 30 min · every number traces to a tab on this dashboard.</div>`;
+}
+
+// ── SCIENTIFIC INTEGRITY + REPLICATION CARDS ──
+function renderRsIntegrity(d){
+  const el=document.getElementById("rs-integrity");
+  if(!d||!d.beliefs){el.innerHTML='<div class="loading">…</div>';return;}
+  const evo=c=>c.map(([dt2,p,why],i)=>`<span title="${why}" class="mono ${i===c.length-1?'':'muted'}" style="font-size:11px">${(p*100).toFixed(0)}%</span>`).join(' <span class="muted">→</span> ');
+  el.innerHTML=d.beliefs.map(b=>{
+    const last=b.confidence[b.confidence.length-1][1];
+    return`<div style="padding:7px 0;border-top:1px solid var(--border);font-size:12px">
+      <b>${b.belief}</b> <span class="badge ${last>=0.7?'b-ready':last<=0.2?'b-bear':'b-appr'}">${(last*100).toFixed(0)}% confidence</span>
+      <span style="margin-left:8px">${evo(b.confidence)}</span>
+      <div class="muted" style="font-size:11px">＋ ${b.evidenceFor} · − ${b.evidenceAgainst}</div>
+      <div class="muted" style="font-size:11px">alternatives: ${b.alternatives} · <b class="${/RETIRED|REVIEW/i.test(b.status)?'amber':'muted'}">${b.status}</b></div></div>`;}).join("")+
+    `<div style="margin-top:8px;font-size:12px"><b>Retired beliefs (progress):</b> ${d.retired.map(r=>`<span class="muted" title="${r.reason}">✗ ${r.belief}</span>`).join(" · ")}</div>
+    <div style="margin-top:6px;font-size:11px" class="muted"><b>Meta-validation:</b>${d.metaValidation.map(m2=>`<div>· ${m2}</div>`).join("")}</div>
+    <div style="margin-top:6px;font-size:11px" class="muted"><b>Sample quality:</b> ${Object.entries(d.sampleQuality).map(([k,v])=>`${k}: ${v}`).join(" · ")}</div>
+    <div class="note">${d.note}</div>`;
+}
+function renderRsReplication(r,e){
+  const el=document.getElementById("rs-replication");
+  if(!r||r.error){el.innerHTML=`<div class="loading">${r?r.error:'…'}</div>`;return;}
+  const btab=(title,rows)=>`<div style="font-size:11px;margin-top:6px"><b>${title}</b> ${rows.map(b=>
+    `<span class="mono ${(b.avg||0)>0?'up':'down'}" style="margin-right:8px">${b.bucket||b.params||b.variant}: ${b.avg>0?'+':''}${b.avg}%${b.pf?' pf'+b.pf:''} <span class="muted">n${b.n}</span></span>`).join("")}</div>`;
+  let ex="";
+  if(e&&e.horizons){
+    ex=`<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:12px">
+      <b>EXP-11 — pre-registered falsification of RS selection alpha</b> <span class="badge ${/ACCEPTED/.test(e.verdict)?'b-ready':'b-bear'}">${/ACCEPTED/.test(e.verdict)?'ACCEPTED':'REJECTED'}</span>
+      ${Object.entries(e.horizons).map(([h,x])=>x.error?'':`<div class="mono" style="font-size:11px">h=${h}d: IC ${x.meanIC} (t ${x.tStat}) · train ${x.trainIC} / test ${x.testIC} → ${x.passes?'pass':'FAIL'} · boot90 [${x.bootstrap90}] · perm p=${x.permutationP} · top3−bot3 ${x.top3MinusBottom3}%</div>`).join("")}
+      <div class="muted" style="font-size:11px">${e.verdict}</div></div>`;
+  }
+  el.innerHTML=`<div style="font-size:13px"><b>${r.model}</b> — <span class="${/PASSED/.test(r.replicationStatus)?'up':'amber'}">${r.replicationStatus}</span></div>`+
+    btab("By year:",r.byYear)+btab("By regime:",r.byRegime)+btab("By vol tercile:",r.byVolTercile)+
+    btab("Parameter grid:",r.paramGrid)+btab("Frictions:",r.frictions)+ex+
+    `<div class="note">${r.note} ${e&&e.note?e.note:''}</div>`;
 }
 
 // ── MACRO INSIGHT (Markets tab) ──

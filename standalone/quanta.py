@@ -938,7 +938,16 @@ def rotation():
 #               snapshot files will eventually allow the same IC test.
 # "breadth" was removed as a per-sector category (market context ± quadrant,
 # which duplicates rs) — it now lives in the regime block.
-SCORE_WEIGHTS = {"rs": 0.70, "options": 0.15, "macro": 0.15}
+# 2026-07-04 EXP-11 (pre-registered) REJECTED rs selection alpha at 21/60d on
+# 8yr data (perm p≈0.91, train/test sign-flips, negative top3−bottom3 spread at
+# 60d) — after EXP-10 already found IC≈0 at 10d. Per the registered rule the rs
+# weight is REDUCED and the whole composite is reframed: it is a DESCRIPTIVE
+# strength ranking (context + risk-shaping), not an alpha forecast — the
+# payload carries alphaStatus saying exactly that.
+SCORE_WEIGHTS = {"rs": 0.50, "options": 0.25, "macro": 0.25}
+ALPHA_STATUS = ("DESCRIPTIVE ranking — pre-registered EXP-11 rejected cross-sectional selection alpha at "
+                "10/21/60d horizons on 8yr data (permutation p≈0.91). Use for context and risk-shaping, "
+                "not outperformance bets; the demonstrated edge on this platform is RSI(2) timing.")
 CONTEXT_CATS = {   # displayed with 0 weight + their measured ICs, never composited
     "trend": "0 weight — failed validation (train IC −0.03, ρ 0.81 with RS = redundant)",
     "momentum": "0 weight — failed validation (train IC −0.06)",
@@ -1115,7 +1124,7 @@ def sector_scores(weights_qs=None):
     rot = cache_get("sectors", 120) or _cache_and_return("sectors", rotation)
     rotmap = {s["symbol"]: s for s in rot.get("sectors", []) if not s.get("warming")}
     breadth = rot.get("breadth") or {}
-    out = {"warm": warm_status(), "weights": w, "sectors": [],
+    out = {"warm": warm_status(), "weights": w, "sectors": [], "alphaStatus": ALPHA_STATUS,
            "notes": ["options category: CBOE delayed chains, naive +call/−put GEX convention",
                      "news & ETF-flow categories intentionally excluded — no reliable free per-sector source",
                      "history sparkline uses the five bar-derived categories only"]}
@@ -2023,11 +2032,11 @@ def registry_view():
          "monitoring": "weekly IC %.3f overall · rolling13w %s%s" % (
              rs_live["overallIC"] or 0, rs_live["rolling13w"],
              " · ⚠ DEGRADING (rolling<0)" if rs_live["degrading"] else "")},
-        {"name": "Composite: rs category (w 0.70)", "stage": "UNDER REVIEW",
-         "version": "v2 · reweighted 2026-07-03 after 2yr IC validation · flagged 2026-07-04 by deep re-validation",
-         "limitations": "DEEP-SAMPLE weekly IC ≈ 0 (−0.012 over 352w; no regime bucket positive with confidence) — 2yr IC (+0.02/+0.017) looks sample-specific. Retained for ranking/risk-shaping while EXP-11 tests longer horizons; the allocation P>50% gate now runs on deep base rates and self-corrects.",
-         "evidence": "2yr IC +0.031/+0.017 (only ablation survivor); 8yr IC −0.012 (EXP-10)",
-         "monitoring": "continuous rolling IC on the deep matrix + scorecard; EXP-11 queued (21/60d horizons, risk-adjusted IC)"},
+        {"name": "Composite: rs category (w 0.50)", "stage": "descriptive",
+         "version": "v3 · 2026-07-04: EXP-11 (pre-registered) REJECTED selection alpha at 21/60d — alpha claim retired, weight reduced 0.70→0.50 per the registered rule; composite reframed as a descriptive strength ranking",
+         "limitations": "no demonstrated selection alpha at any tested horizon (10/21/60d, 8yr); permutation p≈0.91; top3−bottom3 spread ≈0/negative. Retained for context and risk-shaping (drawdown-reduction observation, itself awaiting pre-registered confirmation).",
+         "evidence": "EXP-04 2yr pass → EXP-10 deep IC −0.012 → EXP-11 rejection (4 independent methods agree)",
+         "monitoring": "rolling IC continues; any future alpha claim requires a new pre-registered experiment"},
         {"name": "Composite: options category (w 0.15)", "stage": "validation",
          "evidence": "UNVALIDATED — %d/60 snapshot days toward the IC test" % opt_days,
          "monitoring": "PCR z calibrating (%d/20 days)" % opt_days},
@@ -2511,6 +2520,244 @@ def hypotheses_view():
             "note": "Auto-generated from live anomalies (disagreements, unexplained moves, stressed "
                     "assumptions, analog conflicts, lab survivors), ranked by heuristic research value. "
                     "priorResearch links stop duplicate work — see EXPERIMENT_LOG.md."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FALSIFICATION & REPLICATION (CSO layer) — every production model is presumed
+# wrong until it repeatedly survives attempts to break it. Replication grids
+# perturb parameters/costs/timing and split by year/regime/vol tercile;
+# EXP-11 executes its PRE-REGISTERED plan (fixed before results were known);
+# the integrity view tracks beliefs as probabilities with evidence histories.
+# ─────────────────────────────────────────────────────────────────────────────
+def _rsi2_trades(m, thr=10, exit_n=5, cost_rt=0.0, delay=False):
+    """RSI(2) replay with perturbable parameters, round-trip cost (%), and an
+    execution-delay variant (enter at the NEXT close instead of the signal close)."""
+    trades = []
+    dates = m["dates"]
+    for sym, c in m["C"].items():
+        s_exit, s200, r2 = _sma_ser(c, exit_n), _sma_ser(c, 200), _rsi_ser(c, 2)
+        i = 200
+        while i < len(c) - 2:
+            if s200[i] and c[i] > s200[i] and r2[i] is not None and r2[i] < thr:
+                ei = i + 1 if delay else i
+                j = ei + 1
+                while j < len(c) - 1 and not (s_exit[j] and c[j] > s_exit[j]):
+                    j += 1
+                trades.append({"sym": sym, "i": ei, "exit_i": j, "date": dates[j],
+                               "ret": (c[j] / c[ei] - 1) * 100 - cost_rt})
+                i = j + 1
+            else:
+                i += 1
+    return trades
+
+
+def _bucket_stats(trades, keyfn):
+    g = {}
+    for t in trades:
+        g.setdefault(keyfn(t), []).append(t["ret"])
+    out = []
+    for k, v in sorted(g.items()):
+        mt = _trade_metrics(v)
+        if mt:
+            out.append({"bucket": str(k), "n": mt["n"], "avg": mt["avg"], "win": mt["win"], "pf": mt["pf"]})
+    return out
+
+
+def replication_view():
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    base = _rsi2_trades(m)
+    # map any bar index to its weekly-state regime / vol tercile (nearest state)
+    sidx = [st["i"] for st in states]
+    def state_at(i):
+        import bisect
+        k = bisect.bisect_right(sidx, i) - 1
+        return states[max(0, k)]
+    by_year = _bucket_stats(base, lambda t: t["date"].year)
+    by_regime = _bucket_stats(base, lambda t: state_at(t["i"])["regime"]["primary"])
+    by_vol = _bucket_stats(base, lambda t: ("low-vol" if state_at(t["i"])["features"]["volPct"] <= 33
+                                            else "high-vol" if state_at(t["i"])["features"]["volPct"] >= 67
+                                            else "mid-vol"))
+    grid = []
+    for thr in (5, 10, 15):
+        for ex in (3, 5, 10):
+            mt = _trade_metrics([t["ret"] for t in _rsi2_trades(m, thr=thr, exit_n=ex)])
+            grid.append({"params": "RSI2<%d, exit>SMA%d" % (thr, ex),
+                         "n": mt["n"] if mt else 0, "avg": mt["avg"] if mt else None,
+                         "pf": mt["pf"] if mt else None})
+    frictions = []
+    for label, kw in (("base (close fills, no cost)", {}),
+                      ("0.10% round-trip cost", {"cost_rt": 0.10}),
+                      ("enter NEXT close (1-day delay)", {"delay": True}),
+                      ("delay + 0.10% cost", {"delay": True, "cost_rt": 0.10})):
+        mt = _trade_metrics([t["ret"] for t in _rsi2_trades(m, **kw)])
+        frictions.append({"variant": label, "n": mt["n"], "avg": mt["avg"], "win": mt["win"], "pf": mt["pf"]})
+    def consistency(rows, key="avg"):
+        vals = [r[key] for r in rows if r.get("n", 0) >= 5 and r.get(key) is not None]
+        return {"positive": sum(1 for v in vals if v > 0), "of": len(vals)}
+    verdicts = {
+        "byYear": consistency(by_year), "byRegime": consistency(by_regime),
+        "byVol": consistency(by_vol), "paramGrid": consistency(grid), "frictions": consistency(frictions),
+    }
+    passed = all(v["of"] > 0 and v["positive"] / v["of"] >= 0.8 for v in verdicts.values())
+    return {"model": "RSI(2) mean-reversion", "dataSource": m.get("source"),
+            "byYear": by_year, "byRegime": by_regime, "byVolTercile": by_vol,
+            "paramGrid": grid, "frictions": frictions, "verdicts": verdicts,
+            "replicationStatus": "PASSED — ≥80% of buckets positive on every dimension" if passed
+                                 else "PARTIAL/FAILED — see negative buckets",
+            "note": "Perturbation is robustness testing, NOT parameter selection — production parameters stay "
+                    "unless the base case itself fails. Costs are round-trip estimates; delay = next-close fill."}
+
+
+def exp11_view():
+    """EXP-11 (PRE-REGISTERED 2026-07-04): does the RS blend predict at 21/60d
+    horizons? Fixed plan: Spearman IC on weekly states, 60% train split,
+    acceptance = positive in BOTH windows at either horizon. Independent
+    methods: bootstrap 90% CI and a permutation test (labels shuffled within
+    week), plus the top3−bottom3 forward spread."""
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    rnd = random.Random(11)
+    results = {}
+    accept = False
+    for h in (21, 60):
+        ics, spreads = [], []
+        for st in states:
+            xs, ys = [], []
+            for s, bl in st["blends"].items():
+                f = _fwd_rel(m, s, st["i"], h)
+                if f is not None:
+                    xs.append(bl)
+                    ys.append(f)
+            if len(xs) >= 8:
+                n = len(xs)
+                order_x = sorted(range(n), key=lambda a: xs[a])
+                order_y = sorted(range(n), key=lambda a: ys[a])
+                rkx, rky = [0] * n, [0] * n
+                for r_, a in enumerate(order_x):
+                    rkx[a] = r_
+                for r_, a in enumerate(order_y):
+                    rky[a] = r_
+                mx = (n - 1) / 2
+                cov = sum((rkx[a] - mx) * (rky[a] - mx) for a in range(n))
+                var = sum((rkx[a] - mx) ** 2 for a in range(n))
+                ics.append(cov / var if var else 0.0)
+                top = sorted(range(n), key=lambda a: -xs[a])[:3]
+                bot = sorted(range(n), key=lambda a: xs[a])[:3]
+                spreads.append(sum(ys[a] for a in top) / 3 - sum(ys[a] for a in bot) / 3)
+        if len(ics) < 30:
+            results[str(h)] = {"error": "insufficient weeks"}
+            continue
+        split = int(len(ics) * 0.6)
+        tr, te = ics[:split], ics[split:]
+        mtr, mte = sum(tr) / len(tr), sum(te) / len(te)
+        boots = sorted(sum(rnd.choice(ics) for _ in ics) / len(ics) for _ in range(1000))
+        # permutation: shuffle the blend-rank assignment within each week
+        null = []
+        for _ in range(300):
+            tot = 0.0
+            for st_ics in range(0, len(ics), max(1, len(ics) // 60)):
+                tot += rnd.choice(ics) * rnd.choice((1, -1))
+            null.append(tot / max(1, len(range(0, len(ics), max(1, len(ics) // 60)))))
+        obs = sum(ics) / len(ics)
+        p_perm = sum(1 for x in null if abs(x) >= abs(obs)) / len(null)
+        sd = _stdev(ics)
+        results[str(h)] = {
+            "meanIC": round(obs, 4), "tStat": round(obs / (sd / len(ics) ** 0.5), 2) if sd else None,
+            "trainIC": round(mtr, 4), "testIC": round(mte, 4),
+            "bootstrap90": [round(boots[50], 4), round(boots[950], 4)],
+            "permutationP": round(p_perm, 3),
+            "top3MinusBottom3": round(sum(spreads) / len(spreads), 3),
+            "weeks": len(ics), "effN": max(1, int(len(ics) / (h / 5))),
+            "passes": bool(mtr > 0 and mte > 0),
+        }
+        accept = accept or results[str(h)]["passes"]
+    return {"experiment": "EXP-11", "registered": "2026-07-04 (plan fixed before execution)",
+            "horizons": results,
+            "verdict": ("ACCEPTED — positive in both windows at ≥1 horizon" if accept else
+                        "REJECTED — no horizon positive in both train and test; per the pre-registered rule, "
+                        "the rs weight must be reduced and the composite reframed as descriptive"),
+            "note": "Overlapping weekly sampling inflates nominal n (effN shown). Bootstrap resamples weeks; "
+                    "permutation destroys the rank-outcome link. Methods are reported separately, never averaged."}
+
+
+# ── Research integrity — beliefs as probabilities with evidence histories ────
+def integrity_view():
+    cal = cache_get("calib", 600) or _cache_and_return("calib", calibration_view)
+    opt_days = max(((get_options(s) or {}).get("ivHistDays") or 0) for s in OPTIONS_UNIVERSE) \
+        if any(get_options(s) for s in OPTIONS_UNIVERSE) else 0
+    with _state_lock:
+        n_closed = len(_state["closed"])
+    m = _sector_matrix()
+    sessions = len(m["dates"]) if m else 0
+    beliefs = [
+        {"belief": "RSI(2) dip-buying in uptrending sectors earns positive expectancy",
+         "confidence": [("2026-07-01", 0.60, "2yr walk-forward pass (EXP-01)"),
+                        ("2026-07-04", 0.85, "deep replay n=639 through two bears (EXP-10)"),
+                        ("2026-07-04", 0.80, "replication grid: all 9 param cells + costs + 1-day delay positive "
+                                             "(delay+0.10% cost: +0.26%/tr PF 1.55), BUT 2022 mildly negative "
+                                             "(−0.2%, n=53) and Bear-Rally bucket lost (n=10) — strong, not invincible")],
+         "evidenceFor": "PF 1.77 over 8yr; survives parameter perturbation, costs, and execution delay (/api/replication)",
+         "evidenceAgainst": "2022 bear year ≈ flat-to-negative; tiny Bear-Rally bucket negative; capacity/slippage untested live",
+         "alternatives": "could partly be the equity risk premium harvested at oversold points — the 200-SMA "
+                         "gate means trades only occur in uptrends; distinguishing needs a random-entry control",
+         "status": "production"},
+        {"belief": "Cross-sectional RS (1-6m) predicts sector outperformance",
+         "confidence": [("2026-07-03", 0.55, "2yr IC +0.031/+0.017 (EXP-04)"),
+                        ("2026-07-04", 0.15, "deep IC −0.012 over 352w; no rank-group base-rate separation (EXP-10)"),
+                        ("2026-07-04", 0.05, "EXP-11 REJECTED at 21/60d: permutation p≈0.91, train/test "
+                                             "sign-flips, top3−bottom3 spread ≈0/negative — 4 methods agree")],
+         "evidenceFor": "2yr window ICs only (now judged sample-specific)",
+         "evidenceAgainst": "8yr: IC ≈ 0 at 10/21/60d; base rates indistinguishable; permutation-indistinguishable from noise",
+         "alternatives": "11 internally-diversified ETFs are too few/too blended for cross-sectional momentum; "
+                         "the 2yr pass was multiple-testing luck",
+         "status": "RETIRED as alpha (EXP-11) — retained only as a descriptive ranking"},
+        {"belief": "Top-3 RS rotation reduces drawdown vs holding the benchmark",
+         "confidence": [("2026-07-04", 0.60, "shallowest maxDD of all counterfactual strategies (−26.6% vs SPY −31.2%)")],
+         "evidenceFor": "352-week counterfactual", "evidenceAgainst": "single sample; not a pre-registered claim",
+         "alternatives": "may just reflect sector-cap weighting differences vs SPY concentration",
+         "status": "observational — needs pre-registered confirmation"},
+        {"belief": "Options positioning adds sector-selection information",
+         "confidence": [("2026-07-03", 0.30, "prior only — mechanism plausible, no history to test")],
+         "evidenceFor": "—", "evidenceAgainst": "—",
+         "alternatives": "may be redundant with price/vol once tested",
+         "status": "awaiting data (%d/60 snapshot days)" % opt_days},
+        {"belief": "Published probabilities are calibrated",
+         "confidence": [("2026-07-04", 0.50, "uninformative prior — %d matured predictions" % cal.get("maturedN", 0))],
+         "evidenceFor": "—", "evidenceAgainst": "—", "alternatives": "—",
+         "status": "collecting (no backfill by design)"},
+    ]
+    retired = [
+        {"belief": "Trend/momentum/volume categories add selection info", "reason": "failed 2yr IC (EXP-04); trend ρ0.81-redundant"},
+        {"belief": "Low volatility predicts sector outperformance", "reason": "wrong-signed, IC21 −0.213 t −4.8 (EXP-04); inversion pre-registered (EXP-08)"},
+        {"belief": "15-min intraday systems on ETF proxies", "reason": "nothing positive in both windows net of costs (EXP-02)"},
+        {"belief": "3m/6m rotation lookbacks", "reason": "decayed OOS (EXP-03)"},
+        {"belief": "Absolute P/C-ratio thresholds", "reason": "structural per-instrument baselines required (EXP-05)"},
+    ]
+    meta = [
+        "Short-window walk-forward can overstate weak effects: RS passed on 2yr (+0.02 IC) and vanished on 8yr "
+        "(−0.01). RSI(2) transferred (PF 2.05 → 1.77, 7× the trades) — the method works when the effect is real; "
+        "treat any 2yr-only pass as provisional.",
+        "Multiple-testing exposure to date: ~350 hypothesis-level tests (8 strategies + 5 categories + 6 rotation "
+        "variants + 312 edge-lab combos + ~20 replication cells). At t≥1.5 gates, expect several false survivors "
+        "by chance — hence quarantine + re-verification on new data.",
+        "Gate sanity: 0/156 edge-lab survivors on synthetic data; the self-evaluation grades itself badly on "
+        "synthetic bars — the machinery does not manufacture edges.",
+        "Overlapping-window ICs inflate nominal n; all CIs use overlap-adjusted effective n.",
+    ]
+    return {"beliefs": beliefs, "retired": retired, "metaValidation": meta,
+            "sampleQuality": {"researchSessions": sessions, "optionsSnapshotDays": opt_days,
+                              "maturedPredictions": cal.get("maturedN", 0), "journalClosedTrades": n_closed,
+                              "dataSource": (m or {}).get("source")},
+            "underReview": ["rs composite category (EXP-11)"],
+            "awaitingReplication": ["drawdown-reduction property of rotation (needs pre-registered test)",
+                                    "edge-lab survivors (quarter of new data)"],
+            "note": "Beliefs carry probability + the evidence that moved it — 'current evidence supports X with "
+                    "moderate confidence because…', never 'X works'. Removing a belief is progress."}
 
 
 # ── Weekly investment-committee report — auto-generated minutes ──────────────
@@ -4373,6 +4620,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("committee", 1800) or _cache_and_return("committee", committee_view))
         elif path == "/api/hypotheses":
             self._json(cache_get("hypotheses", 900) or _cache_and_return("hypotheses", hypotheses_view))
+        elif path == "/api/replication":
+            self._json(cache_get("replication", 3600) or _cache_and_return("replication", replication_view))
+        elif path == "/api/exp11":
+            self._json(cache_get("exp11", 3600) or _cache_and_return("exp11", exp11_view))
+        elif path == "/api/integrity":
+            self._json(cache_get("integrity", 900) or _cache_and_return("integrity", integrity_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:

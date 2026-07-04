@@ -87,8 +87,38 @@ Format: Question / Hypothesis / Method / Data / Result / Limitations / Decision 
   same weekly states, train/test split at the 60% week; acceptance = positive
   both windows at either horizon. If it fails, rs weight must be reduced and
   the composite redesigned around what remains.
-- **Status:** queued — deliberately NOT run in the same cycle that produced
-  the anomaly (guard against result-chasing).
+- **Executed 2026-07-04 (next cycle, per plan). RESULT: REJECTED at both horizons.**
+  - h=21d: IC +0.006 (t 0.29) · train +0.048 / test **−0.055** · bootstrap90
+    [−0.031, +0.044] · permutation p=0.907 · top3−bottom3 −0.02%
+  - h=60d: IC −0.005 (t −0.23) · train +0.050 / test **−0.087** · bootstrap90
+    [−0.039, +0.029] · permutation p=0.913 · top3−bottom3 **−0.51%**
+  - Four independent methods agree (IC t-stat, bootstrap, permutation, decile
+    spread) — no averaging needed; there is nothing to reconcile.
+- **Alternative explanations considered:** (a) horizon mismatch — now excluded
+  at 10/21/60d; (b) regime dependence — no bucket positive with confidence
+  (EXP-10); (c) too few/too-blended assets: 11 internally-diversified ETFs may
+  simply not exhibit cross-sectional momentum — most consistent with all data;
+  (d) the 2yr pass was multiple-testing luck — likely contributor.
+- **Decision (pre-registered consequence executed):** rs weight 0.70 → 0.50;
+  composite reframed as DESCRIPTIVE ranking (alphaStatus in the payload);
+  registry stage → descriptive; belief confidence 0.55 → 0.15 → 0.05.
+- **Limitations:** overlapping weekly sampling (effN 82/28 shown); single
+  8yr window; permutation approximates the within-week label shuffle.
+- **Follow-up:** none planned — any future RS-alpha claim requires a NEW
+  pre-registered experiment on unseen data.
+
+## EXP-12 · 2026-07-04 · RSI(2) replication grid
+- **Q:** Does the platform's strongest edge survive attempts to break it?
+- **Method:** deep-history replay across years / regimes / vol terciles;
+  3×3 parameter perturbation (threshold × exit); frictions (0.10% round-trip
+  cost, next-close execution delay, both).
+- **Result:** survives everything material — all 9 parameter cells positive
+  (PF 1.29–1.76), all vol terciles positive, **delay+cost variant +0.26%/tr
+  PF 1.55** (execution-robust). Honest cracks: 2022 −0.2%/tr (n=53), 2020
+  flat, Bear-Rally bucket −1.24% (n=10) — the edge is bull/range-market
+  mean reversion; the 200-SMA gate mitigates but doesn't eliminate bear risk.
+- **Decision:** production confirmed; belief confidence 0.85 → 0.80 with the
+  bear-year caveat attached. Parameters unchanged (perturbation ≠ selection).
 
 ## Meta-findings (research about our research)
 - The **both-windows-positive gate** caught every curve-fit so far (volatility sign, 3m/6m lookbacks, intraday systems).
