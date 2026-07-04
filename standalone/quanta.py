@@ -4137,8 +4137,10 @@ def fetch_bills():
         pa = _policy_area(title + " " + (la.get("text") or ""))
         typ, num, cong = (b.get("type") or "").upper(), b.get("number", ""), b.get("congress", "")
         slug = _BILL_SLUG.get(typ)
+        stage = _bill_stage(la.get("text"))
         items.append({"bill": "%s %s" % (typ, num), "congress": cong, "title": title[:170],
                       "status": (la.get("text") or "no action recorded")[:130],
+                      "stage": stage, "nextMilestone": _STAGE_NEXT.get(stage, ""),
                       "actionDate": la.get("actionDate"), "updateDate": (b.get("updateDate") or "")[:10],
                       "policyArea": pa, "sectors": POLICY_SECTOR.get(pa, "unmapped"),
                       "chamber": b.get("originChamber") or "",
@@ -4447,6 +4449,214 @@ def _gov_follow_study():
     return out
 
 
+# ── Phase 11: policy research workstation ────────────────────────────────────
+# FOMC decision days (announcement day) from Federal Reserve published
+# schedules, 2019–2026. Unscheduled 2020 emergency actions (Mar 3, Mar 15)
+# excluded — crisis moves would contaminate the scheduled-meeting study.
+FOMC_DECISIONS = [
+    "2019-01-30", "2019-03-20", "2019-05-01", "2019-06-19", "2019-07-31", "2019-09-18", "2019-10-30", "2019-12-11",
+    "2020-01-29", "2020-04-29", "2020-06-10", "2020-07-29", "2020-09-16", "2020-11-05", "2020-12-16",
+    "2021-01-27", "2021-03-17", "2021-04-28", "2021-06-16", "2021-07-28", "2021-09-22", "2021-11-03", "2021-12-15",
+    "2022-01-26", "2022-03-16", "2022-05-04", "2022-06-15", "2022-07-27", "2022-09-21", "2022-11-02", "2022-12-14",
+    "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14", "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13",
+    "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12", "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+]
+
+
+def _ret_stats(xs):
+    if not xs:
+        return None
+    s = sorted(xs)
+    return {"n": len(xs), "meanPct": round(sum(xs) / len(xs), 2), "medianPct": round(s[len(s) // 2], 2),
+            "bestPct": round(s[-1], 2), "worstPct": round(s[0], 2),
+            "meanAbsPct": round(sum(abs(x) for x in xs) / len(xs), 2),
+            "pctPositive": round(100 * sum(1 for x in xs if x > 0) / len(xs))}
+
+
+def _fomc_event_study():
+    """Measured reaction on scheduled FOMC decision days vs the all-days
+    baseline, from deep history. The one government event type with a full
+    machine-readable date archive today; every other event type accumulates
+    in the event store until its own study is computable."""
+    spy = get_deep_bars(BENCH)
+    if not spy:
+        return {"available": False, "reason": "deep history not loaded yet"}
+
+    def day_rets(bars):
+        c = [b["c"] for b in bars]
+        ix = {dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date().isoformat(): i
+              for i, b in enumerate(bars)}
+        ev, nxt = [], []
+        for d in FOMC_DECISIONS:
+            i = ix.get(d)
+            if i is not None and i > 0:
+                ev.append((c[i] / c[i - 1] - 1) * 100)
+                if i + 1 < len(c):
+                    nxt.append((c[i + 1] / c[i] - 1) * 100)
+        return c, ev, nxt
+
+    c, ev, nxt = day_rets(spy)
+    base = _ret_stats([(c[i] / c[i - 1] - 1) * 100 for i in range(1, len(c))])
+    ds = _ret_stats(ev)
+    sec = {}
+    for s in ("XLF", "XLU", "XLK"):
+        bars = get_deep_bars(s)
+        if bars:
+            _c2, ev2, _n2 = day_rets(bars)
+            sec[s] = _ret_stats(ev2)
+    read = None
+    if ds and base and base["meanAbsPct"] > 0:
+        ratio = ds["meanAbsPct"] / base["meanAbsPct"]
+        mag = ("sharply elevated" if ratio >= 1.8 else "elevated" if ratio >= 1.35 else
+               "modestly elevated" if ratio >= 1.1 else "roughly baseline")
+        read = ("decision-day |move| %.2f%% vs %.2f%% all-days baseline (%.2fx — %s volatility); direction "
+                "~coin-flip (%d%% up) → no directional edge; at most a sizing/timing consideration."
+                % (ds["meanAbsPct"], base["meanAbsPct"], ratio, mag, ds["pctPositive"]))
+    return {"available": True, "event": "Scheduled FOMC decision day",
+            "source": "Federal Reserve published schedules 2019–2026 (2020 emergency actions excluded); "
+                      "returns from deep history (close-to-close)",
+            "spyDecisionDay": ds, "spyNextDay": _ret_stats(nxt), "allDaysBaseline": base,
+            "sectors": sec, "read": read,
+            "limitations": "close-to-close only (no intraday); dates hand-carried from published schedules; "
+                           "no statement-content classification (hawkish/dovish not separable without NLP)"}
+
+
+_BILL_STAGES = [
+    ("Became law", ["became public law", "signed by president"]),
+    ("Presidential action", ["presented to president", "to the president"]),
+    ("Passed both chambers", ["cleared for the president", "passed congress"]),
+    ("Passed Senate", ["passed senate", "agreed to in senate"]),
+    ("Passed House", ["passed house", "agreed to in house", "passed/agreed to in house"]),
+    ("Committee reported", ["reported by", "ordered to be reported", "placed on the union calendar",
+                            "placed on senate legislative calendar"]),
+    ("Committee review", ["referred to"]),
+    ("Introduced", ["introduced"]),
+]
+_STAGE_NEXT = {
+    "Introduced": "committee referral → hearings/markup; most bills die here",
+    "Committee review": "committee markup/report — historically only ~10% of bills are reported out",
+    "Committee reported": "floor scheduling and a vote in the origin chamber",
+    "Passed House": "Senate committee → floor (60-vote threshold except reconciliation)",
+    "Passed Senate": "House consideration, or conference if texts differ",
+    "Passed both chambers": "presentment to the President",
+    "Presidential action": "signature or veto (10-day window)",
+    "Became law": "agency rulemaking implements it — watch the Federal Register feed",
+    "Active": "stage not parseable from the latest action text — open the bill",
+}
+
+
+def _bill_stage(action_text):
+    t = (action_text or "").lower()
+    for stage, kws in _BILL_STAGES:
+        if any(k in t for k in kws):
+            return stage
+    return "Active"
+
+
+# Interpretation library: why each policy area matters to a sector-ETF swing
+# trader, and its standing risk. Curated analyst text, labeled as such.
+WHY_POLICY = {
+    "Antitrust": ("Breakup/blocked-merger risk reprices platform premiums and kills deal arbs; multi-year court timelines usually mute the day-1 sector-level move.",
+                  "Headline ≠ filing ≠ ruling; outcomes are binary and slow."),
+    "Drug approvals": ("FDA decisions are single-name binary events; sector-level XLV impact only when a mega-cap or a policy theme (pricing) is involved.",
+                       "PDUFA dates aren't in our free data — timing is unknown here."),
+    "Energy policy": ("Permitting/emissions rules shift XLE capex economics and XLU rate-base plans; sanctions move the crude price channel directly.",
+                      "Rules face litigation; effective dates often years out."),
+    "Defense": ("Budget authorizations/contract flow are XLI primes' revenue base; policy is slow but compounding.",
+                "Contract-to-ticker mapping unavailable free — sector-level only."),
+    "Banking & financial regulation": ("Capital/liquidity rules change XLF payout capacity and lending margins; the curve matters more day-to-day.",
+                                       "Long comment periods; final ≠ proposed."),
+    "AI": ("Compute/model rules could gate XLK earnings power; today mostly framework-stage — watch for binding rules.",
+           "No binding US AI statute yet; mostly proposals."),
+    "Telecommunications": ("Spectrum and broadband subsidy decisions move XLC carriers' capex and coverage economics.",
+                           "FCC composition drives direction; litigation common."),
+    "Trade & tariffs": ("Tariffs hit import-cost sectors (XLY retail, XLI machinery, XLB) and invite retaliation against exporters (XLK semis).",
+                        "Announcement→implementation gaps; exemptions negotiated quietly."),
+    "Sanctions & export controls": ("Export controls directly cap addressable markets (China revenue for semis); sanctions reroute energy flows.",
+                                    "Entity-list changes are abrupt and hard to anticipate."),
+    "Tax policy": ("Corporate rate/buyback-tax changes reprice all sectors via after-tax earnings; leverage-heavy sectors most sensitive.",
+                   "Requires legislation — watch reconciliation windows."),
+    "Environmental regulation": ("Emissions/water rules are direct cost items for XLE/XLB/XLU; also drive the transition-capex theme.",
+                                 "Court challenges routinely stay major rules."),
+    None: ("Unclassified policy area — read the source document.", "Keyword classifier found no match."),
+}
+
+# Expanded exposure: 9 additional policy dimensions per sector (0–3 curated,
+# same rules as SECTOR_GOV_EXPOSURE — analyst judgment, labeled, not measured).
+SECTOR_GOV_AREAS = {
+    "XLK":  {"exportControls": 3, "taxes": 2, "bankRegulation": 0, "environment": 0, "antitrust": 3, "aiRegulation": 3, "semiconductors": 3, "supplyChain": 3, "govContracts": 1},
+    "XLC":  {"exportControls": 1, "taxes": 2, "bankRegulation": 0, "environment": 0, "antitrust": 3, "aiRegulation": 3, "semiconductors": 1, "supplyChain": 1, "govContracts": 0},
+    "XLY":  {"exportControls": 1, "taxes": 1, "bankRegulation": 1, "environment": 1, "antitrust": 1, "aiRegulation": 1, "semiconductors": 1, "supplyChain": 3, "govContracts": 0},
+    "XLF":  {"exportControls": 0, "taxes": 2, "bankRegulation": 3, "environment": 0, "antitrust": 1, "aiRegulation": 1, "semiconductors": 0, "supplyChain": 0, "govContracts": 0},
+    "XLV":  {"exportControls": 0, "taxes": 1, "bankRegulation": 0, "environment": 0, "antitrust": 1, "aiRegulation": 1, "semiconductors": 0, "supplyChain": 2, "govContracts": 3},
+    "XLI":  {"exportControls": 2, "taxes": 1, "bankRegulation": 0, "environment": 2, "antitrust": 0, "aiRegulation": 0, "semiconductors": 1, "supplyChain": 3, "govContracts": 3},
+    "XLE":  {"exportControls": 2, "taxes": 2, "bankRegulation": 0, "environment": 3, "antitrust": 0, "aiRegulation": 0, "semiconductors": 0, "supplyChain": 1, "govContracts": 1},
+    "XLB":  {"exportControls": 1, "taxes": 1, "bankRegulation": 0, "environment": 3, "antitrust": 0, "aiRegulation": 0, "semiconductors": 0, "supplyChain": 3, "govContracts": 1},
+    "XLP":  {"exportControls": 0, "taxes": 1, "bankRegulation": 0, "environment": 1, "antitrust": 1, "aiRegulation": 0, "semiconductors": 0, "supplyChain": 2, "govContracts": 0},
+    "XLU":  {"exportControls": 0, "taxes": 1, "bankRegulation": 0, "environment": 3, "antitrust": 0, "aiRegulation": 1, "semiconductors": 0, "supplyChain": 1, "govContracts": 0},
+    "XLRE": {"exportControls": 0, "taxes": 2, "bankRegulation": 1, "environment": 1, "antitrust": 0, "aiRegulation": 0, "semiconductors": 0, "supplyChain": 0, "govContracts": 0},
+}
+
+
+def _sectors_of(sectors_str):
+    """Parse a sectors display string ('XLE/XLU', 'all sectors', …) to symbols."""
+    if not sectors_str:
+        return []
+    if "all" in sectors_str.lower():
+        return [s for s, _n in SECTORS]
+    return [tok for tok in re_split_secs(sectors_str) if tok in dict(SECTORS)]
+
+
+def re_split_secs(s):
+    import re
+    return re.split(r"[/,\s()]+", s or "")
+
+
+def _gov_exposure_hits(sec_syms):
+    """Portfolio positions and watchlist names inside the affected sectors."""
+    with _state_lock:
+        pos = [p["symbol"] for p in _state["positions"]]
+    pos_hit = [p for p in pos if CONGRESS_SECTOR_MAP.get(p, p) in sec_syms or p in sec_syms]
+    watch_hit = [w for w in WATCHLIST if CONGRESS_SECTOR_MAP.get(w) in sec_syms]
+    return pos_hit, watch_hit
+
+
+def _gov_scorecard(kind, date, sec_syms, pos_hit, watch_hit, hist_n, source, policy_area):
+    """Multi-dimensional event grades — every grade explains itself. Display
+    heuristics, not measured probabilities (stated on the panel)."""
+    try:
+        days = (dt.date.fromisoformat(date) - dt.date.today()).days
+    except (ValueError, TypeError):
+        days = None
+    dims = []
+    mk = "High" if kind == "Fed" else "Medium" if kind in ("Regulatory", "Congress") else "Low"
+    dims.append({"dim": "Market importance", "grade": mk,
+                 "why": {"Fed": "FOMC days measured ~2x baseline volatility (see event study)",
+                         "Regulatory": "final rules bind; sector-level cost/revenue impact",
+                         "Congress": "legislation binds if enacted, but most bills die in committee"}.get(
+                     kind, "delayed filings — context, not catalyst")})
+    pk = "High" if pos_hit else "Medium" if watch_hit else "Low"
+    dims.append({"dim": "Portfolio importance", "grade": pk,
+                 "why": ("open positions exposed: %s" % ", ".join(pos_hit)) if pos_hit else
+                        (("watchlist exposed: %s" % ", ".join(watch_hit[:5])) if watch_hit else
+                         "no open position or watchlist name in the affected sectors")})
+    dims.append({"dim": "Historical evidence", "grade": "Measured" if hist_n else "None",
+                 "why": ("event study n=%d (see Historical Event Intelligence)" % hist_n) if hist_n else
+                        "no machine-readable archive for this event type — archive accumulating since 2026-07-04"})
+    dims.append({"dim": "Research confidence", "grade": "Low",
+                 "why": "no government-derived signal has passed validation (EXP-13/GOV-02/03 pending) — descriptive only"})
+    dims.append({"dim": "Urgency", "grade": ("Today" if days == 0 else "%dd away" % days if days and days > 0
+                                             else "Occurred") if days is not None else "Undated",
+                 "why": "calendar distance, not an impact estimate"})
+    dims.append({"dim": "Data quality", "grade": "Official" if "official" in (source or "").lower() else "Delayed/self-reported",
+                 "why": source or "unknown source"})
+    dims.append({"dim": "Complexity", "grade": "High" if len(sec_syms) >= 4 else "Medium" if len(sec_syms) >= 2 else "Low",
+                 "why": "%d sectors mapped; multi-sector policy interacts with more of the book" % len(sec_syms)})
+    return dims
+
+
 def government_view():
     cg = cache_get("congress", 900) or _cache_and_return("congress", congress_view)
     reg = cache_get("fedreg", 6 * 3600) or _cache_and_return("fedreg", fetch_fedreg)
@@ -4465,6 +4675,7 @@ def government_view():
         h = heat.get(s, {})
         exposure.append({"sector": s, "name": name,
                          "scores": {k: e.get(k, 0) for k, _l in _EXPO_DIMS},
+                         "areas": SECTOR_GOV_AREAS.get(s, {}),
                          "why": e.get("why", ""),
                          "live": {"regDocs90d": h.get("regDocs", 0),
                                   "cgBuys90d": h.get("buys90d", 0), "cgSells90d": h.get("sells90d", 0),
@@ -4492,6 +4703,23 @@ def government_view():
                               "priority": "Low", "source": "FMP disclosures (delayed filings)",
                               "confidence": "context only — delayed, unvalidated"})
     catalysts.sort(key=lambda x: x["date"], reverse=True)
+    # enrichment: urgency / status / research linkage per catalyst
+    today_iso = dt.date.today().isoformat()
+    RESEARCH_LINK = {"Fed": "risk event, measured (FOMC event study)",
+                     "Congress-trades": "EXP-13 accumulating (pre-registered)",
+                     "Regulatory": "GOV-03 data-gated", "Congress": "no validated signal — descriptive",
+                     "Treasury": "no validated signal — schedule context",
+                     "Economic": "macro category (validated weight 0.25, descriptive)"}
+    for c in catalysts:
+        try:
+            dd = (dt.date.fromisoformat(c["date"]) - dt.date.today()).days
+            c["urgency"] = "today" if dd == 0 else ("in %dd" % dd if dd > 0 else "occurred")
+        except ValueError:
+            c["urgency"] = "—"
+        c["status"] = ("scheduled" if c["kind"] in ("Fed", "Treasury", "Economic") else
+                       "published" if c["kind"] == "Regulatory" else
+                       "filed (delayed)" if c["kind"] == "Congress-trades" else "in process")
+        c["researchStatus"] = RESEARCH_LINK.get(c["kind"], "—")
     # knowledge-graph lite: entity links for the most-disclosed tickers
     sec_agencies = {}
     for slug, (nm, secs) in AGENCY_SECTOR.items():
@@ -4525,8 +4753,150 @@ def government_view():
          "stage": "data-gated", "status": "needs ≥26 weekly heat observations — have %d daily snapshots (started 2026-07-04)" % heat_days},
         {"id": "GOV-03", "hypothesis": "Federal Register rule-count spikes per sector precede sector vol/underperformance",
          "stage": "data-gated", "status": "reg-doc history accumulates with the heat snapshots — same gate"},
+        {"id": "GOV-04", "hypothesis": "Non-FOMC government events (rules, bill passage, tariff/sanction actions) have "
+                                       "measurable sector reactions worth conditioning on",
+         "stage": "data-gated", "status": "event archive accumulating (no free historical archive to backfill); "
+                                          "gate: ≥30 events of a kind before its reaction study runs"},
     ]
+    # ── event briefings (institutional notes, rule-based like /api/summary) ──
+    fomc = cache_get("fomc_study", 24 * 3600) or _cache_and_return("fomc_study", _fomc_event_study)
+    sc = cache_get("scores", 600) or {}
+    scores_by = {r.get("symbol"): r.get("score") for r in (sc.get("sectors") or [])}
+    regv = cache_get("regime", 900) or {}
+    regime_read = ((regv.get("current") or {}).get("primary")) if not regv.get("error") else None
+    with _congress_lock:
+        ev_archive = dict(_congress.get("events", {}))
+    briefings = []
+
+    def _brief(kind, date, title, why, risks, sec_syms, precedent, source, policy_area=None, extra=None):
+        pos_hit, watch_hit = _gov_exposure_hits(sec_syms)
+        ctx = [("regime: %s" % regime_read) if regime_read else "regime: warming"]
+        for s in sec_syms[:4]:
+            if scores_by.get(s) is not None:
+                ctx.append("%s composite %d (descriptive)" % (s, round(scores_by[s])))
+        hist_n = (precedent or {}).get("n") if isinstance(precedent, dict) else None
+        briefings.append({
+            "kind": kind, "date": date, "title": title, "summary": title,
+            "whyItMatters": why, "risks": risks,
+            "sectors": sec_syms, "policyArea": policy_area,
+            "exposedPositions": pos_hit, "exposedWatchlist": watch_hit[:8],
+            "context": ctx, "precedent": precedent, "source": source,
+            "scorecard": _gov_scorecard(kind, date, sec_syms, pos_hit, watch_hit, hist_n, source, policy_area),
+            "limitations": "rule-generated note — interpretations are the curated policy library, not measured "
+                           "effects; company-level attribution unavailable in free data",
+            "extra": extra or {}})
+
+    # next FOMC
+    nxt_fomc = next((c for c in sorted(catalysts, key=lambda x: x["date"])
+                     if c["kind"] == "Fed" and c["date"] >= today_iso), None)
+    if nxt_fomc:
+        prec = None
+        if fomc.get("available"):
+            d0 = fomc["spyDecisionDay"] or {}
+            prec = {"n": d0.get("n"), "meanPct": d0.get("meanPct"), "medianPct": d0.get("medianPct"),
+                    "worstPct": d0.get("worstPct"), "bestPct": d0.get("bestPct"),
+                    "read": fomc.get("read")}
+        fwhy = "a sizing/timing consideration for anything held through the decision, especially rate-sensitive XLF/XLU/XLRE."
+        if prec and prec.get("read"):
+            fwhy = "Measured: %s Also %s" % (prec["read"], fwhy)
+        _brief("Fed", nxt_fomc["date"], "FOMC meeting %s" % nxt_fomc["date"], fwhy,
+               "Statement wording/dots can dominate the rate decision itself; close-to-close stats hide intraday swings.",
+               ["XLF", "XLU", "XLRE"], prec, nxt_fomc["source"])
+    # newest final rules
+    for it in [x for x in (reg.get("items") or []) if x.get("significance") == "rule"][:3]:
+        pa = it.get("policyArea")
+        why, risk = WHY_POLICY.get(pa, WHY_POLICY[None])
+        _brief("Regulatory", it["date"], "%s: %s" % (it["agency"], it["title"]), why, risk,
+               _sectors_of(it.get("sectors")), None, "Federal Register (official)", pa,
+               {"url": it.get("url"), "type": it.get("type")})
+    # bills at advanced stages, else most recent action
+    adv = [b for b in bills.get("items", []) if b.get("stage") in
+           ("Passed House", "Passed Senate", "Passed both chambers", "Presidential action", "Became law")]
+    for b in (adv or bills.get("items", [])[:2])[:3]:
+        pa = b.get("policyArea")
+        why, risk = WHY_POLICY.get(pa, WHY_POLICY[None])
+        _brief("Congress", b.get("actionDate") or b.get("updateDate"), "%s — %s" % (b["bill"], b["title"]),
+               why, risk, _sectors_of(b.get("sectors")), None, b["source"], pa,
+               {"stage": b.get("stage"), "nextMilestone": b.get("nextMilestone"), "url": b.get("url"),
+                "timelineNote": "historical duration of similar bills: not measured (no archive) — stage flow shown instead"})
+    # top conviction clusters
+    for c in (cg.get("conviction") or [])[:2]:
+        if c["grade"] in ("High", "Very High"):
+            _brief("Congress-trades", today_iso, "Cluster congressional buying: %s (%s)" % (c["ticker"], c["grade"]),
+                   "Multiple members disclosing buys in the same name is the strongest free political-flow pattern — "
+                   "but every filing is weeks old, and EXP-13 exists precisely to test whether following it earns anything.",
+                   "Delay is structural (45+ days allowed); ownership may be spouse/dependent; committee overlap unscored.",
+                   [c["sector"]] if c.get("sector") else [], None, "FMP disclosures (delayed, unverified)", None,
+                   {"why": c["why"]})
+
+    # ── morning brief ──
+    d48 = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+    d3 = (dt.date.today() - dt.timedelta(days=3)).isoformat()
+    with _congress_lock:
+        fresh_tr = [t for t in _congress["trades"].values() if (t.get("discDate") or "") >= d48]
+        hh = dict(_congress.get("heatHistory", {}))
+    overnight = []
+    if fresh_tr:
+        by_side = {"buy": 0, "sell": 0}
+        for t in fresh_tr:
+            if t["side"] in by_side:
+                by_side[t["side"]] += 1
+        tops = {}
+        for t in fresh_tr:
+            tops[t["ticker"]] = tops.get(t["ticker"], 0) + 1
+        overnight.append("%d congressional disclosures in 48h (%d buys / %d sells) — most filed: %s. All delayed filings."
+                         % (len(fresh_tr), by_side["buy"], by_side["sell"],
+                            ", ".join(sorted(tops, key=tops.get, reverse=True)[:4])))
+    new_rules = [it for it in (reg.get("items") or []) if it.get("significance") == "rule" and (it.get("date") or "") >= d3]
+    if new_rules:
+        overnight.append("%d final/proposed rule(s) published ≤3d: %s"
+                         % (len(new_rules), "; ".join("%s (%s)" % (r["agency"], r.get("sectors") or "—") for r in new_rules[:3])))
+    new_bills = [b for b in bills.get("items", []) if (b.get("actionDate") or "") >= d3]
+    if new_bills:
+        overnight.append("%d bill action(s) ≤3d — furthest along: %s"
+                         % (len(new_bills), "; ".join("%s [%s]" % (b["bill"], b["stage"]) for b in new_bills[:3])))
+    if not overnight:
+        overnight.append("no new government items in the last 48–72h windows")
+    approaching = [c for c in sorted(catalysts, key=lambda x: x["date"])
+                   if today_iso <= c["date"] <= (dt.date.today() + dt.timedelta(days=10)).isoformat()][:6]
+    # what changed: heat delta vs ~5 snapshots back (honest when history is short)
+    changes = []
+    hh_keys = sorted(hh)
+    if len(hh_keys) >= 2:
+        prev = hh[hh_keys[max(0, len(hh_keys) - 6)]]
+        curr = hh[hh_keys[-1]]
+        for s in set(list(curr) + list(prev)):
+            db = curr.get(s, {}).get("b", 0) - prev.get(s, {}).get("b", 0)
+            ds_ = curr.get(s, {}).get("s", 0) - prev.get(s, {}).get("s", 0)
+            if abs(db) + abs(ds_) >= 3:
+                changes.append("%s: %+d buys / %+d sells vs %s" % (s, db, ds_, hh_keys[max(0, len(hh_keys) - 6)]))
+    if not changes:
+        changes.append("sector-heat change detection needs more snapshot history (have %d day(s), started 2026-07-04)"
+                       % len(hh_keys))
+    pos_all, watch_all = _gov_exposure_hits([s for s, _n in SECTORS])
+    active_secs = sorted(((h["sector"], h["buys90d"] + h["sells90d"] + h["regDocs"]) for h in cg.get("heat", [])),
+                         key=lambda x: -x[1])[:3]
+    brief = {"asOf": today_iso, "regime": regime_read or "warming",
+             "overnight": overnight,
+             "watchSectors": [{"sector": s, "why": "highest combined gov activity (filings+reg docs 90d): %d" % n}
+                              for s, n in active_secs if n > 0] or
+                             [{"sector": "—", "why": "no measurable government activity concentration yet"}],
+             "approaching": approaching,
+             "changes": changes,
+             "portfolioNote": ("open positions: %s — all sector ETFs inherit every policy dimension of their sector "
+                               "(see exposure table)" % ", ".join(pos_all)) if pos_all else "no open positions",
+             "challenged": [p.get("status") or (p.get("study") or {}).get("status", "") for p in pipeline],
+             "monitorNext": ([("%s (%s, %s)" % (c["title"][:60], c["date"], c["urgency"])) for c in approaching[:3]] or
+                             ["nothing scheduled inside 10 days"]),
+             "note": "assembled by rules from the live feeds below — not an AI narrative, no prediction implied"}
+
     return {"disclaimer": CONGRESS_DISCLAIMER, "policy": GOV_PIPELINE_NOTE,
+            "brief": brief, "briefings": briefings,
+            "eventStudies": {"fomc": fomc,
+                             "otherKinds": "no machine-readable historical archive exists free for antitrust cases, "
+                                           "FDA approvals, tariffs, shutdowns, sanctions or SEC actions — the event "
+                                           "store (n=%d since 2026-07-04) accumulates them so similarity/reaction "
+                                           "studies become computable instead of fabricated" % len(ev_archive)},
             "exposure": exposure,
             "exposureNote": "0–3 structural ratings are curated analyst judgments (hover 'why'); LIVE columns are "
                             "measured counts. Rates sensitivity has independent measured support in the factor library.",
@@ -4570,6 +4940,33 @@ def congress_loop():
                 hh[today] = snap
                 for k in sorted(hh)[:-750] if len(hh) > 750 else []:
                     del hh[k]
+            # event archive — institutional memory. Log every dated government
+            # event so reaction/similarity studies become computable over time
+            # (there is no free historical archive to backfill from).
+            try:
+                evs = {}
+                reg = cache_get("fedreg", 6 * 3600) or _cache_and_return("fedreg", fetch_fedreg)
+                for it in (reg.get("items") or []):
+                    if it.get("significance") == "rule":
+                        evs["reg|%s|%s" % (it.get("date"), (it.get("title") or "")[:50])] = {
+                            "kind": "Regulatory", "date": it.get("date"), "title": (it.get("title") or "")[:120],
+                            "agency": it.get("agency"), "policyArea": it.get("policyArea"),
+                            "sectors": it.get("sectors"), "loggedAt": today}
+                bl = cache_get("bills", 6 * 3600) or _cache_and_return("bills", fetch_bills)
+                for b in (bl.get("items") or []):
+                    evs["bill|%s|%s" % (b["bill"], b.get("stage"))] = {
+                        "kind": "Congress", "date": b.get("actionDate") or b.get("updateDate"),
+                        "title": ("%s %s" % (b["bill"], b["title"]))[:120], "stage": b.get("stage"),
+                        "policyArea": b.get("policyArea"), "sectors": b.get("sectors"), "loggedAt": today}
+                with _congress_lock:
+                    store = _congress.setdefault("events", {})
+                    for k, v in evs.items():
+                        store.setdefault(k, v)
+                    if len(store) > 4000:
+                        for k in sorted(store, key=lambda x: store[x].get("date") or "")[:len(store) - 4000]:
+                            del store[k]
+            except Exception:
+                pass
             _congress_save()
             # top disclosed tickers get price history so performance is computable
             counts = {}

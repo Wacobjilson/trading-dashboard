@@ -236,9 +236,21 @@
       passes the same pre-registered validation as every other model.
       <span id="cg-status" class="muted" style="font-size:11px"></span></div>
 
+    <div class="sechead">MORNING BRIEF</div>
+    <div class="card"><h2>Committee briefing — government &amp; policy <span class="muted" id="gv-brief-asof" style="font-weight:normal;font-size:11px"></span></h2>
+      <div id="gv-brief"><div class="loading">…</div></div></div>
+
+    <div class="sechead">EVENT BRIEFINGS</div>
+    <div class="card"><h2>Research notes on active events <span class="muted" style="font-weight:normal;font-size:11px">(rule-generated, evidence cited, expand for scorecard)</span></h2>
+      <div id="gv-briefs"><div class="loading">…</div></div></div>
+
+    <div class="sechead">HISTORICAL EVENT INTELLIGENCE</div>
+    <div class="card"><h2>Measured event studies</h2><div id="gv-events"><div class="loading">…</div></div></div>
+
     <div class="sechead">SECTOR GOVERNMENT EXPOSURE</div>
     <div class="card"><h2>Structural policy sensitivity by sector <span class="muted" style="font-weight:normal;font-size:11px">(curated ratings + live activity — hover a row for the reasoning)</span></h2>
-      <div id="gv-exp" class="scrollx"><div class="loading">…</div></div></div>
+      <div id="gv-exp" class="scrollx"><div class="loading">…</div></div>
+      <div id="gv-exp-detail"></div></div>
 
     <div class="sechead">CONGRESSIONAL ACTIVITY</div>
     <div class="card"><h2>Sector political heat (last 90 days)</h2><div id="cg-heat"><div class="loading">…</div></div></div>
@@ -1402,15 +1414,79 @@ function renderCatalysts(){
   const kind=document.getElementById("gv-cat-kind").value;
   const rows=(_gv.catalysts||[]).filter(c=>(!kind||c.kind===kind)&&(!q||`${c.title} ${c.sectors} ${c.kind} ${c.policyArea||""}`.toLowerCase().includes(q)));
   document.getElementById("gv-cat").innerHTML=rows.length?
-    `<table><thead><tr><th>Date</th><th>Catalyst</th><th>Kind</th><th>Priority</th><th>Sectors</th><th>Confidence</th></tr></thead><tbody>
+    `<table><thead><tr><th>Date</th><th>Urgency</th><th>Catalyst</th><th>Kind</th><th>Status</th><th>Priority</th><th>Sectors</th><th>Research</th><th>Confidence</th></tr></thead><tbody>
     ${rows.slice(0,40).map(c=>`<tr><td class="mono">${c.date}</td>
+      <td class="mono ${c.urgency==='today'?'amber':(c.urgency||'').startsWith('in')?'up':'muted'}" style="font-size:11px">${c.urgency||'—'}</td>
       <td style="white-space:normal;font-size:12px">${c.url?`<a href="${c.url}" target="_blank" rel="noopener" style="color:var(--text)">${c.title}</a>`:c.title}${c.policyArea?` <span class="badge b-neu">${c.policyArea}</span>`:""}</td>
       <td><span class="badge b-neu">${c.kind}</span></td>
+      <td class="muted" style="font-size:10px">${c.status||'—'}</td>
       <td class="${c.priority==='High'?'amber':'muted'}" style="font-size:11px">${c.priority}</td>
       <td class="muted" style="font-size:11px;white-space:normal">${c.sectors}</td>
+      <td class="muted" style="font-size:10px;white-space:normal">${c.researchStatus||'—'}</td>
       <td class="muted" style="font-size:10px;white-space:normal">${c.confidence}<div style="font-size:9px">${c.source}</div></td></tr>`).join("")}</tbody></table>
-    <div class="note">Priority is a display heuristic (scheduled Fed events > legislation/rules > delayed filings), not a measured impact estimate — no validated impact model exists.</div>`
+    <div class="note">Priority/urgency are display heuristics (scheduled Fed events > legislation/rules > delayed filings), not measured impact estimates — no validated impact model exists.</div>`
     :'<div class="muted" style="padding:8px">No catalysts match the filter.</div>';
+}
+const gradeBadge=g=>{const c=/High|Measured|today|Official/i.test(g)?"b-ready":/Medium|d away/i.test(g)?"b-appr":"b-neu";return `<span class="badge ${c}">${g}</span>`;};
+function showExpoDetail(sym){
+  const e=(_gv&&_gv.exposure||[]).find(x=>x.sector===sym); if(!e)return;
+  const all={...e.scores,...e.areas};
+  const LBL={govSpending:"Gov spending",defense:"Defense",healthPolicy:"Health policy",regulation:"Regulation",trade:"Trade",rates:"Interest rates",fiscal:"Fiscal policy",election:"Election",exportControls:"Export controls",taxes:"Taxes",bankRegulation:"Bank regulation",environment:"Environmental",antitrust:"Antitrust",aiRegulation:"AI regulation",semiconductors:"Semiconductors",supplyChain:"Supply chains",govContracts:"Gov contracts"};
+  document.getElementById("gv-exp-detail").innerHTML=
+    `<div style="border-top:1px solid var(--border);margin-top:8px;padding-top:8px;font-size:12px">
+     <b>${e.sector}</b> ${e.name} — full policy exposure profile
+     <span class="clk" style="float:right;color:var(--muted)" onclick="document.getElementById('gv-exp-detail').innerHTML=''">✕ close</span>
+     <div style="display:flex;flex-wrap:wrap;gap:4px;margin:6px 0">
+       ${Object.entries(all).map(([k,v])=>`<span class="badge ${v>=3?'b-bear':v===2?'b-appr':'b-neu'}" title="${LBL[k]||k}">${LBL[k]||k}: ${["—","low","med","HIGH"][v]||"—"}</span>`).join("")}</div>
+     <div class="muted" style="font-size:11px"><b>Rationale:</b> ${e.why}</div>
+     <div class="muted" style="font-size:11px"><b>Live activity:</b> ${e.live.regDocs90d} reg docs 90d · ${e.live.cgBuys90d}/${e.live.cgSells90d} congressional buys/sells 90d · ${e.live.activeBills} mapped bills</div>
+     <div class="note">Ratings are curated analyst judgments about structural sensitivity — not measured coefficients. Rates sensitivity has independent measured support (factor library). <span class="clk" style="color:var(--text)" onclick="openChart('${e.sector}')">Open ${e.sector} chart →</span></div></div>`;
+}
+function renderGovBrief(gv){
+  const b=gv.brief||{};
+  document.getElementById("gv-brief-asof").textContent=`as of ${b.asOf} · regime: ${b.regime}`;
+  const li=xs=>(xs||[]).map(x=>`<li>${typeof x==="string"?x:JSON.stringify(x)}</li>`).join("");
+  document.getElementById("gv-brief").innerHTML=
+    `<div class="cols cols2" style="font-size:12px">
+      <div><b>What happened (48–72h)</b><ul style="margin:4px 0 8px 18px">${li(b.overnight)}</ul>
+        <b>What changed</b><ul style="margin:4px 0 8px 18px">${li(b.changes)}</ul>
+        <b>Portfolio</b><div class="muted" style="margin:4px 0 8px">${b.portfolioNote||""}</div></div>
+      <div><b>Sectors to watch</b><ul style="margin:4px 0 8px 18px">${(b.watchSectors||[]).map(w=>`<li><b>${w.sector}</b> — ${w.why}</li>`).join("")}</ul>
+        <b>Approaching (≤10d)</b><ul style="margin:4px 0 8px 18px">${(b.approaching||[]).map(c=>`<li><span class="mono">${c.date}</span> ${c.title} <span class="badge b-neu">${c.kind}</span></li>`).join("")||"<li>nothing inside 10 days</li>"}</ul>
+        <b>Assumptions in play</b><ul style="margin:4px 0 8px 18px">${li((b.challenged||[]).filter(Boolean))}</ul></div></div>
+    <div class="note">${b.note||""}</div>`;
+}
+function renderGovBriefings(gv){
+  const bs=gv.briefings||[];
+  document.getElementById("gv-briefs").innerHTML=bs.length?bs.map(b=>{
+    const prec=b.precedent?`measured: n=${b.precedent.n}, mean ${pct(b.precedent.meanPct)}, median ${pct(b.precedent.medianPct)}, best ${pct(b.precedent.bestPct)}, worst ${pct(b.precedent.worstPct)}${b.precedent.read?` — ${b.precedent.read}`:""}`
+      :"no measured precedent — no machine-readable archive for this event type (archive accumulating)";
+    return`<details style="border-top:1px solid var(--border);padding:6px 0">
+      <summary style="cursor:pointer;font-size:12.5px"><span class="badge b-neu">${b.kind}</span> <span class="mono muted">${b.date||""}</span> <b>${b.title}</b>${(b.exposedPositions||[]).length?' <span class="badge b-bear">POSITION EXPOSED</span>':''}</summary>
+      <div style="font-size:12px;padding:6px 0 2px 12px">
+        <div><b>Why it matters:</b> ${b.whyItMatters}</div>
+        <div style="margin-top:3px"><b>Known risks:</b> ${b.risks}</div>
+        <div style="margin-top:3px"><b>Affected sectors:</b> ${(b.sectors||[]).join(", ")||"—"}${b.policyArea?` · <span class="badge b-neu">${b.policyArea}</span>`:""}</div>
+        <div style="margin-top:3px"><b>Exposure:</b> positions [${(b.exposedPositions||[]).join(", ")||"none"}] · watchlist [${(b.exposedWatchlist||[]).join(", ")||"none"}]</div>
+        <div style="margin-top:3px"><b>Historical precedent:</b> ${prec}</div>
+        <div style="margin-top:3px"><b>Market context:</b> ${(b.context||[]).join(" · ")}</div>
+        ${b.extra&&b.extra.stage?`<div style="margin-top:3px"><b>Lifecycle:</b> stage <span class="badge b-appr">${b.extra.stage}</span> → next: ${b.extra.nextMilestone||"—"} <span class="muted">(${b.extra.timelineNote||""})</span></div>`:""}
+        ${b.extra&&b.extra.url?`<div style="margin-top:3px"><a href="${b.extra.url}" target="_blank" rel="noopener" style="color:var(--text)">source document →</a></div>`:""}
+        <div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:4px">${(b.scorecard||[]).map(s=>`<span title="${(s.why||"").replace(/"/g,"'")}">${s.dim}: ${gradeBadge(s.grade)}</span>`).join("")}</div>
+        <div class="note">${b.limitations} · source: ${b.source}</div></div></details>`;}).join("")
+    :'<div class="muted" style="padding:8px">No active events to brief.</div>';
+}
+function renderGovEvents(gv){
+  const es=(gv.eventStudies||{}),f=es.fomc||{};
+  const row=(l,s)=>s?`<tr><td>${l}</td><td class="mono">${s.n}</td><td class="mono ${dir(s.meanPct)}">${pct(s.meanPct)}</td><td class="mono">${pct(s.medianPct)}</td><td class="mono up">${pct(s.bestPct)}</td><td class="mono down">${pct(s.worstPct)}</td><td class="mono">${s.meanAbsPct}%</td><td class="mono">${s.pctPositive}%</td></tr>`:"";
+  document.getElementById("gv-events").innerHTML=(f.available?
+    `<div style="font-size:12px;margin-bottom:4px"><b>${f.event}</b> <span class="muted" style="font-size:11px">— ${f.source}</span></div>
+     <table><thead><tr><th>Series</th><th>n</th><th>Mean</th><th>Median</th><th>Best</th><th>Worst</th><th>|Move|</th><th>% up</th></tr></thead><tbody>
+     ${row("SPY decision day",f.spyDecisionDay)}${row("SPY next day",f.spyNextDay)}${row("SPY all days (baseline)",f.allDaysBaseline)}
+     ${Object.entries(f.sectors||{}).map(([s,v])=>row(s+" decision day",v)).join("")}</tbody></table>
+     <div class="note"><b>${f.read||""}</b><br>${f.limitations||""}</div>`
+    :`<div class="muted" style="padding:8px">FOMC study: ${f.reason||"unavailable"}</div>`)
+    +`<div class="note" style="margin-top:6px"><b>Other event types:</b> ${es.otherKinds||""}</div>`;
 }
 document.getElementById("gv-cat-q").addEventListener("input",renderCatalysts);
 document.getElementById("gv-cat-kind").addEventListener("change",renderCatalysts);
@@ -1420,10 +1496,11 @@ async function loadCongress(){
                                        fetch(`${API}/api/congress_reg`).then(r=>r.json()),
                                        fetch(`${API}/api/government`).then(r=>r.json())]);
     _gv=gv;
+    renderGovBrief(gv); renderGovBriefings(gv); renderGovEvents(gv);
     // sector exposure
     document.getElementById("gv-exp").innerHTML=(gv.exposure&&gv.exposure.length)?
       `<table><thead><tr><th>Sector</th>${EXPO_DIMS.map(x=>`<th>${x[1]}</th>`).join("")}<th>Reg 90d</th><th>CG B/S 90d</th><th>Bills</th></tr></thead><tbody>
-      ${gv.exposure.map(e=>`<tr class="clk" title="${(e.why||"").replace(/"/g,"'")}" onclick="openChart('${e.sector}')">
+      ${gv.exposure.map(e=>`<tr class="clk" title="${(e.why||"").replace(/"/g,"'")}" onclick="showExpoDetail('${e.sector}')">
         <td><b>${e.sector}</b> <span class="muted" style="font-size:10px">${e.name}</span></td>
         ${EXPO_DIMS.map(x=>expoCell(e.scores[x[0]])).join("")}
         <td class="mono muted">${e.live.regDocs90d}</td>
@@ -1434,9 +1511,10 @@ async function loadCongress(){
     // bills
     const bl=gv.bills||{};
     document.getElementById("gv-bills").innerHTML=(bl.items&&bl.items.length)?
-      `<table><thead><tr><th>Bill</th><th>Title</th><th>Latest action</th><th>Date</th><th>Policy area</th><th>Sectors</th></tr></thead><tbody>
+      `<table><thead><tr><th>Bill</th><th>Title</th><th>Stage</th><th>Latest action</th><th>Date</th><th>Policy area</th><th>Sectors</th></tr></thead><tbody>
       ${bl.items.map(b=>`<tr><td class="mono">${b.url?`<a href="${b.url}" target="_blank" rel="noopener" style="color:var(--text)"><b>${b.bill}</b></a>`:`<b>${b.bill}</b>`}</td>
         <td style="white-space:normal;font-size:12px">${b.title}</td>
+        <td title="next: ${(b.nextMilestone||"").replace(/"/g,"'")}"><span class="badge ${/law|President|both/i.test(b.stage||'')?'b-ready':/Passed/.test(b.stage||'')?'b-appr':'b-neu'}">${b.stage||'—'}</span></td>
         <td class="muted" style="white-space:normal;font-size:11px">${b.status}</td>
         <td class="mono">${b.actionDate||b.updateDate||"—"}</td>
         <td>${b.policyArea?`<span class="badge b-neu">${b.policyArea}</span>`:'<span class="muted">—</span>'}</td>

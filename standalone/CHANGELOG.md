@@ -1,5 +1,22 @@
 # Changelog (standalone platform)
 
+## 2026-07-04 · Phase 11 — policy research workstation
+- **Morning brief** at the top of the Government tab (overnight items,
+  changes vs snapshot history, sectors to watch, approaching catalysts,
+  portfolio note, assumptions in play) — rule-assembled, no AI narrative.
+- **Event briefings**: institutional research notes (why it matters, risks,
+  exposed positions/watchlist, market context, precedent, multi-dimension
+  scorecard with explanations, limitations) for FOMC, final rules,
+  advanced-stage bills, conviction clusters.
+- **Measured event study**: scheduled FOMC decision days 2019–2026 vs
+  baseline (SPY + XLF/XLU/XLK) — measured n=59: |move| 0.92% vs 0.78%
+  baseline (~1.2x, modestly elevated), 51% up → no directional edge.
+  Other event types: event archive accumulates (GOV-04, gate ≥30/kind)
+  instead of fabricated similarity scores.
+- Bill lifecycle stages + next milestones; exposure expanded to 17 policy
+  dimensions (click-through profile); catalysts gain urgency/status/research
+  columns. All still descriptive — nothing feeds scores/allocation.
+
 ## 2026-07-04 · Phase 10 — Government & Policy Intelligence Center
 - **Congress tab rebuilt as "Government"** (one tab, sectioned): sector
   government exposure (curated 0–3 ratings + live counts), congressional

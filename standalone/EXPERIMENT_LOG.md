@@ -145,3 +145,19 @@ Format: Question / Hypothesis / Method / Data / Result / Limitations / Decision 
   congressional buying vs forward sector-relative returns (needs >= 26 weekly
   heat snapshots; daily snapshots started 2026-07-04); GOV-03 Federal
   Register rule-count spikes vs sector vol/returns (same snapshot store).
+
+## GOV-04 - registered 2026-07-04 - government event reactions (non-FOMC)
+- **Status: DATA-GATED.** No free machine-readable historical archive exists
+  for antitrust cases, FDA approvals, tariff announcements, shutdowns,
+  sanctions or SEC actions - so the platform logs every dated government
+  event (rules, bill stage changes) into congress_trades.json -> events
+  (started 2026-07-04) instead of fabricating similarity scores.
+- **Gate:** >= 30 archived events of a kind before that kind gets a reaction
+  study (same design as the FOMC study: event-day and next-day sector
+  returns vs all-days baseline).
+- **Measured today:** scheduled FOMC decisions only (published date archive
+  2019-2026, 2020 emergency actions excluded). First run n=59: decision-day
+  |move| 0.92% vs 0.78% all-days baseline (~1.2x, MODESTLY elevated - less
+  than folklore suggests, partly because the 8yr baseline includes 2020/2022
+  high-vol days), 51% up -> no directional edge; sizing context at most.
+  Read out live at /api/government -> eventStudies.

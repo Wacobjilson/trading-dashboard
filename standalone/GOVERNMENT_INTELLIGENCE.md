@@ -71,6 +71,40 @@ panel says so. Click any ticker on the tab to open its profile.
 - **GOV-03:** Federal Register rule-count spikes vs sector vol/returns —
   same snapshot store.
 
+## Phase 11 — policy research workstation layer
+- **Morning brief** (`brief` in `/api/government`): rule-assembled from the
+  live feeds — new disclosures (48h), new rules/bill actions (3d), approaching
+  catalysts (≤10d), sector-heat change vs ~5 snapshots back (says "needs more
+  history" until it has it), portfolio note, pipeline statuses. Not an AI
+  narrative; no prediction implied.
+- **Event briefings** (`briefings`): institutional notes for the next FOMC,
+  newest final rules, advanced-stage bills, and high-conviction clusters. Each:
+  why-it-matters + risks (curated policy library `WHY_POLICY`, labeled),
+  affected sectors, exposed positions/watchlist, market context (regime +
+  descriptive composite), precedent, multi-dimension scorecard (market/
+  portfolio importance, historical evidence, research confidence, urgency,
+  data quality, complexity — every grade carries its why), limitations.
+- **Historical event intelligence**: the ONE event type with a machine-readable
+  archive today is the scheduled FOMC decision (published dates 2019–2026,
+  2020 emergency actions excluded) → measured decision-day study vs all-days
+  baseline (SPY + XLF/XLU/XLK): mean/median/best/worst/|move|/% up. Measured
+  finding (first run, n=59): |move| 0.92% vs 0.78% baseline (~1.2x, modestly
+  elevated), 51% up — no directional edge; at most a sizing consideration.
+  All other event types (antitrust, FDA, tariffs, shutdowns, sanctions,
+  SEC actions) have **no free historical archive** — the event store
+  (`congress_trades.json → events`, capped 4,000) accumulates them going
+  forward so reaction/similarity studies become computable instead of faked
+  (GOV-04, gate ≥30 events per kind).
+- **Bill lifecycle**: stage parsed from the latest official action
+  (Introduced → Committee → Passed House/Senate → President → Law) with the
+  typical next milestone; durations not estimated (no archive).
+- **Expanded exposure**: 8 headline dimensions in the table + 9 more
+  (export controls, taxes, bank regulation, environment, antitrust, AI,
+  semiconductors, supply chains, government contracts) in the click-through
+  sector profile. Same rule: curated judgments, labeled, never scored.
+- **Catalyst tracker**: adds urgency (calendar distance), status, and research
+  linkage (which experiment/status covers that event kind).
+
 ## Known gaps (stated, not papered over)
 FDA approval calendars (PDUFA), lobbying intensity (Senate LDA client-name→
 ticker matching unreliable — parked), DoD contract-award→ticker mapping
