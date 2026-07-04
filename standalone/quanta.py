@@ -1220,6 +1220,380 @@ def macro_view():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RESEARCH & PREDICTION ENGINE — runs on the bars already cached in memory.
+# Answers "what has historically happened next under similar conditions?" with
+# empirical distributions, Wilson confidence intervals and explicit sample
+# sizes. 2 years of daily data is a SMALL sample; every view says so rather
+# than presenting certainty. All classification uses backward-looking data only.
+# ─────────────────────────────────────────────────────────────────────────────
+CYCLICALS = ("XLK", "XLY", "XLF", "XLI")
+DEFENSIVES = ("XLP", "XLU", "XLV")
+_research_cache = {}
+
+
+def _sector_matrix():
+    """Date-aligned closes for the 11 sectors + SPY from cached bars."""
+    spy_bars = get_bars(BENCH)
+    if not spy_bars or len(spy_bars) < 300:
+        return None
+    def dts(bars):
+        return [dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date() for b in bars]
+    per = {}
+    for sym, _n in SECTORS:
+        b = get_bars(sym)
+        if not b:
+            return None
+        per[sym] = (b, dts(b))
+    spy_d = dts(spy_bars)
+    common = sorted(set(spy_d).intersection(*[set(d) for _b, d in per.values()]))
+    if len(common) < 300:
+        return None
+    idx_spy = {d: i for i, d in enumerate(spy_d)}
+    spy = [spy_bars[idx_spy[d]]["c"] for d in common]
+    C = {}
+    for sym, (b, d) in per.items():
+        ix = {dd: i for i, dd in enumerate(d)}
+        C[sym] = [b[ix[dd]]["c"] for dd in common]
+    return {"dates": common, "C": C, "spy": spy}
+
+
+def _ret(c, i, n):
+    return (c[i] / c[i - n] - 1) * 100 if i - n >= 0 and c[i - n] else None
+
+
+def regime_at(m, i):
+    """Backward-looking regime label at day-index i of the aligned matrix."""
+    spy, C = m["spy"], m["C"]
+    if i < 260:
+        return None
+    s200 = sum(spy[i - 199:i + 1]) / 200
+    above = spy[i] > s200
+    r21 = _ret(spy, i, 21) or 0
+    primary = (("Trending Bull" if r21 >= -1 else "Bull Pullback") if above
+               else ("Bear Rally" if r21 > 1 else "Trending Bear"))
+    rets = [spy[k] / spy[k - 1] - 1 for k in range(i - 20, i + 1)]
+    vol = _stdev(rets) * (252 ** 0.5) * 100
+    hist_vols = [_stdev([spy[k] / spy[k - 1] - 1 for k in range(j - 20, j + 1)]) * (252 ** 0.5) * 100
+                 for j in range(260, i + 1, 21)]
+    volpct = (sum(1 for v in hist_vols if v <= vol) / len(hist_vols)) if hist_vols else 0.5
+    volmod = "high-vol" if volpct >= 0.8 else "low-vol" if volpct <= 0.3 else "mid-vol"
+    def rel21(sym):
+        a, b = _ret(C[sym], i, 21), _ret(spy, i, 21)
+        return (a - b) if (a is not None and b is not None) else 0
+    cyc = sum(rel21(s) for s in CYCLICALS) / len(CYCLICALS)
+    dfs = sum(rel21(s) for s in DEFENSIVES) / len(DEFENSIVES)
+    spread = cyc - dfs
+    rot = "risk-on" if spread >= 0.5 else "defensive" if spread <= -0.5 else "mixed"
+    breadth = sum(1 for s in C if i >= 49 and C[s][i] > sum(C[s][i - 49:i + 1]) / 50) / len(C)
+    return {"primary": primary, "vol": volmod, "rotation": rot,
+            "label": "%s · %s · %s" % (primary, volmod, rot),
+            "evidence": {"spyVs200d": round((spy[i] / s200 - 1) * 100, 2), "spyRet21d": round(r21, 2),
+                         "realizedVol": round(vol, 1), "volPercentile": round(volpct * 100),
+                         "cycMinusDef21d": round(spread, 2), "breadthAbove50": round(breadth * 100)}}
+
+
+def _weekly_states():
+    """Weekly market-state snapshots (features + per-sector RS ranks + regime),
+    cached per bar-set. Everything at week t uses only data ≤ t."""
+    m = _sector_matrix()
+    if not m:
+        return None
+    ck = ("weekly", len(m["dates"]), m["dates"][-1])
+    if ck in _research_cache:
+        return _research_cache[ck]
+    spy, C, dates = m["spy"], m["C"], m["dates"]
+    n = len(dates)
+    states = []
+    for i in range(260, n, 5):
+        reg = regime_at(m, i)
+        blends = {}
+        for s in C:
+            r1 = (_ret(C[s], i, 21) or 0) - (_ret(spy, i, 21) or 0)
+            r3 = (_ret(C[s], i, 63) or 0) - (_ret(spy, i, 63) or 0)
+            r6 = (_ret(C[s], i, 126) or 0) - (_ret(spy, i, 126) or 0)
+            blends[s] = 0.5 * r1 + 0.3 * r3 + 0.2 * r6
+        order = sorted(blends, key=blends.get, reverse=True)
+        rank = {s: k for k, s in enumerate(order)}      # 0 = strongest
+        # avg pairwise sector correlation over 21d (correlation structure)
+        rmat = {s: [C[s][k] / C[s][k - 1] - 1 for k in range(i - 20, i + 1)] for s in C}
+        syms = list(C)
+        cors = []
+        for a in range(len(syms)):
+            for b in range(a + 1, len(syms)):
+                r1_, r2_ = rmat[syms[a]], rmat[syms[b]]
+                m1, m2 = sum(r1_) / len(r1_), sum(r2_) / len(r2_)
+                cv = sum((x - m1) * (y - m2) for x, y in zip(r1_, r2_))
+                v1 = sum((x - m1) ** 2 for x in r1_) ** 0.5
+                v2 = sum((y - m2) ** 2 for y in r2_) ** 0.5
+                if v1 > 0 and v2 > 0:
+                    cors.append(cv / (v1 * v2))
+        states.append({
+            "i": i, "date": dates[i].isoformat(), "regime": reg,
+            "blends": blends, "rank": rank,
+            "features": {"breadth": reg["evidence"]["breadthAbove50"],
+                         "spyR21": reg["evidence"]["spyRet21d"],
+                         "spyR63": _ret(spy, i, 63) or 0,
+                         "volPct": reg["evidence"]["volPercentile"],
+                         "cycDef": reg["evidence"]["cycMinusDef21d"],
+                         "avgCorr": round(sum(cors) / len(cors), 3) if cors else None,
+                         "ewSpy21": round(sum(((_ret(C[s], i, 21) or 0) - (_ret(spy, i, 21) or 0))
+                                              for s in C) / len(C), 2)},
+        })
+    out = {"m": m, "states": states}
+    if len(_research_cache) > 8:
+        _research_cache.clear()
+    _research_cache[ck] = out
+    return out
+
+
+def _fwd_rel(m, sym, i, h):
+    spy, c = m["spy"], m["C"][sym]
+    if i + h >= len(c):
+        return None
+    return (c[i + h] / c[i] - 1) * 100 - (spy[i + h] / spy[i] - 1) * 100
+
+
+def _wilson(p, n, z=1.96):
+    if n == 0:
+        return 0.0, 1.0
+    den = 1 + z * z / n
+    ctr = p + z * z / (2 * n)
+    rad = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    return max(0.0, (ctr - rad) / den), min(1.0, (ctr + rad) / den)
+
+
+RANK_GROUPS = [("Top-3 RS", 0, 2), ("Mid (4-8)", 3, 7), ("Bottom-3 RS", 8, 10)]
+
+
+def probabilities_view():
+    """Empirical P(sector beats SPY over h days | its current RS rank group),
+    pooled across all sectors and weeks. Overlapping windows inflate n, so the
+    effective sample is ~n/(h/5) — both numbers are reported."""
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    table = []
+    for gname, lo, hi in RANK_GROUPS:
+        row = {"group": gname, "horizons": {}}
+        for h in (5, 10, 21, 60):
+            obs = []
+            for st in states:
+                for s, rk in st["rank"].items():
+                    if lo <= rk <= hi:
+                        f = _fwd_rel(m, s, st["i"], h)
+                        if f is not None:
+                            obs.append(f)
+            if len(obs) < 20:
+                row["horizons"][str(h)] = None
+                continue
+            wins = sum(1 for o in obs if o > 0)
+            p = wins / len(obs)
+            ci = _wilson(p, max(1, int(len(obs) / max(1, h / 5))))   # CI on effective n
+            so = sorted(obs)
+            row["horizons"][str(h)] = {
+                "p": round(p * 100, 1), "ciLo": round(ci[0] * 100, 1), "ciHi": round(ci[1] * 100, 1),
+                "median": round(so[len(so) // 2], 2), "q25": round(so[len(so) // 4], 2),
+                "q75": round(so[3 * len(so) // 4], 2), "n": len(obs),
+                "nEff": max(1, int(len(obs) / max(1, h / 5))),
+            }
+        table.append(row)
+    cur = {}
+    last = states[-1]
+    for s, rk in last["rank"].items():
+        cur[s] = next(g for g, lo, hi in RANK_GROUPS if lo <= rk <= hi)
+    return {"table": table, "currentGroup": cur, "asOf": last["date"],
+            "note": "Pooled 11 sectors × %d weeks (2yr — small sample). CI uses the overlap-adjusted "
+                    "effective n. These are historical base rates, not forecasts." % len(states)}
+
+
+def regime_view():
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    cur = regime_at(m, len(m["dates"]) - 1)
+    freq = {}
+    for st in states:
+        freq[st["regime"]["primary"]] = freq.get(st["regime"]["primary"], 0) + 1
+    # per-regime historical sector winners/losers (forward 21d SPY-relative)
+    perf = {}
+    for st in states:
+        r = st["regime"]["primary"]
+        for s in st["blends"]:
+            f = _fwd_rel(m, s, st["i"], 21)
+            if f is not None:
+                perf.setdefault(r, {}).setdefault(s, []).append(f)
+    hist = {}
+    for r, d in perf.items():
+        rows = sorted(((s, sum(v) / len(v), len(v)) for s, v in d.items()), key=lambda x: -x[1])
+        hist[r] = {"weeks": freq.get(r, 0),
+                   "winners": [{"symbol": s, "avgRel21": round(a, 2), "n": n} for s, a, n in rows[:3]],
+                   "losers": [{"symbol": s, "avgRel21": round(a, 2), "n": n} for s, a, n in rows[-3:]]}
+    # confidence: margins from the rule boundaries
+    ev = cur["evidence"]
+    margins = [min(1.0, abs(ev["spyVs200d"]) / 3), min(1.0, abs(ev["spyRet21d"] + 1) / 3
+               if cur["primary"] in ("Trending Bull", "Bull Pullback") else abs(ev["spyRet21d"] - 1) / 3),
+               min(1.0, abs(ev["volPercentile"] - 55) / 45)]
+    conf = round(100 * sum(margins) / len(margins))
+    return {"current": cur, "confidence": conf,
+            "frequencies": {r: {"weeks": c, "pct": round(100 * c / len(states), 1)} for r, c in freq.items()},
+            "historical": hist, "sampleWeeks": len(states),
+            "note": "Rule-based, backward-looking only. 2yr sample: regime stats with few weeks are anecdotes, "
+                    "not statistics — n is shown everywhere."}
+
+
+def analogs_view(k=8):
+    """Nearest historical market states to today (z-scored features, euclidean),
+    excluding the last 4 weeks, with what happened next."""
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    keys = ["breadth", "spyR21", "spyR63", "volPct", "cycDef", "avgCorr", "ewSpy21"]
+    vals = {kk: [st["features"][kk] for st in states if st["features"][kk] is not None] for kk in keys}
+    mu = {kk: sum(v) / len(v) for kk, v in vals.items() if v}
+    sd = {kk: (_stdev(v) or 1) for kk, v in vals.items() if v}
+    def zvec(st):
+        return [((st["features"][kk] or mu[kk]) - mu[kk]) / sd[kk] for kk in keys]
+    today = states[-1]
+    tz = zvec(today)
+    cands = []
+    for st in states[:-4]:
+        d = sum((a - b) ** 2 for a, b in zip(zvec(st), tz)) ** 0.5
+        cands.append((d, st))
+    cands.sort(key=lambda x: x[0])
+    rows, spy10, spy21, top3rel = [], [], [], []
+    spy = m["spy"]
+    for d, st in cands[:k]:
+        i = st["i"]
+        f10 = ((spy[i + 10] / spy[i] - 1) * 100) if i + 10 < len(spy) else None
+        f21 = ((spy[i + 21] / spy[i] - 1) * 100) if i + 21 < len(spy) else None
+        top3 = [s for s, rk in st["rank"].items() if rk <= 2]
+        t3 = [x for x in (_fwd_rel(m, s, i, 21) for s in top3) if x is not None]
+        t3m = sum(t3) / len(t3) if t3 else None
+        rows.append({"date": st["date"], "distance": round(d, 2), "regime": st["regime"]["label"],
+                     "top3Then": top3, "spyFwd10": round(f10, 2) if f10 is not None else None,
+                     "spyFwd21": round(f21, 2) if f21 is not None else None,
+                     "top3FwdRel21": round(t3m, 2) if t3m is not None else None})
+        if f10 is not None:
+            spy10.append(f10)
+        if f21 is not None:
+            spy21.append(f21)
+        if t3m is not None:
+            top3rel.append(t3m)
+    def agg(v):
+        if not v:
+            return None
+        sv = sorted(v)
+        return {"win": round(100 * sum(1 for x in v if x > 0) / len(v)), "median": round(sv[len(sv) // 2], 2),
+                "worst": round(sv[0], 2), "best": round(sv[-1], 2), "n": len(v)}
+    return {"today": {"date": today["date"], "features": today["features"], "regime": today["regime"]["label"]},
+            "analogs": rows,
+            "aggregate": {"spyFwd10": agg(spy10), "spyFwd21": agg(spy21), "top3ContinuationRel21": agg(top3rel)},
+            "note": "%d nearest of %d weeks by z-scored state distance — one 2yr regime cycle, so analogs "
+                    "describe THIS sample, not all of history." % (k, len(states) - 4)}
+
+
+def research_view():
+    """Validation of the production signal, live: rolling IC, IC by regime
+    (the adaptive-weighting test), and RS rank-group monotonicity."""
+    ws = _weekly_states()
+    if not ws:
+        return {"error": "bars still warming"}
+    m, states = ws["m"], ws["states"]
+    ics = []
+    for st in states:
+        xs, ys = [], []
+        for s, bl in st["blends"].items():
+            f = _fwd_rel(m, s, st["i"], 10)
+            if f is not None:
+                xs.append(bl)
+                ys.append(f)
+        if len(xs) >= 8:
+            n = len(xs)
+            rx = sorted(range(n), key=lambda a: xs[a])
+            ry = sorted(range(n), key=lambda a: ys[a])
+            rkx, rky = [0] * n, [0] * n
+            for r_, a in enumerate(rx):
+                rkx[a] = r_
+            for r_, a in enumerate(ry):
+                rky[a] = r_
+            mx = sum(rkx) / n
+            cov = sum((rkx[a] - mx) * (rky[a] - mx) for a in range(n))
+            var = sum((rkx[a] - mx) ** 2 for a in range(n))
+            ics.append({"date": st["date"], "ic": round(cov / var, 3) if var else None,
+                        "regime": st["regime"]["primary"]})
+    roll = []
+    vals = [x["ic"] for x in ics if x["ic"] is not None]
+    for j in range(12, len(ics)):
+        w = [x["ic"] for x in ics[j - 12:j + 1] if x["ic"] is not None]
+        roll.append({"date": ics[j]["date"], "ic13w": round(sum(w) / len(w), 3) if w else None})
+    by_reg = {}
+    for x in ics:
+        if x["ic"] is not None:
+            by_reg.setdefault(x["regime"], []).append(x["ic"])
+    regs = []
+    for r, v in sorted(by_reg.items(), key=lambda kv: -len(kv[1])):
+        mn, se, n = (sum(v) / len(v), (_stdev(v) / len(v) ** 0.5) if len(v) > 2 else None, len(v))
+        regs.append({"regime": r, "n": n, "meanIC": round(mn, 3),
+                     "tStat": round(mn / se, 1) if se else None})
+    enough = [r for r in regs if r["n"] >= 30]
+    verdict = ("ADAPTIVE WEIGHTING NOT JUSTIFIED YET: no regime has n≥30 weekly ICs (largest bucket n=%d) — "
+               "per-regime differences are indistinguishable from noise at this sample size. Static weights stay; "
+               "re-run as history accumulates." % (max((r["n"] for r in regs), default=0))
+               if not enough else
+               "Buckets with n≥30 exist — compare their mean ICs before considering adaptive weights.")
+    return {"weeklyIC": ics[-26:], "rollingIC": roll, "icOverall": round(sum(vals) / len(vals), 3) if vals else None,
+            "byRegime": regs, "adaptiveWeightingVerdict": verdict,
+            "note": "RS blend vs forward 10d SPY-relative return, Spearman per week (11 sectors). "
+                    "This is the LIVE version of research_categories.py's test."}
+
+
+def opportunities_view():
+    sc = cache_get("scores", 120) or _cache_and_return("scores", sector_scores)
+    prob = probabilities_view()
+    reg = regime_view()
+    if prob.get("error") or reg.get("error"):
+        return {"error": "warming"}
+    ptab = {r["group"]: r["horizons"].get("10") for r in prob.get("table", [])}
+    cur_reg = reg["current"]["primary"]
+    regperf = {w["symbol"]: (w["avgRel21"], w["n"]) for w in
+               reg["historical"].get(cur_reg, {}).get("winners", []) +
+               reg["historical"].get(cur_reg, {}).get("losers", [])}
+    rows = []
+    for s in sc.get("sectors", []):
+        grp = prob["currentGroup"].get(s["symbol"])
+        p10 = ptab.get(grp)
+        evidence = ["composite %s (rs-weighted, conf %s%%)" % (s["total"], s["confidence"]),
+                    "RS group: %s → historical P(beat SPY 10d) %s%% [%s–%s], median %+0.2f%%"
+                    % (grp, p10["p"], p10["ciLo"], p10["ciHi"], p10["median"]) if p10 else "probability table warming"]
+        conflicts = []
+        cats = s.get("categories", {})
+        if cats.get("options", {}).get("score", 50) < 45 and s["total"] >= 55:
+            conflicts.append("options positioning bearish (%s) vs strong composite: %s"
+                             % (cats["options"]["score"], cats["options"]["detail"]))
+        if cats.get("macro", {}).get("score", 50) < 42 and s["total"] >= 55:
+            conflicts.append("macro headwind (%s): %s" % (cats["macro"]["score"], cats["macro"]["detail"]))
+        if s.get("risk", 0) >= 60:
+            conflicts.append("elevated risk score %s (%s)" % (s["risk"], s.get("riskDetail", "")))
+        rp = regperf.get(s["symbol"])
+        fit = None
+        if rp:
+            fit = {"avgRel21": rp[0], "n": rp[1], "regime": cur_reg}
+            (evidence if rp[0] > 0 else conflicts).append(
+                "in %s weeks this sector averaged %+0.2f%% vs SPY fwd 21d (n=%d)" % (cur_reg, rp[0], rp[1]))
+        rows.append({"symbol": s["symbol"], "name": s["name"], "score": s["total"],
+                     "pBeat10d": p10["p"] if p10 else None, "group": grp,
+                     "risk": s["risk"], "confidence": s["confidence"], "delta1d": s.get("delta1d"),
+                     "regimeFit": fit, "evidence": evidence, "conflicts": conflicts})
+    rows.sort(key=lambda r: -r["score"])
+    return {"regime": cur_reg, "rows": rows,
+            "note": "Ranked by the evidence-weighted composite; probability and regime-fit columns are "
+                    "historical base rates with n shown — context, not forecasts."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Market summary — synthesizes scores + rotation + breadth + options + macro
 # into prose where EVERY sentence carries its numbers. Deterministic rule-based
 # generator by default; if ANTHROPIC_API_KEY is set, the same data bundle is
@@ -1815,7 +2189,9 @@ def _opt_history_update(summ):
             except (FileNotFoundError, ValueError):
                 hist = {}
             h = hist.setdefault(summ["symbol"], {})
-            h[day] = {"iv30": summ.get("iv30"), "oi": summ.get("totalOI"), "pcr": summ.get("pcrOI")}
+            # gex/dex stored so positioning-CHANGE research activates as days accrue
+            h[day] = {"iv30": summ.get("iv30"), "oi": summ.get("totalOI"), "pcr": summ.get("pcrOI"),
+                      "gex": summ.get("netGEX"), "dex": summ.get("netDEX")}
             for d in sorted(h)[:-260]:      # keep ~1yr
                 del h[d]
             with open(OPT_HIST_PATH + ".tmp", "w") as f:
@@ -1851,6 +2227,9 @@ def _opt_enrich_from_history(summ, h):
         summ["oiChangePct"] = round((summ["totalOI"] / h[prev[-1]]["oi"] - 1) * 100, 1)
     else:
         summ["oiChange"] = summ["oiChangePct"] = None
+    summ["gexChange"] = (round(summ["netGEX"] - h[prev[-1]]["gex"], 1)
+                         if prev and h[prev[-1]].get("gex") is not None and summ.get("netGEX") is not None
+                         else None)
     return summ
 
 
@@ -2141,11 +2520,17 @@ def position_add(d):
     entry = _fnum(d.get("entry"))
     if not sym or entry is None or entry <= 0:
         return {"ok": False, "error": "symbol and entry price are required"}
+    try:
+        m = _sector_matrix()
+        reg = regime_at(m, len(m["dates"]) - 1)["primary"] if m else None
+    except Exception:
+        reg = None
     p = {"id": _next_id(), "symbol": sym,
          "dir": "short" if d.get("dir") == "short" else "long",
          "qty": _fnum(d.get("qty")) or 1,
          "entry": entry, "stop": _fnum(d.get("stop")), "target": _fnum(d.get("target")),
-         "note": str(d.get("note", ""))[:120], "opened": time.time()}
+         "note": str(d.get("note", ""))[:120], "opened": time.time(),
+         "regime": reg}     # tagged so the journal can learn expectancy by regime
     with _state_lock:
         _state["positions"].append(p)
     save_state()
@@ -2291,7 +2676,38 @@ def positions_view():
                 "note": "current allocation replayed over %d sessions — not your trade record" % m,
             }
     analytics["note"] = "63d daily returns; weights = share of gross exposure (shorts negative)"
-    return {"open": rows, "closed": closed[::-1], "analytics": analytics,
+    # concentration warnings — the numbers that make a portfolio one trade in disguise
+    warnings = []
+    for a in ({"symbol": k, "pct": round(v / tot_val * 100, 1)} for k, v in alloc.items() if tot_val):
+        if a["pct"] > 40:
+            warnings.append("%s is %.0f%% of gross exposure — concentration" % (a["symbol"], a["pct"]))
+    if (analytics.get("avgPairCorr") or 0) > 0.75:
+        warnings.append("avg pairwise correlation %.2f — positions are one trade in disguise" % analytics["avgPairCorr"])
+    if analytics.get("beta") is not None and abs(analytics["beta"]) > 1.5:
+        warnings.append("portfolio beta %.2f vs SPY — outsized market exposure" % analytics["beta"])
+    if (analytics.get("expDailyVolPct") or 0) > 2.5:
+        warnings.append("expected daily vol %.2f%% — hot sizing" % analytics["expDailyVolPct"])
+    analytics["warnings"] = warnings
+
+    # trade-journal intelligence (closed trades; small n is labeled, not hidden)
+    def _jgroup(keyfn):
+        g = {}
+        for c in closed:
+            g.setdefault(keyfn(c) or "?", []).append(c)
+        out_ = []
+        for k, v in g.items():
+            pls = [c.get("pl") or 0 for c in v]
+            holds = [(c["closedAt"] - c["opened"]) / 86400 for c in v if c.get("closedAt") and c.get("opened")]
+            out_.append({"key": k, "n": len(v), "win": round(100 * sum(1 for x in pls if x > 0) / len(pls)),
+                         "totalPL": round(sum(pls), 2), "avgPL": round(sum(pls) / len(pls), 2),
+                         "avgHoldDays": round(sum(holds) / len(holds), 1) if holds else None})
+        out_.sort(key=lambda r: -r["totalPL"])
+        return out_
+    journal = {"bySymbol": _jgroup(lambda c: c["symbol"]),
+               "byDir": _jgroup(lambda c: c.get("dir")),
+               "byRegime": _jgroup(lambda c: c.get("regime")),
+               "note": "closed trades only — groups with n<10 are anecdotes, not statistics"} if closed else None
+    return {"open": rows, "closed": closed[::-1], "analytics": analytics, "journal": journal,
             "totalValue": round(tot_val, 2), "openPL": round(tot_pl, 2),
             "realizedPL": round(sum(by_sym.values()), 2),
             "realizedBySymbol": [{"symbol": k, "pl": round(v, 2)} for k, v in
@@ -2473,9 +2889,18 @@ def _check_price_alerts():
         save_state()
 
 
+def _check_portfolio_risk():
+    with _state_lock:
+        has = bool(_state["positions"])
+    if not has:
+        return
+    for wmsg in (positions_view().get("analytics") or {}).get("warnings", []):
+        push_alert("risk", "PORTFOLIO", wmsg, "warn", dedupe_hours=24, key=wmsg[:40])
+
+
 def check_alerts():
     for fn in (_check_signal_alerts, _check_setup_alerts, _check_rotation_alerts,
-               _check_position_alerts, _check_price_alerts):
+               _check_position_alerts, _check_price_alerts, _check_portfolio_risk):
         try:
             fn()
         except Exception as e:
@@ -2564,6 +2989,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("macro", 300) or _cache_and_return("macro", macro_view))
         elif path == "/api/summary":
             self._json(cache_get("summary", 600) or _cache_and_return("summary", market_summary))
+        elif path == "/api/regime":
+            self._json(cache_get("regime", 600) or _cache_and_return("regime", regime_view))
+        elif path == "/api/probabilities":
+            self._json(cache_get("probs", 600) or _cache_and_return("probs", probabilities_view))
+        elif path == "/api/analogs":
+            self._json(cache_get("analogs", 600) or _cache_and_return("analogs", analogs_view))
+        elif path == "/api/research":
+            self._json(cache_get("research", 600) or _cache_and_return("research", research_view))
+        elif path == "/api/opportunities":
+            self._json(cache_get("opps", 300) or _cache_and_return("opps", opportunities_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:

@@ -113,6 +113,7 @@
   <button data-tab="signals">Signals</button>
   <button data-tab="rotation">Rotation</button>
   <button data-tab="options">Options</button>
+  <button data-tab="research">Research</button>
   <button data-tab="entries">Entries</button>
   <button data-tab="portfolio">Portfolio</button>
   <button data-tab="chart">Chart</button>
@@ -126,6 +127,7 @@
   <!-- INTEL (market intelligence engine — the synthesis view) -->
   <section class="tab active" id="tab-intel">
     <div class="card" id="intel-regime" style="font-size:13px;padding:10px 16px">Loading regime…</div>
+    <div class="card" id="intel-opps" style="font-size:13px"><div class="loading">Ranking opportunities…</div></div>
     <div class="card" id="intel-summary" style="font-size:13px;white-space:pre-line">Loading market summary…</div>
     <div class="card"><h2>Sector intelligence scores <span class="muted" style="text-transform:none;letter-spacing:0" id="intel-weights"></span></h2>
       <div class="scrollx" id="intel-table"><div class="loading">Scoring sectors…</div></div>
@@ -190,6 +192,21 @@
     </div>
   </section>
 
+  <!-- RESEARCH -->
+  <section class="tab" id="tab-research">
+    <div class="card" style="font-size:13px"><span class="badge b-appr">RESEARCH MODE</span>
+      &nbsp;Everything here computes live from the same 2-year bar cache the production score uses — regime
+      classification, historical base rates, analogs and validation. <b class="amber">A 2-year sample is one
+      regime cycle</b>: every number carries its n and these are descriptions of this sample, never forecasts.
+      Nothing enters the production composite until it survives the validation shown here.</div>
+    <div class="card" id="rs-regime"><div class="loading">Classifying regime…</div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Production-signal validation (live)</h2><div id="rs-validation"><div class="loading">…</div></div></div>
+      <div class="card"><h2>P(beat SPY) by RS rank group — historical base rates</h2><div id="rs-probs"><div class="loading">…</div></div></div>
+    </div>
+    <div class="card"><h2>Historical analogs — the market states most similar to today</h2><div id="rs-analogs"><div class="loading">…</div></div></div>
+  </section>
+
   <!-- ENTRIES -->
   <section class="tab" id="tab-entries">
     <div class="card">
@@ -225,6 +242,7 @@
     <div class="card"><h2>Open positions — alerts fire automatically as price nears your stop/target</h2>
       <div id="pf-open"><div class="loading">Loading…</div></div></div>
     <div class="card"><h2>Closed positions (realized P&amp;L)</h2><div id="pf-closed"></div></div>
+    <div class="card"><h2>Trade journal intelligence</h2><div id="pf-journal"><div class="muted" style="padding:8px">No closed trades yet — expectancy by symbol/direction/regime appears here as you close positions (new positions are auto-tagged with the market regime at entry).</div></div></div>
   </section>
 
   <!-- CHART -->
@@ -318,6 +336,7 @@ function activate(t){
   if(t==="signals")loadSignals();
   if(t==="rotation")loadRotation();
   if(t==="options")loadOptions();
+  if(t==="research")loadResearch();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
   if(t==="portfolio")loadPortfolio();
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
@@ -800,8 +819,25 @@ const INTEL_COLS=[
   {k:"quadrant",l:"Quad",r:o=>`<span class="q-${o.quadrant}">${o.quadrant||'—'}</span>`},
   {k:"_spark",l:"13w trend",r:o=>spark(o.history)},
 ];
+async function loadOpps(){
+  try{
+    const d=await(await fetch(`${API}/api/opportunities`)).json();
+    const el=document.getElementById("intel-opps");
+    if(d.error){el.innerHTML=`<div class="loading">Opportunity ranking ${d.error}…</div>`;return;}
+    const rows=(d.rows||[]).slice(0,3);
+    el.innerHTML=`<b style="color:var(--amber)">TOP OPPORTUNITIES</b> <span class="muted" style="font-size:11px">· regime: ${d.regime} · ${d.note}</span>`+
+      rows.map((o,i)=>`<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">
+        <b>#${i+1} ${o.symbol}</b> <span class="muted">${o.name}</span>
+        · score <b style="color:${scoreCol(o.score)}">${o.score}</b>
+        ${o.pBeat10d!=null?`· P(beat SPY 10d) <b class="mono">${o.pBeat10d}%</b> <span class="muted">(${o.group})</span>`:''}
+        · risk <span class="${o.risk>=60?'down':'muted'} mono">${o.risk}</span>
+        <span class="mini" style="cursor:pointer;float:right" onclick="renderIntelDetail('${o.symbol}')">breakdown</span>
+        <div style="font-size:12px;margin-top:3px">${(o.evidence||[]).map(e=>`<div class="up" style="opacity:.85">＋ ${e}</div>`).join("")}
+        ${(o.conflicts||[]).map(c=>`<div class="down" style="opacity:.85">− ${c}</div>`).join("")||'<div class="muted">no conflicting evidence detected</div>'}</div></div>`).join("");
+  }catch(e){document.getElementById("intel-opps").innerHTML='<div class="loading">Opportunities failed.</div>';}
+}
 async function loadIntel(){
-  loadSummary();
+  loadSummary(); loadOpps();
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();
     _intel=d.sectors||[];
@@ -957,6 +993,77 @@ function drawGexCurve(d){
   el.innerHTML=g;
 }
 
+// ── RESEARCH TAB ──
+async function loadResearch(){
+  try{
+    const [reg,val,prob,ana]=await Promise.all(["regime","research","probabilities","analogs"]
+      .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
+    renderRsRegime(reg); renderRsValidation(val); renderRsProbs(prob); renderRsAnalogs(ana);
+  }catch(e){document.getElementById("rs-regime").innerHTML='<div class="loading">Research engines failed to load.</div>';}
+}
+function renderRsRegime(d){
+  const el=document.getElementById("rs-regime");
+  if(d.error){el.innerHTML=`<div class="loading">${d.error}</div>`;return;}
+  const c=d.current,ev=c.evidence;
+  const freq=Object.entries(d.frequencies||{}).sort((a,b)=>b[1].weeks-a[1].weeks)
+    .map(([r,f])=>`<span class="badge ${r===c.primary?'b-ready':'b-neu'}" style="margin-right:6px">${r} ${f.pct}%</span>`).join("");
+  const h=(d.historical||{})[c.primary];
+  const wl=h?`<div style="margin-top:6px;font-size:12px"><b>In ${c.primary} weeks (n=${h.weeks}):</b>
+    historically led: ${h.winners.map(w=>`<span class="up">${w.symbol} ${w.avgRel21>0?'+':''}${w.avgRel21}% (n=${w.n})</span>`).join(", ")} ·
+    lagged: ${h.losers.map(w=>`<span class="down">${w.symbol} ${w.avgRel21>0?'+':''}${w.avgRel21}%</span>`).join(", ")}
+    <span class="muted">(fwd 21d vs SPY)</span></div>`:"";
+  el.innerHTML=`<h2>Market regime classifier</h2>
+    <div style="font-size:15px"><b class="amber">${c.label}</b> · confidence <b class="mono">${d.confidence}%</b></div>
+    <div class="muted" style="font-size:12px;margin:4px 0">evidence: SPY ${ev.spyVs200d>0?'+':''}${ev.spyVs200d}% vs 200d ·
+      21d ${ev.spyRet21d>0?'+':''}${ev.spyRet21d}% · realized vol ${ev.realizedVol}% (${ev.volPercentile}th pctile) ·
+      cyc−def ${ev.cycMinusDef21d>0?'+':''}${ev.cycMinusDef21d}% · breadth ${ev.breadthAbove50}% >50d</div>
+    <div style="margin-top:4px">${freq}</div>${wl}
+    <div class="note">${d.note}</div>`;
+}
+function renderRsValidation(d){
+  const el=document.getElementById("rs-validation");
+  if(d.error){el.innerHTML=`<div class="loading">${d.error}</div>`;return;}
+  const roll=(d.rollingIC||[]).map(x=>x.ic13w).filter(x=>x!=null);
+  el.innerHTML=`<div style="font-size:13px">RS-blend IC vs fwd 10d (all weeks): <b class="mono ${d.icOverall>0?'up':'down'}">${d.icOverall}</b>
+      · rolling 13w: ${spark(roll)} <span class="mono ${roll[roll.length-1]>0?'up':'down'}">${roll.length?roll[roll.length-1]:'—'}</span></div>
+    <table style="margin-top:8px"><thead><tr><th>Regime</th><th>n weeks</th><th>mean IC</th><th>t</th></tr></thead><tbody>
+    ${(d.byRegime||[]).map(r=>`<tr><td>${r.regime}</td><td class="mono">${r.n}</td>
+      <td class="mono ${r.meanIC>0?'up':'down'}">${r.meanIC}</td><td class="mono muted">${r.tStat??'—'}</td></tr>`).join("")}</tbody></table>
+    <div class="note"><b>Adaptive weighting verdict:</b> ${d.adaptiveWeightingVerdict}</div>
+    <div class="note">${d.note}</div>`;
+}
+function renderRsProbs(d){
+  const el=document.getElementById("rs-probs");
+  if(d.error){el.innerHTML=`<div class="loading">${d.error}</div>`;return;}
+  const hs=["5","10","21","60"];
+  el.innerHTML=`<table><thead><tr><th>RS group now</th>${hs.map(h=>`<th>${h}d</th>`).join("")}</tr></thead><tbody>`+
+    (d.table||[]).map(r=>`<tr><td><b>${r.group}</b></td>`+hs.map(h=>{const c=r.horizons[h];
+      return c?`<td><span class="mono ${c.p>=52?'up':c.p<=48?'down':'muted'}">${c.p}%</span>
+        <div class="muted" style="font-size:10px">[${c.ciLo}–${c.ciHi}] · med ${c.median>0?'+':''}${c.median}% · n${c.n}/${c.nEff}eff</div></td>`
+      :'<td class="muted">n&lt;20</td>';}).join("")+"</tr>").join("")+"</tbody></table>"+
+    `<div style="margin-top:6px;font-size:12px"><b>Now:</b> ${Object.entries(d.currentGroup||{}).filter(([s,g])=>g==="Top-3 RS").map(([s])=>`<span class="up">${s}</span>`).join(" ")} top-3 ·
+     ${Object.entries(d.currentGroup||{}).filter(([s,g])=>g==="Bottom-3 RS").map(([s])=>`<span class="down">${s}</span>`).join(" ")} bottom-3</div>
+    <div class="note">${d.note}</div>`;
+}
+function renderRsAnalogs(d){
+  const el=document.getElementById("rs-analogs");
+  if(d.error){el.innerHTML=`<div class="loading">${d.error}</div>`;return;}
+  const a=d.aggregate||{};
+  const ag=(l,v)=>v?`<span style="margin-right:16px">${l}: <b class="mono ${v.median>0?'up':'down'}">med ${v.median>0?'+':''}${v.median}%</b>
+    <span class="muted" style="font-size:11px">win ${v.win}% · worst ${v.worst}% · best +${v.best}% · n${v.n}</span></span>`:"";
+  el.innerHTML=`<div style="font-size:13px;margin-bottom:6px"><b>Today:</b> ${d.today.regime} ·
+      breadth ${d.today.features.breadth}% · vol pctile ${d.today.features.volPct} · avg sector ρ ${d.today.features.avgCorr}</div>
+    <div style="font-size:13px;margin-bottom:8px"><b>What followed the ${(d.analogs||[]).length} closest states:</b><br>
+      ${ag("SPY fwd 10d",a.spyFwd10)}${ag("SPY fwd 21d",a.spyFwd21)}${ag("then-top-3 continuation (rel, 21d)",a.top3ContinuationRel21)}</div>
+    <div class="scrollx"><table><thead><tr><th>Week</th><th>Dist</th><th>Regime then</th><th>Top-3 then</th><th>SPY +10d</th><th>SPY +21d</th><th>Top-3 rel +21d</th></tr></thead><tbody>
+    ${(d.analogs||[]).map(r=>`<tr><td class="mono">${r.date}</td><td class="mono muted">${r.distance}</td><td>${r.regime}</td>
+      <td class="mono">${(r.top3Then||[]).join(" ")}</td>
+      <td class="mono ${dir(r.spyFwd10)}">${r.spyFwd10==null?'—':pct(r.spyFwd10)}</td>
+      <td class="mono ${dir(r.spyFwd21)}">${r.spyFwd21==null?'—':pct(r.spyFwd21)}</td>
+      <td class="mono ${dir(r.top3FwdRel21)}">${r.top3FwdRel21==null?'—':pct(r.top3FwdRel21)}</td></tr>`).join("")}</tbody></table></div>
+    <div class="note">${d.note}</div>`;
+}
+
 // ── MACRO INSIGHT (Markets tab) ──
 async function loadMacro(){
   try{
@@ -978,7 +1085,7 @@ async function loadMacro(){
 const NAV_BTNS=[...document.querySelectorAll("#nav button")];
 document.addEventListener("keydown",e=>{
   if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT"||e.ctrlKey||e.metaKey||e.altKey)return;
-  const keys="1234567890-";
+  const keys="1234567890-=";
   const i=keys.indexOf(e.key);
   if(i>=0&&i<NAV_BTNS.length){NAV_BTNS[i].click();e.preventDefault();}
   if(e.key==="/"){NAV_BTNS.find(b=>b.dataset.tab==="chart").click();document.getElementById("ch-sym").select();e.preventDefault();}
@@ -1010,7 +1117,9 @@ async function loadPortfolio(){
         · <b>exp. daily vol:</b> <span class="mono">${an.expDailyVolPct!=null?an.expDailyVolPct+'%':'—'}</span>
         · <b>avg pair ρ:</b> <span class="mono">${an.avgPairCorr!=null?an.avgPairCorr:'—'}</span>
         ${an.excluded&&an.excluded.length?`<span class="muted">(no bar history: ${an.excluded.join(", ")})</span>`:""}`:"";
-    const stLine=st?`<div style="margin-top:6px;font-size:13px"><b>Stress (${st.days}d replay):</b>
+    const warns=(an.warnings||[]).length?
+      `<div style="margin-top:6px">${an.warnings.map(w=>`<span class="badge b-bear" style="margin-right:6px">⚠ ${w}</span>`).join("")}</div>`:"";
+    const stLine=st?`${warns}<div style="margin-top:6px;font-size:13px"><b>Stress (${st.days}d replay):</b>
         worst day <span class="mono down">${st.worstDayPct}%</span> ·
         VaR95 <span class="mono down">${st.var95Pct}%</span> ·
         max DD <span class="mono down">${st.maxDDPct}%</span> ·
@@ -1050,6 +1159,17 @@ async function loadPortfolio(){
         <td class="mono ${dir(p.pl)}">${signed(p.pl)}</td>
         <td class="muted">${p.closedAt?new Date(p.closedAt*1000).toLocaleDateString():''}</td></tr>`).join("")+"</tbody></table>"
       :'<div class="muted" style="padding:8px">Nothing closed yet.</div>';
+    if(d.journal){
+      const jt=(title,rows)=>rows&&rows.length?`<div style="margin-top:8px"><b style="font-size:12px">${title}</b>
+        <table style="margin-top:4px"><thead><tr><th>Group</th><th>n</th><th>Win%</th><th>Total P&L</th><th>Avg P&L</th><th>Avg hold</th></tr></thead><tbody>
+        ${rows.map(r=>`<tr><td><b>${r.key}</b></td><td class="mono">${r.n}${r.n<10?' <span class="muted" style="font-size:10px">(small)</span>':''}</td>
+          <td class="mono">${r.win}%</td><td class="mono ${dir(r.totalPL)}">${signed(r.totalPL)}</td>
+          <td class="mono ${dir(r.avgPL)}">${signed(r.avgPL)}</td><td class="mono muted">${r.avgHoldDays!=null?r.avgHoldDays+'d':'—'}</td></tr>`).join("")}
+        </tbody></table></div>`:"";
+      document.getElementById("pf-journal").innerHTML=
+        jt("By symbol",d.journal.bySymbol)+jt("By direction",d.journal.byDir)+jt("By market regime at entry",d.journal.byRegime)+
+        `<div class="note">${d.journal.note}</div>`;
+    }
   }catch(e){document.getElementById("pf-summary").textContent="Portfolio failed to load.";}
 }
 setInterval(()=>{if(tabActive("portfolio"))loadPortfolio();},15000);
