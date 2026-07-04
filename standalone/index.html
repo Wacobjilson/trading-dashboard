@@ -127,6 +127,7 @@
   <!-- INTEL (market intelligence engine — the synthesis view) -->
   <section class="tab active" id="tab-intel">
     <div class="card" id="intel-regime" style="font-size:13px;padding:10px 16px">Loading regime…</div>
+    <div class="card" id="intel-cio" style="font-size:13px"><div class="loading">Preparing committee briefing…</div></div>
     <div class="card" id="intel-opps" style="font-size:13px"><div class="loading">Ranking opportunities…</div></div>
     <div class="card" id="intel-summary" style="font-size:13px;white-space:pre-line">Loading market summary…</div>
     <div class="card"><h2>Sector intelligence scores <span class="muted" style="text-transform:none;letter-spacing:0" id="intel-weights"></span></h2>
@@ -205,6 +206,7 @@
       <div class="ctl"><span class="seg" id="fx-sel"></span></div>
       <div id="rs-factors"><div class="loading">Computing factor attribution…</div></div></div>
     <div class="card"><h2>Edge discovery lab — automated condition search</h2><div id="rs-edgelab"><div class="loading">…</div></div></div>
+    <div class="card"><h2>Confidence calibration — do our published probabilities come true?</h2><div id="rs-calib"><div class="loading">…</div></div></div>
     <div class="cols cols2">
       <div class="card"><h2>Production-signal validation (live)</h2><div id="rs-validation"><div class="loading">…</div></div></div>
       <div class="card"><h2>P(beat SPY) by RS rank group — historical base rates</h2><div id="rs-probs"><div class="loading">…</div></div></div>
@@ -233,6 +235,22 @@
   <!-- PORTFOLIO -->
   <section class="tab" id="tab-portfolio">
     <div id="pf-summary" class="card" style="font-size:13px">Loading portfolio…</div>
+    <div class="card"><h2>Suggested allocation — decision-support framework (not advice)</h2>
+      <div id="pf-alloc"><div class="loading">Building allocation…</div></div></div>
+    <div class="card"><h2>Position sizing calculator — multiple methods, none crowned</h2>
+      <div class="ctl" style="margin-bottom:8px">
+        <select class="ipt" id="sz-sym"></select>
+        <input class="ipt" id="sz-eq" value="100000" style="width:110px" title="account equity $">
+        <input class="ipt" id="sz-risk" value="1" style="width:64px" title="risk % per trade">
+        <button class="go" id="sz-go">Size it</button>
+      </div>
+      <div id="pf-sizing" class="muted" style="font-size:12px">Pick a sector, set equity ($) and per-trade risk (%).</div></div>
+    <div class="card"><h2>Scenario simulator — linear factor-beta stress (approximation, stated)</h2>
+      <div class="ctl" style="margin-bottom:8px">
+        <span class="seg" id="sim-src"><button data-m="current" class="on">Current positions</button><button data-m="suggested">Suggested allocation</button></span>
+        <button class="go" id="sim-go">Run scenarios</button>
+      </div>
+      <div id="pf-sim" class="muted" style="font-size:12px">Runs all stress scenarios against the chosen book.</div></div>
     <div class="card"><h2>Add / track a position</h2>
       <div class="ctl" style="margin:0">
         <input class="ipt" id="pf-sym" placeholder="XLK" style="width:80px;text-transform:uppercase">
@@ -343,7 +361,7 @@ function activate(t){
   if(t==="options")loadOptions();
   if(t==="research")loadResearch();
   if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
-  if(t==="portfolio")loadPortfolio();
+  if(t==="portfolio"){loadPortfolio();loadAllocation();}
   if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
   if(t==="futures"){loadFutures();}
   if(t==="markets"){if(!loaded.markets){loadQuotes();loaded.markets=true;}loadMacro();}
@@ -841,8 +859,52 @@ async function loadOpps(){
         ${(o.conflicts||[]).map(c=>`<div class="down" style="opacity:.85">− ${c}</div>`).join("")||'<div class="muted">no conflicting evidence detected</div>'}</div></div>`).join("");
   }catch(e){document.getElementById("intel-opps").innerHTML='<div class="loading">Opportunities failed.</div>';}
 }
+let _alloc=null;
+async function loadAllocation(){
+  try{ _alloc=await(await fetch(`${API}/api/allocation`)).json(); }catch(e){_alloc=null;}
+  renderCIO(); renderPfAlloc();
+}
+function renderCIO(){
+  const el=document.getElementById("intel-cio");
+  if(!el)return;
+  const d=_alloc;
+  if(!d||d.error){el.innerHTML='<div class="loading">Committee briefing warming (engines need bars)…</div>';return;}
+  const top=(d.rows||[]).slice(0,4);
+  const exp=(d.factorExposures||[]).slice(0,4);
+  el.innerHTML=`<b style="color:var(--amber)">COMMITTEE BRIEFING</b>
+    <span class="muted" style="font-size:11px">· ${d.regime} · framework output, not advice</span>
+    <div style="margin-top:6px"><b>If allocating today:</b>
+      ${top.map(r=>`<span class="badge b-ready" style="margin-right:5px;cursor:pointer" onclick="renderIntelDetail('${r.symbol}')">${r.symbol} ${r.weightPct}%</span>`).join("")}
+      <span class="badge b-neu">cash ${d.cashPct}%</span>
+      <span class="muted" style="font-size:11px">(regime sets the ${d.investedBudgetPct}% invested budget)</span></div>
+    <div style="margin-top:5px;font-size:12px"><b>Factor tilts:</b> ${exp.map(x=>`<span class="${x.warn?'amber':'muted'}">${x.factor} ${x.exposure>0?'+':''}${x.exposure}${x.warn?' ⚠':''}</span>`).join(" · ")||'—'}
+      · <b>Excluded:</b> <span class="muted">${(d.excluded||[]).map(x=>x.symbol).join(", ")||"none"}</span>
+      · full detail on the <a style="color:var(--amber);cursor:pointer" onclick="document.querySelector('[data-tab=portfolio]').click()">Portfolio tab</a></div>`;
+}
+function renderPfAlloc(){
+  const el=document.getElementById("pf-alloc");
+  if(!el)return;
+  const d=_alloc;
+  if(!d||d.error){el.innerHTML='<div class="loading">Allocation engine warming…</div>';return;}
+  el.innerHTML=`<div style="font-size:13px;margin-bottom:6px"><b>${d.regime}</b> → invested budget ${d.investedBudgetPct}% ·
+      suggested invested ${d.investedPct}% / cash ${d.cashPct}%</div>
+    <div class="scrollx"><table><thead><tr><th>Sector</th><th>Weight</th><th>Score</th><th>P(beat 10d)</th><th>Exp med 10d</th><th>Ann vol</th><th>Risk</th></tr></thead><tbody>
+    ${(d.rows||[]).map(r=>`<tr class="clk" onclick="openChart('${r.symbol}')"><td><b>${r.symbol}</b> <span class="muted" style="font-size:11px">${r.name}</span></td>
+      <td class="mono"><b>${r.weightPct}%</b></td><td class="mono" style="color:${scoreCol(r.score)}">${r.score}</td>
+      <td class="mono">${r.pBeat10d??'—'}%</td>
+      <td class="mono ${dir(r.expMedianRel10d)}">${r.expMedianRel10d==null?'—':pct(r.expMedianRel10d)} <span class="muted" style="font-size:10px">${r.expRange10d?'['+r.expRange10d[0]+'…'+r.expRange10d[1]+']':''}</span></td>
+      <td class="mono muted">${r.annVolPct}%</td><td class="mono ${r.risk>=60?'down':'muted'}">${r.risk}</td></tr>`).join("")}</tbody></table></div>
+    ${(d.rows||[]).slice(0,3).map(r=>`<div style="margin-top:8px;font-size:12px;border-top:1px solid var(--border);padding-top:6px">
+      <b>${r.symbol} ${r.weightPct}%</b> — <span class="muted">${r.whyThisSize}</span>
+      ${(r.whyThisSector||[]).slice(0,2).map(e=>`<div class="up" style="opacity:.85">＋ ${e}</div>`).join("")}
+      ${(r.against||[]).slice(0,2).map(c=>`<div class="down" style="opacity:.85">− ${c}</div>`).join("")}
+      <div class="muted" style="font-size:11px">changes if: ${(r.wouldChange||[]).join(" · ")}</div></div>`).join("")}
+    <div style="margin-top:8px;font-size:12px"><b>Why not the others:</b> ${(d.excluded||[]).map(x=>`<span class="muted">${x.symbol} (${x.reasons.join("; ")})</span>`).join(" · ")||"—"}</div>
+    <div style="margin-top:6px;font-size:12px"><b>Factor exposures of this book:</b> ${(d.factorExposures||[]).map(x=>`<span class="${x.warn?'amber':'muted'}">${x.factor} ${x.exposure>0?'+':''}${x.exposure}${x.warn?' ⚠':''}</span>`).join(" · ")}</div>
+    <div class="note">${(d.notes||[]).join(" ")}</div>`;
+}
 async function loadIntel(){
-  loadSummary(); loadOpps();
+  loadSummary(); loadOpps(); loadAllocation();
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();
     _intel=d.sectors||[];
@@ -1002,11 +1064,11 @@ function drawGexCurve(d){
 let _fx=null,fxSym="XLK",fxBuilt=false;
 async function loadResearch(){
   try{
-    const [reg,val,prob,ana,regy,fx,lab]=await Promise.all(
-      ["regime","research","probabilities","analogs","registry","factors","edgelab"]
+    const [reg,val,prob,ana,regy,fx,lab,cal]=await Promise.all(
+      ["regime","research","probabilities","analogs","registry","factors","edgelab","calibration"]
       .map(p=>fetch(`${API}/api/${p}`).then(r=>r.json())));
     renderRsRegistry(regy); renderRsRegime(reg); renderRsValidation(val); renderRsProbs(prob);
-    renderRsAnalogs(ana); _fx=fx; renderRsFactors(); renderRsEdgeLab(lab);
+    renderRsAnalogs(ana); _fx=fx; renderRsFactors(); renderRsEdgeLab(lab); renderRsCalib(cal);
   }catch(e){document.getElementById("rs-regime").innerHTML='<div class="loading">Research engines failed to load.</div>';}
 }
 const stageBadge=s=>({production:'b-ready',validation:'b-appr',retired:'b-bear'}[s]||'b-neu');
@@ -1249,6 +1311,59 @@ async function loadPortfolio(){
   }catch(e){document.getElementById("pf-summary").textContent="Portfolio failed to load.";}
 }
 setInterval(()=>{if(tabActive("portfolio"))loadPortfolio();},15000);
+
+// ── SIZING CALCULATOR + SCENARIO SIMULATOR ──
+document.getElementById("sz-sym").innerHTML=["XLK","XLC","XLY","XLF","XLV","XLI","XLE","XLB","XLP","XLU","XLRE"].map(s=>`<option>${s}</option>`).join("");
+document.getElementById("sz-go").onclick=async()=>{
+  const el=document.getElementById("pf-sizing");
+  el.innerHTML='<div class="loading">Sizing…</div>';
+  try{
+    const d=await(await fetch(`${API}/api/sizing?symbol=${document.getElementById("sz-sym").value}&equity=${document.getElementById("sz-eq").value}&risk=${document.getElementById("sz-risk").value}`)).json();
+    if(d.error){el.innerHTML=`<div class="loading">${d.error}</div>`;return;}
+    el.innerHTML=`<div style="font-size:13px;margin-bottom:4px"><b>${d.symbol}</b> @ ${fmt(d.price)} · ann vol ${d.annVolPct}% · equity ${vol(d.equity)} · risk ${d.riskPctPerTrade}%/trade</div>
+      <table><thead><tr><th>Method</th><th>Shares</th><th>% of equity</th><th>How</th><th>Pro / Con</th></tr></thead><tbody>
+      ${Object.entries(d.methods).map(([k,m2])=>`<tr><td><b>${k}</b></td><td class="mono">${m2.shares}</td>
+        <td class="mono">${m2.positionPct!=null?m2.positionPct+'%':'—'}</td>
+        <td class="muted" style="white-space:normal;font-size:11px">${m2.detail}</td>
+        <td class="muted" style="white-space:normal;font-size:11px">＋${(d.doc[k]||{}).pros||''}<br>−${(d.doc[k]||{}).cons||''}</td></tr>`).join("")}</tbody></table>
+      <div class="note">${d.portfolioHeatNote} ${d.note}</div>`;
+  }catch(e){el.innerHTML='<div class="loading">Sizing failed.</div>';}
+};
+document.querySelectorAll("#sim-src button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#sim-src button").forEach(x=>x.classList.remove("on"));b.classList.add("on");});
+document.getElementById("sim-go").onclick=async()=>{
+  const el=document.getElementById("pf-sim");
+  el.innerHTML='<div class="loading">Running scenarios…</div>';
+  try{
+    let url=`${API}/api/simulate`;
+    if(document.querySelector("#sim-src button.on").dataset.m==="suggested"&&_alloc&&_alloc.rows)
+      url+="?w="+encodeURIComponent(_alloc.rows.map(r=>`${r.symbol}:${r.weightPct}`).join(","));
+    const d=await(await fetch(url)).json();
+    if(d.error){el.innerHTML=`<div class="loading">${d.error}</div>`;return;}
+    const p=d.portfolio||{};
+    el.innerHTML=`<div style="font-size:13px;margin-bottom:4px"><b>Book:</b> ${Object.entries(d.weights).map(([s,w])=>`${s} ${w}%`).join(" · ")}
+        ${p.beta!=null?` · β ${p.beta}`:''} ${p.annVolPct!=null?` · vol ${p.annVolPct}%`:''} ${p.maxDD1yPct!=null?` · 1y maxDD ${p.maxDD1yPct}%`:''}</div>
+      <div class="scrollx"><table><thead><tr><th>Scenario</th><th>Portfolio</th><th>Most vulnerable</th><th>Most resilient</th></tr></thead><tbody>
+      ${(d.scenarios||[]).map(s=>`<tr><td style="white-space:normal"><b>${s.scenario}</b><div class="muted" style="font-size:10px">${s.desc}</div></td>
+        <td class="mono ${dir(s.portfolioImpactPct)}"><b>${pct(s.portfolioImpactPct)}</b></td>
+        <td class="mono down" style="font-size:11px">${s.mostVulnerable.map(x=>`${x.symbol} ${pct(x.impactPct)}`).join(", ")}</td>
+        <td class="mono up" style="font-size:11px">${s.mostResilient.map(x=>`${x.symbol} ${pct(x.impactPct)}`).join(", ")}</td></tr>`).join("")}</tbody></table></div>
+      <div class="note">${d.note}</div>`;
+  }catch(e){el.innerHTML='<div class="loading">Simulation failed.</div>';}
+};
+function renderRsCalib(d){
+  const el=document.getElementById("rs-calib");
+  if(!el)return;
+  if(!d){el.innerHTML='<div class="loading">…</div>';return;}
+  const rel=(d.reliability||[]);
+  el.innerHTML=`<div style="font-size:13px">Prediction log: <b>${d.days||0}</b> days recorded · <b>${d.maturedN||0}</b> matured predictions
+      ${d.calibrated!=null?` · calibrated: <b class="${d.calibrated?'up':'down'}">${d.calibrated?'yes (±15pts)':'NO — recalibration needed'}</b>`:' · needs ≥30 matured for a first read'}</div>`+
+    (rel.length?`<table style="margin-top:6px"><thead><tr><th>Predicted P bucket</th><th>Avg predicted</th><th>Realized</th><th>n</th></tr></thead><tbody>
+      ${rel.map(r=>`<tr><td class="mono">${r.bucket}</td><td class="mono">${r.predicted}%</td>
+        <td class="mono ${Math.abs(r.predicted-r.realized)<=15?'up':'down'}">${r.realized}%</td><td class="mono muted">${r.n}</td></tr>`).join("")}</tbody></table>`:"")+
+    ((d.weeklyReview||[]).length?`<div style="margin-top:8px;font-size:12px"><b>Decision review — did each day's top-3 scores beat SPY over the next 10 sessions?</b>
+      ${d.weeklyReview.map(w=>`<div class="mono" style="font-size:11px">${w.date}: ${w.top3.map(t=>`${t.symbol} ${t.rel10d>0?'+':''}${t.rel10d}%`).join(" · ")} → <span class="${w.top3HitRate>=50?'up':'down'}">${w.top3HitRate}% hit</span></div>`).join("")}</div>`:"")+
+    `<div class="note">${d.note||''}</div>`;
+}
 
 // ── ALERTS (bell · browser notifications · sound · custom price levels) ──
 let AL={last:0,unread:0,sound:localStorage.getItem("qa_sound")!=="0",items:[],pending:[]};

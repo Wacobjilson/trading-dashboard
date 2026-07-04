@@ -1100,6 +1100,7 @@ def _scores_persist(sectors):
                 hist[day] = row
                 for d in sorted(hist)[:-120]:
                     del hist[d]
+                os.makedirs(os.path.dirname(SCORES_HIST_PATH) or ".", exist_ok=True)
                 with open(SCORES_HIST_PATH + ".tmp", "w") as f:
                     json.dump(hist, f)
                 os.replace(SCORES_HIST_PATH + ".tmp", SCORES_HIST_PATH)
@@ -1394,11 +1395,15 @@ def probabilities_view():
             p = wins / len(obs)
             ci = _wilson(p, max(1, int(len(obs) / max(1, h / 5))))   # CI on effective n
             so = sorted(obs)
+            wl = [o for o in obs if o > 0]
+            ll = [o for o in obs if o <= 0]
             row["horizons"][str(h)] = {
                 "p": round(p * 100, 1), "ciLo": round(ci[0] * 100, 1), "ciHi": round(ci[1] * 100, 1),
                 "median": round(so[len(so) // 2], 2), "q25": round(so[len(so) // 4], 2),
                 "q75": round(so[3 * len(so) // 4], 2), "n": len(obs),
                 "nEff": max(1, int(len(obs) / max(1, h / 5))),
+                "avgWin": round(sum(wl) / len(wl), 2) if wl else None,
+                "avgLoss": round(sum(ll) / len(ll), 2) if ll else None,
             }
         table.append(row)
     cur = {}
@@ -1897,6 +1902,330 @@ def registry_view():
             "disagreement": disagree, "backlog": RESEARCH_BACKLOG,
             "note": "Stages: idea → testing → validation → production → monitoring → retirement. Nothing holds "
                     "composite weight without surviving train/test; retired items stay visible with the reason."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO CONSTRUCTION & DECISION ENGINE — converts the research outputs
+# (scores, probabilities, regime, factor betas, analogs) into an explainable
+# suggested allocation, position-sizing methods, factor exposures, and a
+# scenario simulator. This is a DECISION-SUPPORT FRAMEWORK with every number
+# traceable to a shown method — not advice, and it says so. Expected returns
+# are historical base-rate medians; scenario impacts are linear factor-beta
+# approximations; both caveats ride along in the payloads.
+# ─────────────────────────────────────────────────────────────────────────────
+ALLOC_MAX_POS = 0.25          # single-sector cap
+ALLOC_REGIME_INVEST = {       # invested fraction by primary regime (heuristic, labeled)
+    "Trending Bull": 0.90, "Bull Pullback": 0.75, "Bear Rally": 0.50, "Trending Bear": 0.30,
+}
+
+
+def _sector_vol(sym, days=63):
+    b = get_bars(sym)
+    if not b or len(b) < days + 1:
+        return None
+    c = [x["c"] for x in b][-(days + 1):]
+    rets = [c[i] / c[i - 1] - 1 for i in range(1, len(c))]
+    return _stdev(rets) * (252 ** 0.5)
+
+
+def _factor_betas():
+    """{sector: {factor: beta}} from the cached factor engine."""
+    fx = cache_get("factors", 600) or _cache_and_return("factors", factors_view)
+    if fx.get("error"):
+        return {}
+    out = {}
+    for s in fx.get("sectors", []):
+        rows = s.get("primary", []) + s.get("conflicting", []) + s.get("supporting", [])
+        seen = {}
+        for r in rows:
+            seen[r["factor"]] = r["beta"]
+        out[s["symbol"]] = seen
+    return out
+
+
+def allocation_view():
+    opps = cache_get("opps", 300) or _cache_and_return("opps", opportunities_view)
+    reg = cache_get("regime", 600) or _cache_and_return("regime", regime_view)
+    prob = cache_get("probs", 600) or _cache_and_return("probs", probabilities_view)
+    if opps.get("error") or reg.get("error") or prob.get("error"):
+        return {"error": "engines warming"}
+    primary = reg["current"]["primary"]
+    invest = ALLOC_REGIME_INVEST.get(primary, 0.5)
+    if reg["current"]["vol"] == "high-vol":
+        invest = max(0.2, invest - 0.15)
+    ptab = {r["group"]: r["horizons"].get("10") for r in prob.get("table", [])}
+    included, excluded = [], []
+    for o in opps.get("rows", []):
+        p10 = o.get("pBeat10d")
+        why_not = []
+        if o["score"] < 55:
+            why_not.append("composite %s < 55" % o["score"])
+        if p10 is not None and p10 <= 50:
+            why_not.append("historical P(beat SPY 10d) %s%% ≤ 50%%" % p10)
+        if o["risk"] >= 70:
+            why_not.append("risk score %s ≥ 70" % o["risk"])
+        if why_not:
+            excluded.append({"symbol": o["symbol"], "reasons": why_not})
+            continue
+        vol = _sector_vol(o["symbol"])
+        conviction = (o["score"] - 50) / 50 * (o["confidence"] / 100)
+        included.append({"o": o, "vol": vol or 0.2, "conviction": conviction, "p10": p10})
+    total_raw = sum(c["conviction"] / c["vol"] for c in included) or 1
+    rows = []
+    for c in included:
+        w = min(ALLOC_MAX_POS, (c["conviction"] / c["vol"]) / total_raw * invest)
+        o = c["o"]
+        grp = ptab.get(o.get("group"))
+        rows.append({
+            "symbol": o["symbol"], "name": o["name"], "weightPct": round(w * 100, 1),
+            "score": o["score"], "pBeat10d": c["p10"], "confidence": o["confidence"], "risk": o["risk"],
+            "expMedianRel10d": grp["median"] if grp else None,
+            "expRange10d": [grp["q25"], grp["q75"]] if grp else None,
+            "annVolPct": round(c["vol"] * 100, 1),
+            "whyThisSector": o.get("evidence", []),
+            "whyThisSize": "conviction (score−50)/50 × conf = %.2f, ÷ ann vol %.0f%% → share of the %.0f%% "
+                           "invested budget, capped at %.0f%%"
+                           % (c["conviction"], c["vol"] * 100, invest * 100, ALLOC_MAX_POS * 100),
+            "against": o.get("conflicts", []),
+            "wouldChange": ["composite < 50 (now %s)" % o["score"],
+                            "RS group drops out of %s" % (o.get("group") or "?"),
+                            "regime leaves %s (invested budget would move to %s)" %
+                            (primary, {k: "%d%%" % (v * 100) for k, v in ALLOC_REGIME_INVEST.items()})],
+        })
+    rows.sort(key=lambda r: -r["weightPct"])
+    invested = sum(r["weightPct"] for r in rows)
+    # log today's published predictions for ALL sectors (calibration matures on these)
+    _pred_log([{"symbol": o["symbol"], "score": o["score"], "pBeat10d": o.get("pBeat10d"),
+                "confidence": o.get("confidence")} for o in opps.get("rows", [])], ptab)
+    # portfolio-level factor exposures of the SUGGESTED book
+    betas = _factor_betas()
+    expo = {}
+    for r in rows:
+        for f, b in (betas.get(r["symbol"]) or {}).items():
+            expo[f] = expo.get(f, 0) + r["weightPct"] / 100 * b
+    exposures = sorted(({"factor": f, "exposure": round(v, 2),
+                         "warn": abs(v) >= 0.35} for f, v in expo.items()),
+                       key=lambda x: -abs(x["exposure"]))
+    return {"regime": reg["current"]["label"], "investedPct": round(invested, 1),
+            "cashPct": round(100 - invested, 1),
+            "investedBudgetPct": round(invest * 100), "rows": rows, "excluded": excluded,
+            "factorExposures": exposures,
+            "notes": ["Suggested FRAMEWORK, not advice: conviction/vol weighting of sectors that pass "
+                      "score≥55, P>50%, risk<70; invested budget set by regime (heuristic table, shown).",
+                      "Expected 10d numbers are historical base-rate medians/quartiles from the probability "
+                      "engine, not forecasts.",
+                      "Factor exposures = Σ weight × univariate 63d beta (overlapping factors — approximate)."]}
+
+
+# ── Position sizing — multiple methodologies, none crowned ───────────────────
+SIZING_METHODS_DOC = {
+    "fixedRisk": {"pros": "simple, uniform loss per stop-out", "cons": "ignores volatility clustering; stop distance drives share count"},
+    "atrRisk": {"pros": "adapts to current volatility", "cons": "ATR lags regime shifts; assumes stop honored at 2×ATR"},
+    "volTarget": {"pros": "stabilizes portfolio variance", "cons": "targets vol, not loss; leverage implied when vol is low"},
+    "kellyQuarter": {"pros": "growth-optimal direction, ¼ fraction damps estimate error", "cons": "inputs are 2yr base rates — full Kelly on noisy inputs overbets catastrophically"},
+    "equalRisk": {"pros": "no single position dominates portfolio risk", "cons": "ignores conviction differences entirely"},
+}
+
+
+def sizing_view(sym, equity, risk_pct):
+    a = analyze(sym)
+    vol = _sector_vol(sym)
+    px = _live_px(sym)
+    if not a.get("ok") or not px or not vol:
+        return {"error": "no data for %s yet" % sym}
+    risk_dollars = equity * risk_pct / 100
+    out = {"symbol": sym, "price": round(px, 2), "equity": equity, "riskPctPerTrade": risk_pct,
+           "annVolPct": round(vol * 100, 1), "methods": {}, "doc": SIZING_METHODS_DOC}
+    stop = a.get("stop")
+    if stop and a.get("entry") and abs(a["entry"] - stop) > 0:
+        dist = abs(a["entry"] - stop)
+        sh = int(risk_dollars / dist)
+        out["methods"]["fixedRisk"] = {"shares": sh, "positionPct": round(sh * px / equity * 100, 1),
+                                       "detail": "risk $%.0f ÷ entry-to-stop %.2f (scanner's ATR-buffered structure stop)" % (risk_dollars, dist)}
+    av = a.get("atr")
+    if av:
+        sh = int(risk_dollars / (2 * av))
+        out["methods"]["atrRisk"] = {"shares": sh, "positionPct": round(sh * px / equity * 100, 1),
+                                     "detail": "risk $%.0f ÷ 2×ATR(14) %.2f" % (risk_dollars, 2 * av)}
+    target_vol = 0.15
+    w = min(1.0, target_vol / vol)
+    out["methods"]["volTarget"] = {"shares": int(equity * w / px), "positionPct": round(w * 100, 1),
+                                   "detail": "15%% ann-vol target ÷ %.0f%% sector vol → %.0f%% of equity (single-position view)" % (vol * 100, w * 100)}
+    prob = cache_get("probs", 600) or _cache_and_return("probs", probabilities_view)
+    grp = (prob.get("currentGroup") or {}).get(sym)
+    row = next((r["horizons"].get("10") for r in prob.get("table", []) if r["group"] == grp), None)
+    if row and row.get("avgWin") and row.get("avgLoss"):
+        p = row["p"] / 100
+        b = abs(row["avgWin"] / row["avgLoss"]) if row["avgLoss"] else None
+        if b:
+            f = max(0.0, (p - (1 - p) / b)) / 4
+            out["methods"]["kellyQuarter"] = {"shares": int(equity * f / px), "positionPct": round(f * 100, 1),
+                                              "detail": "¼-Kelly: p=%.2f, payoff=%.2f (from %s 10d base rates, n=%d) → f*=%.1f%%"
+                                                        % (p, b, grp, row["n"], f * 100)}
+    with _state_lock:
+        n_open = len(_state["positions"])
+    if n_open:
+        out["methods"]["equalRisk"] = {"shares": int(risk_dollars / (vol / (252 ** 0.5) * px) / max(1, n_open + 1)),
+                                       "positionPct": None,
+                                       "detail": "equalize daily-vol contribution across %d existing + this position" % n_open}
+    out["portfolioHeatNote"] = ("With %d open positions at %.1f%% risk each, adding this makes total heat %.1f%% "
+                                "of equity — many desks cap heat at 6%%." % (n_open, risk_pct, (n_open + 1) * risk_pct))
+    out["note"] = "Multiple methods on purpose — none is universally superior; the doc lists each method's failure mode."
+    return out
+
+
+# ── Scenario simulator & stress tests (linear factor-beta approximation) ─────
+STRESS_SCENARIOS = {
+    "rate_spike": {"desc": "Rapid rate rise (long-end +~50bp)", "shocks": {"TLT": -6}},
+    "vol_spike": {"desc": "VIX toward 30", "shocks": {"VIXY": 40, "HYG": -3}},
+    "oil_shock": {"desc": "Oil supply shock", "shocks": {"USO": 15}},
+    "oil_collapse": {"desc": "Oil demand collapse", "shocks": {"USO": -20, "HYG": -4}},
+    "dollar_spike": {"desc": "Dollar spike", "shocks": {"UUP": 4}},
+    "tech_correction": {"desc": "Mega-cap tech correction", "shocks": {"QQQvSPY": -6}},
+    "credit_stress": {"desc": "Credit stress", "shocks": {"HYG": -6, "VIXY": 30, "TLT": 3}},
+    "covid_style": {"desc": "COVID-style shock (vol +150%, credit −12%, oil −30%, flight to Treasuries)",
+                    "shocks": {"VIXY": 150, "HYG": -12, "USO": -30, "TLT": 8}},
+}
+
+
+def simulate_view(weights=None, scenario=None):
+    """weights: {sym: pct} — defaults to current open positions' gross weights."""
+    if not weights:
+        pv = positions_view()
+        tot = pv.get("totalValue") or 0
+        weights = {}
+        for p in pv.get("open", []):
+            if p.get("last") and tot:
+                weights[p["symbol"]] = weights.get(p["symbol"], 0) + \
+                    p["last"] * (p.get("qty") or 1) / tot * 100 * (1 if p["dir"] == "long" else -1)
+        if not weights:
+            return {"error": "no positions and no weights given — pass ?w=XLK:20,XLF:10"}
+    betas = _factor_betas()
+    scen_names = [scenario] if scenario and scenario in STRESS_SCENARIOS else list(STRESS_SCENARIOS)
+    results = []
+    for name in scen_names:
+        sc = STRESS_SCENARIOS[name]
+        per = []
+        for sym, wpct in weights.items():
+            b = betas.get(sym) or {}
+            impact = sum(b.get(f, 0) * shock for f, shock in sc["shocks"].items())
+            per.append({"symbol": sym, "weightPct": round(wpct, 1), "impactPct": round(impact, 2),
+                        "contribPct": round(impact * wpct / 100, 2)})
+        per.sort(key=lambda x: x["contribPct"])
+        total = round(sum(x["contribPct"] for x in per), 2)
+        results.append({"scenario": name, "desc": sc["desc"], "shocks": sc["shocks"],
+                        "portfolioImpactPct": total,
+                        "mostVulnerable": per[:2], "mostResilient": per[-2:][::-1], "positions": per})
+    results.sort(key=lambda r: r["portfolioImpactPct"])
+    # simple portfolio stats for the given weights
+    stats = {}
+    syms = [s for s in weights if get_bars(s)]
+    if syms:
+        rets = {}
+        mlen = 10 ** 9
+        for s in syms:
+            c = [b["c"] for b in get_bars(s)][-253:]
+            rets[s] = [c[i] / c[i - 1] - 1 for i in range(1, len(c))]
+            mlen = min(mlen, len(rets[s]))
+        port = [sum(weights[s] / 100 * rets[s][-mlen:][i] for s in syms) for i in range(mlen)]
+        sd = _stdev(port)
+        spyc = [b["c"] for b in (get_bars(BENCH) or [])][-(mlen + 1):]
+        if len(spyc) > mlen:
+            spyr = [spyc[i] / spyc[i - 1] - 1 for i in range(1, len(spyc))]
+            vs = _stdev(spyr)
+            cv = sum((a - sum(port) / mlen) * (b2 - sum(spyr) / mlen) for a, b2 in zip(port, spyr)) / mlen
+            stats["beta"] = round(cv / (vs * vs), 2) if vs > 0 else None
+        stats["annVolPct"] = round(sd * (252 ** 0.5) * 100, 1)
+        eq = peak = mdd = 0.0
+        for r in port:
+            eq += r
+            peak = max(peak, eq)
+            mdd = min(mdd, eq - peak)
+        stats["maxDD1yPct"] = round(mdd * 100, 1)
+        stats["worstDayPct"] = round(min(port) * 100, 2)
+    return {"weights": {k: round(v, 1) for k, v in weights.items()}, "portfolio": stats,
+            "scenarios": results,
+            "note": "Linear approximation: impact = Σ weight × 63d univariate factor beta × shock. Real "
+                    "shocks are non-linear and correlations spike in crises — treat as direction and rough "
+                    "magnitude, not precision. Portfolio stats replay the last ~252 sessions of this weight mix."}
+
+
+# ── Prediction log + confidence calibration (matures on live data) ───────────
+PRED_PATH = os.path.join(os.environ.get("QUANTA_DATA", "") or
+                         os.path.dirname(os.path.abspath(__file__)), "predictions_history.json")
+_pred_lock = threading.Lock()
+
+
+def _pred_log(rows, group_probs):
+    day = dt.date.today().isoformat()
+    try:
+        with _pred_lock:
+            try:
+                with open(PRED_PATH) as f:
+                    hist = json.load(f)
+            except (FileNotFoundError, ValueError):
+                hist = {}
+            if day not in hist:
+                hist[day] = {r["symbol"]: {"score": r["score"], "p10": r.get("pBeat10d"),
+                                           "conf": r.get("confidence")} for r in rows}
+                for d in sorted(hist)[:-250]:
+                    del hist[d]
+                os.makedirs(os.path.dirname(PRED_PATH) or ".", exist_ok=True)
+                with open(PRED_PATH + ".tmp", "w") as f:
+                    json.dump(hist, f)
+                os.replace(PRED_PATH + ".tmp", PRED_PATH)
+    except OSError:
+        pass
+
+
+def calibration_view():
+    m = _sector_matrix()
+    with _pred_lock:
+        try:
+            with open(PRED_PATH) as f:
+                hist = json.load(f)
+        except (FileNotFoundError, ValueError):
+            hist = {}
+    if not m or not hist:
+        return {"maturedN": 0, "days": len(hist),
+                "note": "Prediction log started %s — daily P(beat SPY 10d) and scores are recorded; "
+                        "calibration matures once predictions are ≥10 trading days old."
+                        % (min(hist) if hist else "today")}
+    dates = m["dates"]
+    didx = {d.isoformat(): i for i, d in enumerate(dates)}
+    buckets = {}
+    matured = 0
+    weekly_review = []
+    for day, preds in sorted(hist.items()):
+        i = didx.get(day)
+        if i is None or i + 10 >= len(dates):
+            continue
+        day_rows = []
+        for sym, pr in preds.items():
+            out = _fwd_rel(m, sym, i, 10)
+            if out is None or pr.get("p10") is None:
+                continue
+            matured += 1
+            bk = "%d-%d%%" % (int(pr["p10"] // 5) * 5, int(pr["p10"] // 5) * 5 + 5)
+            b = buckets.setdefault(bk, {"n": 0, "hits": 0, "pSum": 0.0})
+            b["n"] += 1
+            b["hits"] += 1 if out > 0 else 0
+            b["pSum"] += pr["p10"]
+            day_rows.append((sym, pr["score"], out))
+        if day_rows:
+            day_rows.sort(key=lambda x: -x[1])
+            top3 = day_rows[:3]
+            weekly_review.append({"date": day,
+                                  "top3": [{"symbol": s, "score": sc_, "rel10d": round(o, 2)} for s, sc_, o in top3],
+                                  "top3HitRate": round(100 * sum(1 for _s, _sc, o in top3 if o > 0) / len(top3))})
+    rel = [{"bucket": k, "predicted": round(v["pSum"] / v["n"], 1), "realized": round(100 * v["hits"] / v["n"], 1),
+            "n": v["n"]} for k, v in sorted(buckets.items())]
+    return {"maturedN": matured, "days": len(hist), "reliability": rel,
+            "weeklyReview": weekly_review[-8:],
+            "calibrated": None if matured < 30 else all(abs(r["predicted"] - r["realized"]) <= 15 for r in rel if r["n"] >= 10),
+            "note": "Live out-of-sample calibration: each day's published P(beat SPY 10d) vs what happened. "
+                    "n=%d matured predictions (need ≥30 for a first read; recalibration only on evidence). "
+                    "Weekly review = did that day's top-3 scores outperform over the next 10 sessions." % matured}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2500,6 +2829,7 @@ def _opt_history_update(summ):
                       "gex": summ.get("netGEX"), "dex": summ.get("netDEX")}
             for d in sorted(h)[:-260]:      # keep ~1yr
                 del h[d]
+            os.makedirs(os.path.dirname(OPT_HIST_PATH) or ".", exist_ok=True)
             with open(OPT_HIST_PATH + ".tmp", "w") as f:
                 json.dump(hist, f)
             os.replace(OPT_HIST_PATH + ".tmp", OPT_HIST_PATH)
@@ -3322,6 +3652,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("edgelab", 900) or _cache_and_return("edgelab", edge_lab))
         elif path == "/api/registry":
             self._json(cache_get("registry", 300) or _cache_and_return("registry", registry_view))
+        elif path == "/api/allocation":
+            self._json(cache_get("alloc", 300) or _cache_and_return("alloc", allocation_view))
+        elif path == "/api/sizing":
+            sym = (qs.get("symbol", ["XLK"])[0]).upper()
+            try:
+                eq = float(qs.get("equity", ["100000"])[0])
+                rp = float(qs.get("risk", ["1"])[0])
+            except ValueError:
+                self._json({"error": "bad equity/risk"}, 400)
+                return
+            self._json(sizing_view(sym, eq, rp))
+        elif path == "/api/simulate":
+            wq = qs.get("w", [None])[0]
+            weights = None
+            if wq:
+                try:
+                    weights = {p.split(":")[0].upper(): float(p.split(":")[1]) for p in wq.split(",")}
+                except (ValueError, IndexError):
+                    self._json({"error": "bad weights — use w=XLK:20,XLF:10"}, 400)
+                    return
+            self._json(simulate_view(weights, qs.get("scenario", [None])[0]))
+        elif path == "/api/calibration":
+            self._json(cache_get("calib", 600) or _cache_and_return("calib", calibration_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
