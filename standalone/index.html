@@ -77,6 +77,58 @@
   .pbar>span{position:absolute;left:0;top:0;bottom:0;}
   .live-tag{font-size:10px;color:var(--up);letter-spacing:.08em;animation:pulse 2s infinite;}
   .sechead{font-size:11px;letter-spacing:.14em;color:var(--muted);margin:18px 2px 6px;border-bottom:1px solid var(--border);padding-bottom:4px;}
+  /* ── Guide tab (operating flowchart) ── */
+  .gd-lede{color:var(--muted);max-width:64ch;font-size:14px;line-height:1.55;margin:2px 0 14px}
+  .gd-lede b{color:var(--text)}
+  .gd-legend{display:flex;flex-wrap:wrap;gap:7px 15px;font-family:monospace;font-size:11px;color:var(--muted);margin-bottom:8px}
+  .gd-legend span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .gd-dot{width:9px;height:9px;border-radius:3px;flex:none}
+  .gd-stage{margin-top:8px}
+  .gd-shead{display:flex;align-items:baseline;gap:10px;margin:0 0 10px}
+  .gd-num{font-family:monospace;font-size:11px;font-weight:700;color:var(--bg);background:var(--amber);border-radius:5px;padding:2px 7px;flex:none}
+  .gd-stitle{font-size:15px;font-weight:600;margin:0}
+  .gd-when{margin-left:auto;font-family:monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}
+  .gd-conn{display:flex;justify-content:center;padding:3px 0}
+  .gd-conn::before{content:"↓";color:var(--border);font-size:16px;line-height:1}
+  .gd-nodes{display:grid;gap:10px}
+  .gd-nodes.c2{grid-template-columns:1fr 1fr}
+  .gd-nodes.c3{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:720px){.gd-nodes.c2,.gd-nodes.c3{grid-template-columns:1fr}}
+  .gd-node{border:1px solid var(--border);background:var(--panel);border-radius:9px;padding:12px 13px;border-left:3px solid var(--accent);position:relative}
+  .gd-node.act{border-left-color:var(--amber)} .gd-node.val{border-left-color:var(--up)} .gd-node.stop{border-left-color:var(--down)}
+  .gd-tab{font-family:monospace;font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);font-weight:600;display:block;margin-bottom:4px}
+  .gd-node.act .gd-tab{color:var(--amber)} .gd-node.val .gd-tab{color:var(--up)} .gd-node.stop .gd-tab{color:var(--down)}
+  .gd-node h4{margin:0 0 3px;font-size:13.5px;font-weight:600}
+  .gd-node p{margin:0;font-size:12px;color:var(--muted);line-height:1.5}
+  .gd-node p .k{color:var(--text);font-weight:600}
+  .gd-gate{border:1.5px solid var(--amber);background:rgba(245,166,35,.08);border-radius:11px;padding:13px 15px}
+  .gd-q{display:flex;align-items:baseline;gap:9px;margin-bottom:9px;flex-wrap:wrap}
+  .gd-q .gd-mk{color:var(--amber);font-size:13px}
+  .gd-q h4{margin:0;font-size:13.5px;font-weight:600}
+  .gd-q .gd-src{margin-left:auto;font-family:monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .gd-exits{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  @media(max-width:720px){.gd-exits{grid-template-columns:1fr}}
+  .gd-exit{border:1px solid var(--border);background:var(--panel);border-radius:8px;padding:8px 10px;font-size:12px}
+  .gd-exit .gd-lab{font-family:monospace;font-weight:700;font-size:10.5px;display:block;margin-bottom:2px}
+  .gd-exit.pass{border-color:rgba(46,204,113,.4)} .gd-exit.pass .gd-lab{color:var(--up)}
+  .gd-exit.fail{border-color:rgba(255,77,79,.35)} .gd-exit.fail .gd-lab{color:var(--down)}
+  .gd-exit p{margin:0;color:var(--muted)}
+  .gd-ladder{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--border);border-radius:9px;overflow:hidden;background:var(--panel)}
+  @media(max-width:720px){.gd-ladder{grid-template-columns:1fr}}
+  .gd-rung{padding:12px 13px;border-right:1px solid var(--border)}
+  .gd-rung:last-child{border-right:none}
+  @media(max-width:720px){.gd-rung{border-right:none;border-bottom:1px solid var(--border)}.gd-rung:last-child{border-bottom:none}}
+  .gd-rung .gd-step{font-family:monospace;font-size:10px;color:var(--amber);letter-spacing:.06em;text-transform:uppercase;font-weight:600;margin-bottom:5px}
+  .gd-rung h4{margin:0 0 3px;font-size:13px;font-weight:600} .gd-rung p{margin:0;font-size:11.5px;color:var(--muted)}
+  .gd-rules{list-style:none;margin:0;padding:0;display:grid;gap:9px}
+  .gd-rules li{display:flex;gap:9px;font-size:12.5px;align-items:flex-start;line-height:1.5}
+  .gd-rules li::before{content:"■";color:var(--amber);font-size:8px;margin-top:5px;flex:none}
+  .gd-rules b{color:var(--text)}
+  .gd-tabmap{display:grid;gap:0}
+  .gd-trow{display:grid;grid-template-columns:92px 1fr;gap:11px;padding:7px 0;border-top:1px solid var(--border);font-size:12px;align-items:baseline}
+  .gd-trow:first-child{border-top:none}
+  .gd-trow .t{font-family:monospace;font-size:11px;color:var(--amber);font-weight:600}
+  .gd-trow .d{color:var(--muted)} .gd-trow .d b{color:var(--text)}
   .scrollx{overflow-x:auto;}
   .sbar{display:inline-block;vertical-align:middle;background:var(--panelAlt);border:1px solid var(--border);border-radius:3px;height:10px;width:64px;position:relative;overflow:hidden;margin-right:6px;}
   .sbar>span{position:absolute;left:0;top:0;bottom:0;}
@@ -138,6 +190,7 @@
   <button data-tab="chart">Chart</button>
   <button data-tab="futures">Futures 15m</button>
   <button data-tab="markets">Markets</button>
+  <button data-tab="guide">Guide</button>
 </nav>
 <div id="countdown" class="cd-bar cd-hidden"></div>
 <main>
@@ -469,6 +522,114 @@
       </div>
       <div class="card"><h2>Earnings (7d)</h2><div id="cal-earn"><div class="loading">Loading…</div></div></div></div>
       <div><div class="card"><h2>Market news</h2><div id="news-list" style="max-height:720px;overflow-y:auto"><div class="loading">Loading news…</div></div></div></div>
+    </div>
+  </section>
+
+  <!-- GUIDE — daily operating flowchart -->
+  <section class="tab" id="tab-guide">
+    <div class="card">
+      <h2>Daily operating flow — how to use this platform</h2>
+      <p class="gd-lede">A companion to the terminal, not a signal service. Every arrow moves an idea one step closer to capital — and every <b>gate</b> is a place the platform is allowed to say <b>no</b>. The rule never changes: <b>evidence changes models, AI organizes evidence, you make the call.</b></p>
+      <div class="gd-legend">
+        <span><i class="gd-dot" style="background:var(--accent)"></i>Orient / context</span>
+        <span><i class="gd-dot" style="background:var(--amber)"></i>Your action</span>
+        <span><i class="gd-dot" style="background:transparent;border:1.5px solid var(--amber);transform:rotate(45deg);border-radius:2px"></i>Decision gate</span>
+        <span><i class="gd-dot" style="background:var(--up)"></i>Validated / proceed</span>
+        <span><i class="gd-dot" style="background:var(--down)"></i>Park it — research only</span>
+      </div>
+
+      <div class="gd-stage">
+        <div class="gd-shead"><span class="gd-num">01</span><h3 class="gd-stitle">Orient — read the room before you touch anything</h3><span class="gd-when">every morning · ~5 min</span></div>
+        <div class="gd-nodes c3">
+          <div class="gd-node"><span class="gd-tab">Intel tab</span><h4>Morning &amp; committee brief</h4><p>What changed overnight, sectors to watch, catalysts inside 10 days. Orientation — <span class="k">not</span> a trade list.</p></div>
+          <div class="gd-node"><span class="gd-tab">Research tab</span><h4>MIOS cycle + Trust score</h4><p>Overnight agent read, and the <span class="k">trust score</span>. If it isn't <span class="k">100</span>, the numbers may be lying — check before trusting anything.</p></div>
+          <div class="gd-node"><span class="gd-tab">Government tab</span><h4>Policy catalysts today</h4><p>FOMC day? Rule / bill landing? These raise <span class="k">event risk</span> on anything held through them.</p></div>
+        </div>
+      </div>
+      <div class="gd-conn"></div>
+
+      <div class="gd-stage">
+        <div class="gd-shead"><span class="gd-num">02</span><h3 class="gd-stitle">Gather candidates — four honest sources</h3><span class="gd-when">pick, don't chase</span></div>
+        <div class="gd-nodes c2">
+          <div class="gd-node act"><span class="gd-tab">Signals tab</span><h4>RSI(2) BUY on a sector ETF</h4><p><span class="k">The one validated edge.</span> Oversold in an uptrend — strongest evidence on the platform, but still paper-first until it has a live track record.</p></div>
+          <div class="gd-node"><span class="gd-tab">Intel · ODE queue</span><h4>Market-wide scanner</h4><p>7,000-name scan for aligned setups. <span class="k">Research candidates</span>, unproven — outcome-tracked, not signals.</p></div>
+          <div class="gd-node"><span class="gd-tab">Research · Deep Value</span><h4>Fundamental candidates</h4><p>Quality + cheap + sound, from FMP &amp; SEC filings. Watch the <span class="k">value-trap flag</span>. Research, not a buy.</p></div>
+          <div class="gd-node"><span class="gd-tab">Research · Falsification</span><h4>What's actually validated</h4><p>The strategy families that survived out-of-sample, cost, deflation &amp; regime tests. Today: usually <span class="k">only RSI(2)</span>.</p></div>
+        </div>
+      </div>
+      <div class="gd-conn"></div>
+
+      <div class="gd-stage">
+        <div class="gd-shead"><span class="gd-num">03</span><h3 class="gd-stitle">Filter — run each candidate through the gates</h3><span class="gd-when">the heart · be strict</span></div>
+        <div class="gd-nodes">
+          <div class="gd-gate">
+            <div class="gd-q"><span class="gd-mk">◆</span><h4>Is this strategy <em>validated</em>, or just surfaced?</h4><span class="gd-src">Falsification engine</span></div>
+            <div class="gd-exits">
+              <div class="gd-exit pass"><span class="gd-lab">✓ validated</span><p>RSI(2) cleared the full gate. Proceed — with paper discipline.</p></div>
+              <div class="gd-exit fail"><span class="gd-lab">✗ candidate / rejected</span><p>Interesting, unproven — research only. Park it or paper it, never size it.</p></div>
+            </div>
+          </div>
+          <div class="gd-gate">
+            <div class="gd-q"><span class="gd-mk">◆</span><h4>Does the current regime support it?</h4><span class="gd-src">Regime router</span></div>
+            <div class="gd-exits">
+              <div class="gd-exit pass"><span class="gd-lab">✓ positive in-regime</span><p>The edge has historically worked in this regime. Context in your favor.</p></div>
+              <div class="gd-exit fail"><span class="gd-lab">✗ none / uncertain</span><p>Router says wait. Under-confidence beats a confident wrong answer — don't force it.</p></div>
+            </div>
+          </div>
+          <div class="gd-gate">
+            <div class="gd-q"><span class="gd-mk">◆</span><h4>Is anything arguing <em>against</em> it?</h4><span class="gd-src">Agents · trap flag · edge-challenge AI</span></div>
+            <div class="gd-exits">
+              <div class="gd-exit pass"><span class="gd-lab">✓ evidence agrees</span><p>Independent signals align. Conviction earns a notch — never the whole thesis.</p></div>
+              <div class="gd-exit fail"><span class="gd-lab">✗ conflict present</span><p>Value-trap flag, agent disagreement, or the AI killed it. Lower conviction — conflict is information.</p></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="gd-conn"></div>
+
+      <div class="gd-stage">
+        <div class="gd-shead"><span class="gd-num">04</span><h3 class="gd-stitle">Decide — you, in writing, before the machine gets a vote</h3><span class="gd-when">non-negotiable</span></div>
+        <div class="gd-nodes c2">
+          <div class="gd-node act"><span class="gd-tab">Portfolio · Decision journal</span><h4>Write the thesis FIRST</h4><p>Seven questions: why, evidence for &amp; against, what invalidates it, confidence %, what would change your mind. <span class="k">Recorded before the outcome, never edited after.</span> This is how the platform learns whether your judgment is calibrated.</p></div>
+          <div class="gd-node val"><span class="gd-tab">Auto · basis: paper</span><h4>It becomes a paper trade</h4><p>Logged hypothetical, auto-matured on price. Feeds the <span class="k">30-matured → calibration</span> goal. No "take trade" button exists — by design.</p></div>
+        </div>
+      </div>
+      <div class="gd-conn"></div>
+
+      <div class="gd-stage">
+        <div class="gd-shead"><span class="gd-num">05</span><h3 class="gd-stitle">Prove it, then maybe risk real money</h3><span class="gd-when">the long game</span></div>
+        <div class="gd-ladder">
+          <div class="gd-rung"><div class="gd-step">accumulate</div><h4>Paper trades</h4><p>Every journaled idea runs forward, hands-off.</p></div>
+          <div class="gd-rung"><div class="gd-step">threshold</div><h4>30 matured</h4><p>Enough closed decisions for calibration to read.</p></div>
+          <div class="gd-rung"><div class="gd-step">verdict</div><h4>Calibration</h4><p>Do your stated confidences match reality? Now you know.</p></div>
+          <div class="gd-rung"><div class="gd-step">only then</div><h4>Small live size</h4><p>Execute in ThinkOrSwim, manage via Quanta alerts. Outcomes loop back.</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cols cols2">
+      <div class="card">
+        <h2>House rules — the ones that don't bend</h2>
+        <ul class="gd-rules">
+          <li><b>RSI(2) is the only validated edge.</b> Everything else — scores, ODE, deep value, rotation — is research and context until it survives the falsification gate.</li>
+          <li><b>Nothing is a buy signal.</b> The AI explains, critiques and challenges; it never decides. There's deliberately no button that places a trade.</li>
+          <li><b>Journal always, paper first.</b> No position — real or paper — without the written thesis that precedes it. That's what turns activity into learning.</li>
+          <li><b>Trust the plumbing, not the edge.</b> Trust score 100 means the numbers are honest, not that a trade will win. Two different things.</li>
+          <li><b>"No edge this week" is a valid answer.</b> An engine that always finds a trade is broken. Sitting out is a position.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Tab map — where each job lives</h2>
+        <div class="gd-tabmap">
+          <div class="gd-trow"><span class="t">Intel</span><span class="d"><b>Start here.</b> Briefing, opportunity queue, sector scores</span></div>
+          <div class="gd-trow"><span class="t">Signals</span><span class="d">The RSI(2) validated edge</span></div>
+          <div class="gd-trow"><span class="t">Research</span><span class="d">Director, MIOS agents, <b>trust score</b>, deep value, falsification, paper trades</span></div>
+          <div class="gd-trow"><span class="t">Government</span><span class="d">Policy catalysts &amp; event risk</span></div>
+          <div class="gd-trow"><span class="t">Portfolio</span><span class="d"><b>Decision journal</b>, positions, allocation</span></div>
+          <div class="gd-trow"><span class="t">Chart</span><span class="d">Setups &amp; the entry scanner</span></div>
+          <div class="gd-trow"><span class="t">Options</span><span class="d">GEX / IV context (assumption-based — context only)</span></div>
+        </div>
+      </div>
     </div>
   </section>
 </main>
