@@ -1,5 +1,24 @@
 # Changelog (standalone platform)
 
+## 2026-07-05 · Phase 17 — Opportunity Discovery Engine
+- **Full-market scanning on the free tier**: Polygon grouped-daily endpoint
+  (whole US market in one call) → ~120-day backfill once, then 1 call/day;
+  liquidity-gated store (~2k names, price≥$5, $vol≥$8M) in compact arrays.
+- **Modular strategy library** with honest stages: RSI(2) (production on
+  sector ETFs, exploratory on stocks), momentum pullback / compression /
+  volume expansion (exploratory — their families failed sector research and
+  every surfaced item says so), 50% retracement (owner's heuristic).
+- **Transparent scoring** (formula displayed; confidence rises only via
+  independent agreement; conflicts subtract and are listed), unified queue
+  with lifecycle (improving/weakening/invalidated/confirmed/expired),
+  MFE/MAE outcome tracking → per-strategy learning verdicts (gate 30):
+  "interesting but unproven" graduates to a pre-registered experiment, never
+  straight to production. Watch/promote/dismiss/archive actions; ✨ AI
+  opportunity review mode (explains + cites research record, never
+  recommends). Options discovery over the tracked CBOE universe with stated
+  limitations. Queue lands on the Intel tab. Docs: OPPORTUNITY_ENGINE.md,
+  STRATEGY_LIBRARY.md.
+
 ## 2026-07-05 · Phase 16 — MIOS (Market Intelligence Operating System)
 - **Agent framework**: 10 analyst agents as config entries (AGENTS dict) with
   whitelisted data sources, versions, and a structured JSON output contract

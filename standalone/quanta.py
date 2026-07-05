@@ -6346,6 +6346,517 @@ AI_PARTS["findings"] = ("Latest multi-agent intelligence cycle (structured findi
                         _part_findings)
 AI_MODES["morning"]["parts"].append("findings")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ODE — Opportunity Discovery Engine (Phase 17).
+# Full-market scanning made honest on the free tier: Polygon's grouped-daily
+# endpoint returns EVERY US stock's OHLCV in ONE call — so a ~130-call
+# backfill builds market-wide history, then 1 call/day maintains it. The
+# scanner runs a modular STRATEGY library over the liquid universe; scores
+# are transparent category sums; confidence rises ONLY with independent
+# evidence agreement; every surfaced item is tracked to outcome (MFE/MAE)
+# and feeds per-strategy learning verdicts. LLMs explain; they never signal.
+# See OPPORTUNITY_ENGINE.md / STRATEGY_LIBRARY.md.
+# ─────────────────────────────────────────────────────────────────────────────
+import gzip
+from array import array
+
+ODE_MIN_PRICE = 5.0
+ODE_MIN_DVOL = 8_000_000          # avg dollar volume gate (liquidity)
+ODE_WINDOW = 120                  # trading days of market-wide history kept
+_mkt_lock = threading.Lock()
+_mkt = {"dates": [], "sym": {}}   # sym -> {"c","h","l","v": array('f')}
+
+
+def _mkt_path():
+    return os.path.join(os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__)),
+                        "market_bars.json.gz")
+
+
+def _mkt_save():
+    try:
+        with _mkt_lock:
+            body = json.dumps({"dates": _mkt["dates"],
+                               "sym": {s: {k: list(a) for k, a in d.items()} for s, d in _mkt["sym"].items()}})
+        with gzip.open(_mkt_path() + ".tmp", "wt", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(_mkt_path() + ".tmp", _mkt_path())
+    except OSError as e:
+        _ops_err("mkt_save", e)
+
+
+def _mkt_load():
+    try:
+        with gzip.open(_mkt_path(), "rt", encoding="utf-8") as f:
+            d = json.load(f)
+        with _mkt_lock:
+            _mkt["dates"] = d["dates"]
+            _mkt["sym"] = {s: {k: array("f", v) for k, v in dd.items()} for s, dd in d["sym"].items()}
+    except (OSError, ValueError, KeyError):
+        pass
+
+
+def fetch_grouped_daily(date_iso):
+    key = urllib.parse.quote(API_KEYS["polygon"])
+    d = http_get_json("https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/%s"
+                      "?adjusted=true&apiKey=%s" % (date_iso, key), timeout=60)
+    return d.get("results") or []
+
+
+def _mkt_ingest(date_iso, rows):
+    """Append one grouped day. Liquidity gate at ingest keeps the store small
+    (~2k names instead of ~10k); missing symbols get NaN-free padding via
+    last value (flagged by identical prints — scanner requires fresh highs
+    anyway, so stale pads never rank)."""
+    keep = {r["T"]: r for r in rows
+            if r.get("c") and r["c"] >= ODE_MIN_PRICE and r["c"] * (r.get("v") or 0) >= ODE_MIN_DVOL
+            and "." not in r["T"] and len(r["T"]) <= 5}
+    with _mkt_lock:
+        if date_iso in _mkt["dates"]:
+            return
+        _mkt["dates"].append(date_iso)
+        n = len(_mkt["dates"])
+        for s, r in keep.items():
+            d = _mkt["sym"].get(s)
+            if d is None:
+                d = _mkt["sym"][s] = {"c": array("f"), "h": array("f"), "l": array("f"), "v": array("f")}
+            pad = n - 1 - len(d["c"])
+            for k, val in (("c", r["c"]), ("h", r.get("h", r["c"])), ("l", r.get("l", r["c"])),
+                           ("v", r.get("v", 0))):
+                if pad > 0:
+                    d[k].extend([d[k][-1] if d[k] else val] * pad)
+                d[k].append(val)
+        # symbols absent today: pad with last close (delisted/illiquid decay out)
+        for s, d in _mkt["sym"].items():
+            if len(d["c"]) < n:
+                for k in d:
+                    d[k].append(d[k][-1])
+        if n > ODE_WINDOW:
+            cut = n - ODE_WINDOW
+            _mkt["dates"] = _mkt["dates"][cut:]
+            for s in list(_mkt["sym"]):
+                for k in _mkt["sym"][s]:
+                    _mkt["sym"][s] = {k2: a[cut:] for k2, a in _mkt["sym"][s].items()}
+                    break
+        # prune symbols that fell below the liquidity gate for the whole window
+        for s in list(_mkt["sym"]):
+            d = _mkt["sym"][s]
+            if len(d["c"]) >= 20 and (d["c"][-1] < ODE_MIN_PRICE or
+                                      sum(d["c"][i] * d["v"][i] for i in range(-20, 0)) / 20 < ODE_MIN_DVOL / 2):
+                del _mkt["sym"][s]
+
+
+def market_loop():
+    """Backfill ODE_WINDOW trading days once (~130 calls at free-tier pacing,
+    ~30 min), then one grouped call per day. Weekends/holidays return empty
+    and are skipped."""
+    if FORCE_SYNTH or not API_KEYS.get("polygon"):
+        return
+    _mkt_load()
+    while True:
+        with _mkt_lock:
+            have = set(_mkt["dates"])
+            n = len(_mkt["dates"])
+        added = 0
+        day = dt.date.today() - dt.timedelta(days=1)
+        probe = 0
+        while n + added < ODE_WINDOW and probe < ODE_WINDOW * 2:
+            probe += 1
+            di = day.isoformat()
+            day -= dt.timedelta(days=1)
+            if di in have or dt.date.fromisoformat(di).weekday() >= 5:
+                continue
+            try:
+                rows = fetch_grouped_daily(di)
+            except Exception as e:
+                _ops_err("grouped_fetch", e)
+                time.sleep(20)
+                continue
+            if rows:
+                _mkt_ingest(di, rows)
+                added += 1
+            time.sleep(14)                 # free-tier pacing, shared budget
+        if added:
+            with _mkt_lock:                # backfill appended out of order → sort
+                order = sorted(range(len(_mkt["dates"])), key=lambda i: _mkt["dates"][i])
+                _mkt["dates"] = [_mkt["dates"][i] for i in order]
+                for s, d in _mkt["sym"].items():
+                    for k in d:
+                        vals = list(d[k])
+                        vals = [vals[i] if i < len(vals) else vals[-1] for i in order]
+                        d[k] = array("f", vals)
+            _mkt_save()
+            try:
+                ode_scan()
+            except Exception as e:
+                _ops_err("ode_scan", e)
+        time.sleep(3600)
+
+
+# ── strategy library: modular, each with an explicit validation stage ───────
+def _sma_a(a, n, i=-1):
+    i = len(a) + i if i < 0 else i
+    if i + 1 < n:
+        return None
+    return sum(a[i - n + 1:i + 1]) / n
+
+
+def _rsi2_a(c):
+    if len(c) < 4:
+        return None
+    gains = losses = 0.0
+    for i in (-2, -1):
+        ch = c[i] - c[i - 1]
+        gains += max(0, ch)
+        losses += max(0, -ch)
+    if losses == 0:
+        return 100.0
+    return 100 - 100 / (1 + gains / losses)
+
+
+def _strat_rsi2(c, h, l, v):
+    s200 = _sma_a(c, 100)
+    r = _rsi2_a(c)
+    if s200 and r is not None and c[-1] > s200 and r < 10:
+        return {"technical": 70 + (10 - r) * 2, "why": "RSI(2)=%.0f oversold, price above long MA" % r,
+                "invalidation": "close below the long-term MA (%.2f)" % s200, "level": s200}
+    return None
+
+
+def _strat_momentum(c, h, l, v):
+    if len(c) < 65:
+        return None
+    r60 = c[-1] / c[-60] - 1
+    r5 = c[-1] / c[-5] - 1
+    if r60 > 0.25 and -0.06 < r5 < 0:
+        return {"technical": min(90, 50 + r60 * 100), "why": "+%.0f%% over 60d, modest 5d pullback (%.1f%%)" % (r60 * 100, r5 * 100),
+                "invalidation": "loss of the 20d MA on volume", "level": _sma_a(c, 20)}
+    return None
+
+
+def _strat_pullback50(c, h, l, v):
+    if len(c) < 40:
+        return None
+    hi, lo = max(h[-40:]), min(l[-40:])
+    if hi <= lo:
+        return None
+    fib = lo + (hi - lo) * 0.5
+    band = (hi - lo) * 0.06
+    up = c[-1] > (_sma_a(c, 50) or c[-1] * 2)
+    if up and abs(c[-1] - fib) <= band and c[-1] < hi * 0.97:
+        return {"technical": 60, "why": "in the 50%% retracement pocket of the 40d swing (%.2f), uptrend intact" % fib,
+                "invalidation": "close below the 61.8%% level (%.2f)" % (lo + (hi - lo) * 0.382), "level": lo + (hi - lo) * 0.382}
+    return None
+
+
+def _strat_compression(c, h, l, v):
+    if len(c) < 30:
+        return None
+    rng = [(h[i] - l[i]) / c[i] for i in range(-20, 0)]
+    r5, r20 = sum(rng[-5:]) / 5, sum(rng) / 20
+    near_hi = c[-1] >= max(c[-30:]) * 0.97
+    if r20 > 0 and r5 / r20 < 0.55 and near_hi:
+        return {"technical": 55, "why": "range compression (5d range %.1f%% of 20d avg) near 30d highs" % (100 * r5 / r20),
+                "invalidation": "expansion downward / loss of 20d MA", "level": _sma_a(c, 20)}
+    return None
+
+
+def _strat_volexp(c, h, l, v):
+    if len(c) < 25 or not v[-1]:
+        return None
+    va = sum(v[-21:-1]) / 20
+    if va and v[-1] > 3 * va and c[-1] > c[-2] * 1.03 and c[-1] >= max(c[-20:]):
+        return {"technical": 50, "why": "3x volume expansion with +3%% move to 20d high",
+                "invalidation": "full retrace of the expansion bar", "level": l[-1]}
+    return None
+
+
+STRATEGIES = {
+    "rsi2-pullback": {"name": "RSI(2) mean reversion", "fn": _strat_rsi2,
+                      "stage": "production on sector ETFs (EXP-12); EXPLORATORY on single stocks — not yet validated there",
+                      "entry": "RSI(2)<10 above long MA", "exit": "close above 5d MA (per EXP-12 spec)"},
+    "momentum-pb": {"name": "Momentum pullback", "fn": _strat_momentum,
+                    "stage": "exploratory — cross-sectional momentum FAILED on sector ETFs (EXP-04/11); single-stock version untested",
+                    "entry": "+25% 60d leader, shallow 5d pullback", "exit": "20d MA loss"},
+    "pullback-50": {"name": "50% retracement (user's discretionary style)", "fn": _strat_pullback50,
+                    "stage": "heuristic — codifies the owner's manual setup; no backtest claim",
+                    "entry": "50% pocket of 40d swing in uptrend", "exit": "61.8% violation / prior swing target"},
+    "compression": {"name": "Volatility compression", "fn": _strat_compression,
+                    "stage": "exploratory — breakout family was REJECTED (EXP-01); compression variant unproven",
+                    "entry": "5d range <55% of 20d avg near highs", "exit": "direction of expansion"},
+    "vol-expansion": {"name": "Volume expansion", "fn": _strat_volexp,
+                      "stage": "exploratory — volume category failed IC on sectors (EXP-04); single-stock untested",
+                      "entry": "3x volume thrust to 20d high", "exit": "expansion bar low"},
+}
+
+ODE_PATH_KEY = "opportunity_queue.json"
+_ode_lock = threading.Lock()
+_ode = {"items": {}, "scannedAt": None, "universe": 0}
+
+
+def _ode_path():
+    return os.path.join(os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__)),
+                        ODE_PATH_KEY)
+
+
+def _ode_save():
+    try:
+        with _ode_lock:
+            body = json.dumps({"items": _ode["items"], "scannedAt": _ode["scannedAt"]})
+        with open(_ode_path() + ".tmp", "w") as f:
+            f.write(body)
+        os.replace(_ode_path() + ".tmp", _ode_path())
+    except OSError as e:
+        _ops_err("ode_save", e)
+
+
+def _ode_load():
+    try:
+        with open(_ode_path()) as f:
+            d = json.load(f)
+        with _ode_lock:
+            _ode["items"] = d.get("items", {})
+            _ode["scannedAt"] = d.get("scannedAt")
+    except (OSError, ValueError):
+        pass
+
+
+def ode_scan():
+    """One full-market scan pass. Transparent scoring: category points are
+    shown per item; confidence increases only with INDEPENDENT agreement
+    (multiple strategies, congressional context, options context, sector
+    strength) and conflicting evidence subtracts."""
+    with _mkt_lock:
+        syms = {s: {k: a[:] for k, a in d.items()} for s, d in _mkt["sym"].items()}
+        dates = list(_mkt["dates"])
+    if len(dates) < 40:
+        return {"error": "market store warming (%d/%d days)" % (len(dates), ODE_WINDOW)}
+    sc = cache_get("scores", 3600) or {}
+    sector_score = {r.get("symbol"): r.get("score") for r in (sc.get("sectors") or [])}
+    regv = cache_get("regime", 3600) or {}
+    regime = ((regv.get("current") or {}).get("primary")) if not regv.get("error") else None
+    with _congress_lock:
+        cg_recent = {}
+        cutoff = (dt.date.today() - dt.timedelta(days=45)).isoformat()
+        for t in _congress.get("trades", {}).values():
+            if (t.get("discDate") or "") >= cutoff and t["side"] == "buy":
+                cg_recent[t["ticker"]] = cg_recent.get(t["ticker"], 0) + 1
+    with _state_lock:
+        held = {p["symbol"] for p in _state["positions"]}
+    today = dt.date.today().isoformat()
+    found = {}
+    for s, d in syms.items():
+        c, h, l, v = d["c"], d["h"], d["l"], d["v"]
+        hits = []
+        for sid, st in STRATEGIES.items():
+            try:
+                r = st["fn"](c, h, l, v)
+            except Exception:
+                r = None
+            if r:
+                hits.append((sid, r))
+        if not hits:
+            continue
+        sec = CONGRESS_SECTOR_MAP.get(s)
+        dvol = sum(c[i] * v[i] for i in range(-20, 0)) / 20
+        for sid, r in hits:
+            cats = {"technical": round(min(100, r["technical"])),
+                    "liquidity": min(100, round(dvol / 2_000_000)),
+                    "agreement": (len(hits) - 1) * 25,
+                    "sectorStrength": round(sector_score.get(sec, 0) or 0) if sec else 0,
+                    "govContext": min(30, cg_recent.get(s, 0) * 10)}
+            conflicts = []
+            if regime and "Bear" in regime and sid in ("momentum-pb", "compression", "vol-expansion"):
+                conflicts.append("regime %s argues against continuation setups" % regime)
+                cats["regimeFit"] = -20
+            else:
+                cats["regimeFit"] = 10 if regime else 0
+            score = round(cats["technical"] * 0.45 + min(100, cats["liquidity"]) * 0.10 +
+                          cats["agreement"] * 0.20 + cats["sectorStrength"] * 0.10 +
+                          cats["govContext"] * 0.05 + cats["regimeFit"] * 0.10)
+            oid = "%s|%s" % (s, sid)
+            found[oid] = {
+                "id": oid, "symbol": s, "assetType": "stock" if s not in dict(SECTORS) else "sector ETF",
+                "sector": sec, "strategy": sid, "strategyName": STRATEGIES[sid]["name"],
+                "stage": STRATEGIES[sid]["stage"], "score": score, "categories": cats,
+                "why": r["why"], "invalidation": r["invalidation"], "level": round(r.get("level") or 0, 2),
+                "conflicting": conflicts + (["strategy family has failed research on record — see stage"]
+                                            if "REJECTED" in STRATEGIES[sid]["stage"] or "failed" in STRATEGIES[sid]["stage"] else []),
+                "supporting": [r["why"]] + (["%d congressional buy filing(s) disclosed ≤45d (delayed context)" % cg_recent[s]]
+                                            if s in cg_recent else []) +
+                              (["+%d other strateg%s flag this symbol" % (len(hits) - 1, "y" if len(hits) == 2 else "ies")]
+                               if len(hits) > 1 else []),
+                "portfolioOverlap": s in held, "watchlistOverlap": s in WATCHLIST,
+                "regime": regime, "price0": round(c[-1], 2), "hi0": round(c[-1], 2), "lo0": round(c[-1], 2),
+                "firstSeen": today, "lastEval": today, "status": "new", "life": "active",
+                "priceNow": round(c[-1], 2), "retPct": 0.0, "mfePct": 0.0, "maePct": 0.0,
+            }
+    # merge with existing queue: refresh live ones, track lifecycle/outcomes
+    with _ode_lock:
+        items = _ode["items"]
+        for oid, it in list(items.items()):
+            s = it["symbol"]
+            d = syms.get(s)
+            if it["life"] not in ("active",):
+                continue
+            if d is None:
+                it["life"], it["lifeNote"] = "expired", "fell out of the liquid universe"
+                continue
+            px = d["c"][-1]
+            it["priceNow"] = round(px, 2)
+            it["retPct"] = round((px / it["price0"] - 1) * 100, 2)
+            it["mfePct"] = round(max(it["mfePct"], (max(d["h"][-1], px) / it["price0"] - 1) * 100), 2)
+            it["maePct"] = round(min(it["maePct"], (min(d["l"][-1], px) / it["price0"] - 1) * 100), 2)
+            it["lastEval"] = today
+            age = (dt.date.fromisoformat(today) - dt.date.fromisoformat(it["firstSeen"])).days
+            if it.get("level") and px < it["level"]:
+                it["life"], it["lifeNote"] = "invalidated", "closed below stated invalidation level"
+            elif it["retPct"] >= 8:
+                it["life"], it["lifeNote"] = "confirmed", "+8% from surfacing"
+            elif age >= 30:
+                it["life"], it["lifeNote"] = "expired", "30 calendar days without confirmation or invalidation"
+            elif oid in found:
+                it["trend"] = "improving" if found[oid]["score"] > it["score"] else \
+                              "weakening" if found[oid]["score"] < it["score"] else "stable"
+                it["score"], it["categories"] = found[oid]["score"], found[oid]["categories"]
+            else:
+                it["trend"] = "weakening"
+        for oid, it in found.items():
+            if oid not in items:
+                items[oid] = it
+        # cap: keep all non-active outcomes for learning (max 800), active top 200 by score
+        active = sorted((i for i in items.values() if i["life"] == "active"), key=lambda x: -x["score"])
+        done = sorted((i for i in items.values() if i["life"] != "active"), key=lambda x: x["lastEval"])[-800:]
+        _ode["items"] = {i["id"]: i for i in active[:200] + done}
+        _ode["scannedAt"] = time.time()
+        _ode["universe"] = len(syms)
+    _ode_save()
+    return {"ok": True, "universe": len(syms), "active": len(active[:200])}
+
+
+def _ode_learning():
+    """Per-strategy outcome verdicts from tracked opportunities. Deterministic;
+    verdict vocabulary matches the platform's: validated edge / interesting
+    but unproven / needs more data / false-positive-prone. Surfacing-tracking
+    is NOT a backtest (no entries/exits/costs) — it grades the SCANNER."""
+    with _ode_lock:
+        done = [i for i in _ode["items"].values() if i["life"] in ("confirmed", "invalidated", "expired")]
+    per = {}
+    for i in done:
+        p = per.setdefault(i["strategy"], {"n": 0, "confirmed": 0, "invalidated": 0, "expired": 0,
+                                           "mfe": [], "mae": []})
+        p["n"] += 1
+        p[i["life"]] += 1
+        p["mfe"].append(i["mfePct"])
+        p["mae"].append(i["maePct"])
+    out = {}
+    for sid, p in per.items():
+        row = {"n": p["n"], "confirmed": p["confirmed"], "invalidated": p["invalidated"], "expired": p["expired"],
+               "avgMFE": round(sum(p["mfe"]) / p["n"], 1), "avgMAE": round(sum(p["mae"]) / p["n"], 1)}
+        if p["n"] < 30:
+            row["verdict"] = "needs more data (gate 30 tracked outcomes)"
+        elif p["confirmed"] / p["n"] >= 0.4 and abs(sum(p["mfe"])) > abs(sum(p["mae"])):
+            row["verdict"] = "interesting but unproven — candidate for a pre-registered experiment"
+        elif p["invalidated"] / p["n"] >= 0.5:
+            row["verdict"] = "false-positive-prone — tighten or retire the screen"
+        else:
+            row["verdict"] = "inconclusive"
+        out[sid] = row
+    return {"byStrategy": out,
+            "note": "grades the scanner's surfacing quality, not a tradable backtest; any 'edge' claim still "
+                    "requires the pre-registered validation pipeline"}
+
+
+def _ode_options():
+    """Options discovery over the TRACKED universe only (sectors + SPY):
+    CBOE free delayed chains can't be fetched for thousands of names — the
+    limitation is stated instead of faked."""
+    out = []
+    for s in OPTIONS_UNIVERSE:
+        o = get_options(s)
+        if not o or o.get("error"):
+            continue
+        ivr, gex, em, skew = o.get("ivRank"), o.get("netGEX"), o.get("expectedMovePct"), o.get("skew")
+        if ivr is not None and ivr >= 80:
+            out.append({"symbol": s, "kind": "high IV rank", "detail": "IV rank %d — rich vs own 20d+ history" % ivr,
+                        "assumptions": "IV rank needs ≥20 snapshot days; premium-selling implications are context only"})
+        if ivr is not None and ivr <= 15:
+            out.append({"symbol": s, "kind": "low IV rank", "detail": "IV rank %d — cheap vs own history" % ivr,
+                        "assumptions": "cheap vol ≠ mispriced vol; event calendar may explain it"})
+        if gex is not None and gex < 0:
+            out.append({"symbol": s, "kind": "short-gamma environment", "detail": "net GEX %.0f (naive convention) — dealer hedging may amplify moves" % gex,
+                        "assumptions": "GEX sign uses the naive +call/−put dealer convention (documented, unverifiable in free data)"})
+        if skew is not None and abs(skew) >= 2:
+            out.append({"symbol": s, "kind": "skew anomaly", "detail": "put/call IV skew %.1f vs typical ~1" % skew,
+                        "assumptions": "skew from delayed CBOE quotes; wide markets distort it"})
+    return {"items": out[:20], "universe": OPTIONS_UNIVERSE,
+            "limitations": "tracked-universe only (free CBOE delayed, ~15 min lag, one symbol per fetch); "
+                           "unusual-flow/insider/analyst-revision screens have no free source — absent, not estimated"}
+
+
+def ode_view():
+    with _ode_lock:
+        items = sorted((dict(i) for i in _ode["items"].values() if i["life"] == "active" and
+                        i["status"] not in ("dismissed", "archived")), key=lambda x: -x["score"])
+        scanned, universe = _ode["scannedAt"], _ode["universe"]
+    with _mkt_lock:
+        days = len(_mkt["dates"])
+    return {"queue": items[:40],
+            "scannedAt": scanned, "universe": universe, "storeDays": days, "storeTarget": ODE_WINDOW,
+            "strategies": {sid: {k: v for k, v in st.items() if k != "fn"} for sid, st in STRATEGIES.items()},
+            "learning": _ode_learning(), "options": _ode_options(),
+            "scoring": "score = 0.45·technical + 0.10·liquidity + 0.20·agreement + 0.10·sectorStrength + "
+                       "0.05·govContext + 0.10·regimeFit — weights are DISPLAY HEURISTICS (unvalidated, shown so "
+                       "you can disagree); confidence only rises via the agreement term",
+            "policy": "the scanner surfaces statistically interesting situations; nothing here is a signal; "
+                      "strategy stages show exactly what has and hasn't survived validation"}
+
+
+def ode_action(d):
+    oid, action = d.get("id"), d.get("action")
+    if action not in ("watch", "archive", "dismiss", "promote"):
+        return {"ok": False, "error": "action must be watch|archive|dismiss|promote"}
+    with _ode_lock:
+        it = _ode["items"].get(oid)
+        if not it:
+            return {"ok": False, "error": "opportunity not found"}
+        it["status"] = {"watch": "watching", "archive": "archived", "dismiss": "dismissed",
+                        "promote": "promoted"}[action]
+    if action == "promote":
+        sym = oid.split("|")[0]
+        if sym not in WATCHLIST:
+            WATCHLIST.append(sym)
+    _ode_save()
+    return {"ok": True, "status": action}
+
+
+def ode_loop():
+    _ode_load()
+    time.sleep(600)
+    while True:
+        try:
+            ode_scan()
+        except Exception as e:
+            _ops_err("ode_scan", e)
+        time.sleep(6 * 3600)
+
+
+def _part_ode():
+    v = ode_view()
+    return {"top": [{k: i.get(k) for k in ("symbol", "strategyName", "score", "why", "conflicting", "stage", "life")}
+                    for i in (v.get("queue") or [])[:8]],
+            "learning": v.get("learning"), "optionsItems": (v.get("options") or {}).get("items", [])[:6]}
+
+
+AI_PARTS["ode"] = ("Opportunity Discovery Engine (top-ranked scanner candidates + strategy stages)", _part_ode)
+AI_MODES["opportunity"] = {
+    "title": "Opportunity review", "rag": True, "ragQuery": "validation edge strategy rejected exploratory",
+    "parts": ["ode", "regime", "scores", "government"],
+    "system": "Review the attached scanner opportunity (or the top of the queue if none attached): why it was "
+              "surfaced, supporting vs conflicting evidence, which platform research supports or contradicts the "
+              "strategy family (cite stages/experiments), what would invalidate it, what catalysts matter next. "
+              "NEVER recommend buying or selling — explain and challenge only."}
+AI_MODES["morning"]["parts"].append("ode")
+
 MIOS_CYCLE_HOURS = float(os.environ.get("MIOS_CYCLE_HOURS") or 24)
 
 
@@ -7314,6 +7825,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(agents_view())
         elif path == "/api/ops":
             self._json(ops_view())
+        elif path == "/api/ode":
+            self._json(cache_get("ode", 300) or _cache_and_return("ode", ode_view))
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -7336,6 +7849,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                                 "note": "cycle runs in background "
                                                                                         "(~10-15 min on a 14B) — "
                                                                                         "watch /api/agents"}),
+        "/api/ode/action": ode_action,
     }
 
     def do_POST(self):
@@ -7424,7 +7938,7 @@ def main():
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
-               research_log_loop, agents_loop):
+               research_log_loop, agents_loop, market_loop, ode_loop):
         threading.Thread(target=fn, daemon=True).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on
