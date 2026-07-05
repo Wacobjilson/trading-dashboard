@@ -1,5 +1,27 @@
 # Changelog (standalone platform)
 
+## 2026-07-05 · Phase 16 — MIOS (Market Intelligence Operating System)
+- **Agent framework**: 10 analyst agents as config entries (AGENTS dict) with
+  whitelisted data sources, versions, and a structured JSON output contract
+  (observation / supporting+conflicting evidence with section citations /
+  stance / sectors / confidence / unknowns / follow-up). Company Intelligence
+  ships dormant (sources not integrated — declines to run rather than guess).
+- **Orchestrator**: event inbox → sequential agent runs → disagreement
+  detection → AI Critic challenge → Research Director synthesis (WHAT
+  CHANGED / MATTERS MOST / SECTORS / WEAK CLAIMS / RESEARCH TODAY / IGNORE)
+  → archived (60 cycles). Scheduled daily (MIOS_CYCLE_HOURS) + on-demand;
+  honest constraint stated: ~10-15 min/cycle on a local 14B, so LLM cycles
+  are scheduled while deterministic loops monitor continuously.
+- **Continuous learning**: agent stances graded against realized SPY 10d
+  forward returns (gate n≥20/agent) — grades AI interpretations, never
+  trading models.
+- **Operations** (/api/ops + MIOS panel): per-host fetch latency/errors,
+  cache hit rate, RAG stats + embedding status, AI token usage by mode,
+  feed freshness, loop-error counters, agent health. Morning AI mode now
+  grounds in the latest cycle. Docs: AGENT_FRAMEWORK, AGENT_ORCHESTRATOR,
+  WORLD_MODEL, EVENT_PIPELINE, MARKET_INTELLIGENCE, OPERATIONS,
+  SOURCE_REGISTRY.
+
 ## 2026-07-05 · Phase 15 fixes — production hardening
 - **Fix #1**: `research_log_loop` — score snapshots + allocation prediction
   log now write on a schedule (4x/day, date-deduped), not only when a tab is

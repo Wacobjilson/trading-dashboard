@@ -230,6 +230,16 @@
       <div class="card"><h2>Meta-learning — research about the research process</h2><div id="rd-meta"><div class="loading">…</div></div></div>
       <div class="card"><h2>Knowledge graph — what evidence connects to what</h2><div id="rd-graph" style="max-height:260px;overflow-y:auto"><div class="loading">…</div></div></div>
     </div>
+    <div class="sechead">MIOS — MULTI-AGENT INTELLIGENCE &amp; OPERATIONS</div>
+    <div class="card"><h2>Intelligence cycle — 10 analyst agents, structured findings, Critic + Director synthesis
+      <span style="float:right;font-weight:normal"><button class="mini" id="ag-run">▶ run cycle now</button>
+      <span class="muted" id="ag-status" style="font-size:11px"></span></span></h2>
+      <div id="ag-summary"><div class="loading">…</div></div>
+      <details style="margin-top:6px"><summary style="cursor:pointer;font-size:12px" class="muted">agent findings (structured)</summary><div id="ag-findings"></div></details></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Agent health &amp; learning</h2><div id="ag-health"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Operations — nothing is a black box</h2><div id="ag-ops"><div class="loading">…</div></div></div>
+    </div>
 
     <div class="card" style="font-size:13px"><span class="badge b-appr">RESEARCH MODE</span>
       &nbsp;Everything here computes live from the same 2-year bar cache the production score uses — regime
@@ -1245,8 +1255,55 @@ async function djLoad(){
       +`<div class="note">${d.note||""}</div>`;
   }catch(e){}
 }
+// ── MIOS: agents + operations ──
+const stanceBadge=s=>`<span class="badge ${s==="risk-on"?"b-long":s==="risk-off"?"b-short":"b-neu"}">${s||"n/a"}</span>`;
+async function loadAgents(){
+  try{
+    const [a,o]=await Promise.all([fetch(`${API}/api/agents`).then(r=>r.json()),
+                                   fetch(`${API}/api/ops`).then(r=>r.json())]);
+    document.getElementById("ag-status").textContent=a.running?"cycle running… (~10-15 min)":a.cycles?`${a.cycles} cycles archived`:"no cycles yet";
+    const lc=a.lastCycle;
+    document.getElementById("ag-summary").innerHTML=lc?
+      `<div class="muted" style="font-size:11px">cycle ${new Date(lc.startedAt*1000).toLocaleString()} · trigger: ${lc.trigger} · ${lc.wallMin??"?"} min${(lc.challenges||[]).length?` · ${lc.challenges.length} disagreement(s) challenged by Critic`:""}</div>
+       <div style="font-size:12.5px;margin-top:4px">${mdLite(lc.summary||"(no synthesis)")}</div>
+       ${(lc.challenges||[]).map(c=>`<div class="note"><b>Critic on ${c.between.join(" vs ")}:</b> ${c.critique}</div>`).join("")}`
+      :'<div class="muted" style="padding:6px;font-size:12px">No intelligence cycle yet — one runs automatically each day when Ollama is reachable, or click ▶.</div>';
+    document.getElementById("ag-findings").innerHTML=lc?(lc.findings||[]).map(f=>
+      `<div style="border-top:1px solid var(--border);padding:5px 0;font-size:12px">
+        <b>${f.name}</b> <span class="muted" style="font-size:10px">v${f.version}</span> ${stanceBadge(f.stance)}
+        conf <b>${f.confidence}</b>${f.parsed===false?' <span class="badge b-bear">unparsed</span>':''}
+        <div style="margin-top:2px">${f.observation||""}</div>
+        <div class="muted" style="font-size:10px">evidence: ${(f.supportingEvidence||[]).join(" · ")||"—"}
+          ${(f.conflictingEvidence||[]).length?`<br>conflicts: ${f.conflictingEvidence.join(" · ")}`:""}
+          ${(f.unknowns||[]).length?`<br>unknowns: ${f.unknowns.join(" · ")}`:""}
+          <br>sources: ${(f.dataSources||[]).join(", ")||"—"} · follow-up: ${f.suggestedFollowup||"—"}</div></div>`).join(""):"";
+    const lr=a.learning||{};
+    document.getElementById("ag-health").innerHTML=
+      `<table><thead><tr><th>Agent</th><th>v</th><th>Runs(10)</th><th>Avg s</th><th>Last conf</th><th>Learning</th></tr></thead><tbody>
+      ${Object.entries(a.agents||{}).map(([k,h])=>{const l=(lr.agents||{})[k]||{};return`<tr>
+        <td style="font-size:12px">${h.name}${h.dormant?' <span class="badge b-neu">dormant</span>':''}</td>
+        <td class="mono muted">${h.version}</td><td class="mono">${h.runs10}${h.parseFailures10?` <span class="down">(${h.parseFailures10}!)</span>`:""}</td>
+        <td class="mono muted">${h.avgLatencyS??"—"}</td><td class="mono">${h.lastConfidence??"—"}</td>
+        <td class="muted" style="font-size:10px">${l.hitRate!=null?`hit ${l.hitRate}% (n=${l.n})`:l.n?`n=${l.n} (gate 20)`:"—"}</td></tr>`;}).join("")}</tbody></table>
+      <div class="note">${(a.learning||{}).note||""} · ${a.policy||""}</div>`;
+    const ai=o.ai||{},rag=o.rag||{},dq=o.dataQuality||{};
+    document.getElementById("ag-ops").innerHTML=
+      `<div style="font-size:12px">
+        <div><b>AI:</b> ${ai.calls||0} calls (window) · avg ${ai.avgLatencyS??"—"}s · ${vol(ai.outputTokens)} out-tokens / ${vol(ai.promptTokens)} prompt-tokens · modes: ${Object.entries(ai.byMode||{}).map(([k,v])=>`${k}:${v}`).join(" ")}</div>
+        <div style="margin-top:3px"><b>Cache:</b> ${o.cache.hitRate}% hit (${vol(o.cache.hits)}/${vol(o.cache.hits+o.cache.misses)}) · ${o.cache.entries} entries · <b>RAG:</b> ${rag.chunks} chunks, ${rag.mode}, ${o.ragSearches} searches · ${rag.embeddings}</div>
+        <div style="margin-top:3px"><b>Feeds:</b> ${(dq.feeds||[]).map(f=>`${f.feed}: ${f.ageMin!=null?f.ageMin+"m":f.ageSec!=null?f.ageSec+"s":f.ageH!=null?f.ageH+"h":"—"}`).join(" · ")}</div>
+        <div style="margin-top:3px"><b>Host latency:</b> ${Object.entries(dq.hostLatency||{}).slice(0,8).map(([h,v])=>`${h.split(".").slice(-2).join(".")} ${v.lastMs}ms${v.errors?` <span class="down">(${v.errors}err/${v.calls})</span>`:""}`).join(" · ")||"—"}</div>
+        ${Object.keys(o.loopErrors||{}).length?`<div style="margin-top:3px"><b class="down">Loop errors:</b> ${Object.entries(o.loopErrors).map(([k,v])=>`${k}×${v}`).join(" · ")}</div>`:'<div style="margin-top:3px" class="muted">no loop errors recorded</div>'}
+        <div class="note">${o.note||""}</div></div>`;
+  }catch(e){document.getElementById("ag-summary").innerHTML='<div class="loading">MIOS unavailable.</div>';}
+}
+document.getElementById("ag-run").onclick=async()=>{
+  const r=await post("/api/agents/run",{});
+  document.getElementById("ag-status").textContent=r.started?"cycle started — refresh in ~15 min":(r.error||"failed");
+  setTimeout(loadAgents,5000);
+};
 async function loadResearch(){
-  loadDirector();
+  loadDirector(); loadAgents();
   try{
     const [reg,val,prob,ana,regy,fx,lab,cal]=await Promise.all(
       ["regime","research","probabilities","analogs","registry","factors","edgelab","calibration"]

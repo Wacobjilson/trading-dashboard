@@ -126,10 +126,36 @@ SEED_PRICES = {"SPY": 545, "QQQ": 470, "IWM": 205, "DIA": 395, "VIX": 14.2, "CL"
 FINNHUB = "https://finnhub.io/api/v1"
 
 
+# Ops instrumentation (MIOS observability): per-host fetch latency/errors,
+# cache hit rates. Cheap counters, no behavior change.
+_ops_lock = threading.Lock()
+_ops = {"http": {}, "cacheHits": 0, "cacheMisses": 0, "ragSearches": 0, "errors": {}}
+
+
+def _ops_err(where, e):
+    with _ops_lock:
+        k = "%s: %s" % (where, type(e).__name__)
+        _ops["errors"][k] = _ops["errors"].get(k, 0) + 1
+
+
 def http_get_json(url, timeout=15):
-    req = urllib.request.Request(url, headers={"User-Agent": "quanta-standalone"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    host = urllib.parse.urlparse(url).netloc
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "quanta-standalone"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+        with _ops_lock:
+            h = _ops["http"].setdefault(host, {"calls": 0, "errors": 0, "lastMs": None})
+            h["calls"] += 1
+            h["lastMs"] = int((time.time() - t0) * 1000)
+        return out
+    except Exception:
+        with _ops_lock:
+            h = _ops["http"].setdefault(host, {"calls": 0, "errors": 0, "lastMs": None})
+            h["calls"] += 1
+            h["errors"] += 1
+        raise
 
 
 _cache, _cache_lock = {}, threading.Lock()
@@ -138,7 +164,10 @@ _cache, _cache_lock = {}, threading.Lock()
 def cache_get(key, ttl):
     with _cache_lock:
         item = _cache.get(key)
-    return item[1] if item and (time.time() - item[0]) < ttl else None
+    hit = item is not None and (time.time() - item[0]) < ttl
+    with _ops_lock:
+        _ops["cacheHits" if hit else "cacheMisses"] += 1
+    return item[1] if hit else None
 
 
 def cache_set(key, value):
@@ -4948,6 +4977,8 @@ def _ollama_chat(messages, opts, stream_cb=None):
         body = {"model": opts["model"], "messages": messages, "stream": stream_cb is not None,
                 "options": {"temperature": opts["temperature"], "num_ctx": opts["numCtx"],
                             "num_predict": opts["maxTokens"]}}
+        if opts.get("jsonMode"):
+            body["format"] = "json"        # agents need machine-parseable findings
         if with_think_param:
             body["think"] = bool(opts.get("think"))
         req = urllib.request.Request(opts["host"] + "/api/chat", data=json.dumps(body).encode("utf-8"),
@@ -5012,9 +5043,13 @@ def _anthropic_chat(messages, opts, stream_cb=None):
 AI_PROVIDERS = {"ollama": _ollama_chat, "anthropic": _anthropic_chat}
 
 
-def ai_chat(messages, mode="ask", stream_cb=None):
+def ai_chat(messages, mode="ask", stream_cb=None, json_mode=False, max_tokens=None):
     with _ai_lock:
         opts = dict(AI_CFG)
+    if json_mode:
+        opts["jsonMode"] = True
+    if max_tokens:
+        opts["maxTokens"] = max_tokens
     if not opts["enabled"]:
         raise RuntimeError("AI disabled (set AI_ENABLED=1)")
     fn = AI_PROVIDERS.get(opts["provider"])
@@ -5298,6 +5333,8 @@ def rag_search(q, k=3):
             _rag_embed["vecs"] = {v: e for v, e in _rag_embed["vecs"].items()}  # keep disk cache
         except Exception:
             pass
+    with _ops_lock:
+        _ops["ragSearches"] += 1
     toks = _rag_tokens(q)
     rankings = []
     if RAG_MODE == "tfidf":
@@ -5949,6 +5986,384 @@ AI_MODES.update({
 })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MIOS — Market Intelligence Operating System (Phase 16).
+# Deterministic loops monitor 24/7 (they already do); LLM agent cycles run
+# scheduled + on-demand because a local 14B model costs ~100s per call — the
+# docs state this honestly instead of pretending per-event agents. Agents are
+# CONFIG entries (add one = add a dict). All output is structured JSON with
+# required evidence fields; the Critic challenges disagreements; the Director
+# synthesizes; findings are archived and later graded against realized sector
+# returns. No agent output touches models/allocation — evidence changes
+# models, AI organizes evidence, humans decide. See AGENT_FRAMEWORK.md.
+# ─────────────────────────────────────────────────────────────────────────────
+AGENT_SCHEMA = ("Respond ONLY with a JSON object with exactly these keys: "
+                '"observation" (1-3 sentences, the single most important thing in your domain right now), '
+                '"supportingEvidence" (array of strings, each naming the DATA/DOCS section it came from), '
+                '"conflictingEvidence" (array of strings, may be empty — look for it honestly), '
+                '"stance" ("risk-on"|"risk-off"|"neutral"|"n/a"), '
+                '"sectors" (array of affected SPDR tickers, may be empty), '
+                '"confidence" (0-100, your evidence-based confidence in the observation), '
+                '"unknowns" (array of strings — what the data cannot tell you), '
+                '"suggestedFollowup" (one concrete, runnable next check). '
+                "If your domain's data is unavailable, say so in observation with confidence <= 20. "
+                "Never invent numbers not present in the data.")
+
+AGENTS = {
+    "macro": {"name": "Macro Analyst", "version": "1.0", "parts": ["macro", "factors", "regime"],
+              "rag": "macro regime rates curve inflation",
+              "charge": "Assess the macro picture: rates/curve/credit/inflation proxies, regime, changes vs history."},
+    "government": {"name": "Government Policy Analyst", "version": "1.0", "parts": ["government"],
+                   "rag": "government policy bill rule congressional",
+                   "charge": "Assess government/policy developments: what happened, affected sectors, what is untested."},
+    "market": {"name": "Market Structure Analyst", "version": "1.0", "parts": ["regime", "scores", "opportunities", "probabilities"],
+               "rag": "breadth rotation regime leadership",
+               "charge": "Assess market structure: breadth, rotation, leadership, regime fit, risk-on/off."},
+    "options": {"name": "Options Analyst", "version": "1.0", "parts": ["options"],
+                "rag": "gamma GEX dealer positioning limitations",
+                "charge": "Assess options positioning (GEX/DEX/IV/skew/walls). State the dealer-inventory assumption "
+                          "and delayed-data limitation explicitly — never infer beyond documented assumptions."},
+    "sector": {"name": "Sector Analyst", "version": "1.0", "parts": ["scores", "opportunities", "factors", "government"],
+               "rag": "sector rotation exposure",
+               "charge": "Assess sector-level standouts: strongest/weakest with their factor and policy context."},
+    "news": {"name": "News Intelligence Analyst", "version": "1.0", "parts": ["alerts"],
+             "rag": "narrative catalyst",
+             "charge": "Assess the platform's recent alert/event stream: what is signal, what is noise, what is developing."},
+    "risk": {"name": "Risk Manager", "version": "1.0", "parts": ["portfolio", "allocation", "regime", "options", "government"],
+             "rag": "risk concentration stress scenario",
+             "charge": "Independent risk read: concentration, regime risk, event risk (FOMC study), what the book "
+                       "is exposed to that the owner may not have priced."},
+    "quality": {"name": "Data Quality Analyst", "version": "1.0", "parts": ["dataquality"],
+                "rag": "data source limitation freshness",
+                "charge": "Assess the measured data-quality report: stale feeds, elevated error hosts, silent-failure risks."},
+    "scientist": {"name": "Research Scientist", "version": "1.0", "parts": ["director", "integrity", "assumptions", "calibration"],
+                  "rag": "experiment validation replication overfitting",
+                  "charge": "Assess research health: weakening beliefs, gate progress, overfitting exposure. Suggest "
+                            "(never approve) the single most valuable experiment."},
+    "company": {"name": "Company Intelligence Analyst", "version": "0.1-dormant", "parts": [],
+                "rag": "", "dormant": "required sources (filings, insiders, revisions, contracts) are not integrated "
+                                      "— agent activates by config when they are; it does not guess meanwhile.",
+                "charge": ""},
+}
+AGENT_CRITIC_VERSION = "1.0"
+
+
+def _agents_path():
+    return os.path.join(os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__)),
+                        "agent_findings.json")
+
+
+_agents_lock = threading.Lock()
+_agents_state = {"cycles": [], "running": False, "lastError": None}
+
+
+def _agents_load():
+    try:
+        with open(_agents_path()) as f:
+            d = json.load(f)
+        with _agents_lock:
+            _agents_state["cycles"] = d.get("cycles", [])
+    except (OSError, ValueError):
+        pass
+
+
+def _agents_save():
+    try:
+        p = _agents_path()
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with _agents_lock:
+            body = json.dumps({"cycles": _agents_state["cycles"][-60:]})
+        with open(p + ".tmp", "w") as f:
+            f.write(body)
+        os.replace(p + ".tmp", p)
+    except OSError as e:
+        _ops_err("agents_save", e)
+
+
+def _data_quality_report():
+    """Measured freshness/error report — the deterministic backbone the Data
+    Quality agent (and ops panel) interprets. Nothing here is inferred."""
+    now = time.time()
+    with _bars_lock:
+        bar_ages = [now - m["updated"] for m in _bars_meta.values()]
+    with _congress_lock:
+        cg_ts = _congress.get("fetchedAt")
+    with _ops_lock:
+        http = {h: dict(v) for h, v in _ops["http"].items()}
+        errs = dict(_ops["errors"])
+    with _live_lock:
+        live_ts = [d["ts"] for d in _live.values()]
+    feeds = [
+        {"feed": "daily bars", "ageMin": round(min(bar_ages) / 60) if bar_ages else None,
+         "worstAgeMin": round(max(bar_ages) / 60) if bar_ages else None, "symbols": len(bar_ages)},
+        {"feed": "live quotes", "ageSec": round(now - max(live_ts)) if live_ts else None},
+        {"feed": "congressional trades", "ageH": round((now - cg_ts) / 3600, 1) if cg_ts else None},
+    ]
+    bad_hosts = [{"host": h, **v} for h, v in http.items() if v["calls"] >= 3 and v["errors"] / v["calls"] > 0.3]
+    return {"feeds": feeds, "hostLatency": http, "elevatedErrorHosts": bad_hosts,
+            "loopErrors": errs, "note": "measured only — interpretation belongs to the quality agent"}
+
+
+def _agent_run_one(aid, adef, data_block, extra_context=""):
+    sysmsg = (AI_SAFETY + "\n\nAGENT: You are the %s (v%s) inside the platform's multi-agent intelligence "
+              "cycle. %s\n%s" % (adef["name"], adef["version"], adef["charge"], AGENT_SCHEMA))
+    t0 = time.time()
+    res = ai_chat([{"role": "system", "content": sysmsg},
+                   {"role": "user", "content": data_block + extra_context}],
+                  mode="agent:" + aid, json_mode=True, max_tokens=600)
+    try:
+        f = json.loads(res["text"])
+        assert isinstance(f, dict) and f.get("observation")
+        parsed = True
+    except (ValueError, AssertionError):
+        f, parsed = {"observation": res["text"][:600], "supportingEvidence": [], "conflictingEvidence": [],
+                     "stance": "n/a", "sectors": [], "confidence": 10,
+                     "unknowns": ["output was not valid structured JSON — treat with suspicion"],
+                     "suggestedFollowup": "re-run agent"}, False
+    f.update({"agent": aid, "name": adef["name"], "version": adef["version"], "ts": int(time.time()),
+              "latencyMs": res["latencyMs"], "parsed": parsed,
+              "dataSources": adef["parts"]})
+    try:
+        f["confidence"] = max(0, min(100, int(f.get("confidence", 0))))
+    except (TypeError, ValueError):
+        f["confidence"] = 0
+    f["wallS"] = round(time.time() - t0, 1)
+    return f
+
+
+def _agent_data_block(parts, ragq):
+    blocks = []
+    for pname in parts:
+        if pname == "dataquality":
+            blocks.append("### DATA: measured data-quality report\n%s" % _j(_data_quality_report(), 2200))
+            continue
+        label, fn = AI_PARTS[pname]
+        try:
+            v = fn()
+        except Exception as e:
+            v = {"unavailable": str(e)}
+        blocks.append("### DATA: %s\n%s" % (label, _j(v) if v is not None else "UNAVAILABLE"))
+    if ragq:
+        for d in rag_search(ragq, k=2):
+            blocks.append("### DOCS: %s\n%s" % (d["doc"], d["text"][:1000]))
+    return "\n\n".join(blocks)[:11000]
+
+
+def _event_inbox():
+    """Deterministic event collection for the cycle: what changed recently.
+    Validation/dedup/classification/sector-mapping already happened upstream
+    in the loops that produced these records (EVENT_PIPELINE.md)."""
+    with _alerts_lock:
+        alerts = [{"kind": a.get("kind"), "symbol": a.get("symbol"), "text": (a.get("text") or "")[:120]}
+                  for a in list(_alerts)[-15:]]
+    with _congress_lock:
+        evs = sorted(_congress.get("events", {}).values(), key=lambda e: e.get("date") or "", reverse=True)[:10]
+    return {"recentAlerts": alerts,
+            "recentGovEvents": [{"kind": e.get("kind"), "date": e.get("date"), "title": (e.get("title") or "")[:100]}
+                                for e in evs]}
+
+
+def run_agent_cycle(trigger="manual"):
+    """One full orchestrated intelligence cycle. Sequential by necessity
+    (one local model); ~10-15 min wall time on qwen3:14b."""
+    with _agents_lock:
+        if _agents_state["running"]:
+            return {"ok": False, "error": "cycle already running"}
+        _agents_state["running"] = True
+        _agents_state["lastError"] = None
+    cycle = {"id": int(time.time()), "trigger": trigger, "startedAt": time.time(),
+             "inbox": _event_inbox(), "findings": [], "challenges": [], "summary": None}
+    try:
+        inbox_ctx = "\n\n### DATA: recent platform events (inbox)\n" + _j(cycle["inbox"], 2000)
+        for aid, adef in AGENTS.items():
+            if adef.get("dormant"):
+                cycle["findings"].append({"agent": aid, "name": adef["name"], "version": adef["version"],
+                                          "observation": "dormant: " + adef["dormant"], "stance": "n/a",
+                                          "confidence": 0, "sectors": [], "supportingEvidence": [],
+                                          "conflictingEvidence": [], "unknowns": [], "dataSources": [],
+                                          "ts": int(time.time()), "parsed": True, "dormantSkip": True})
+                continue
+            try:
+                cycle["findings"].append(_agent_run_one(aid, adef,
+                                                        _agent_data_block(adef["parts"], adef["rag"]), inbox_ctx))
+            except Exception as e:
+                _ops_err("agent:" + aid, e)
+                cycle["findings"].append({"agent": aid, "name": adef["name"], "version": adef["version"],
+                                          "observation": "AGENT FAILED: %s" % e, "stance": "n/a",
+                                          "confidence": 0, "sectors": [], "supportingEvidence": [],
+                                          "conflictingEvidence": [], "unknowns": ["agent run failed"],
+                                          "dataSources": adef["parts"], "ts": int(time.time()), "parsed": False})
+        # disagreement detection: opposing stances among confident agents
+        stances = [f for f in cycle["findings"] if f.get("stance") in ("risk-on", "risk-off") and f["confidence"] >= 40]
+        ons = [f for f in stances if f["stance"] == "risk-on"]
+        offs = [f for f in stances if f["stance"] == "risk-off"]
+        if ons and offs:
+            pair = (max(ons, key=lambda f: f["confidence"]), max(offs, key=lambda f: f["confidence"]))
+            try:
+                ch = ai_chat([{"role": "system", "content": AI_SAFETY + "\n\nAGENT: You are the AI Critic (v%s). "
+                               "Two agents disagree. Attack BOTH positions: which claims are actually grounded in "
+                               "their cited evidence, which are narrative? If the evidence is too weak to decide, "
+                               "say exactly that. ~150 words." % AGENT_CRITIC_VERSION},
+                              {"role": "user", "content": _j(pair[0], 1500) + "\n\n" + _j(pair[1], 1500)}],
+                             mode="agent:critic", max_tokens=350)
+                cycle["challenges"].append({"between": [pair[0]["agent"], pair[1]["agent"]],
+                                            "critique": ch["text"][:1200], "ts": int(time.time())})
+            except Exception as e:
+                _ops_err("agent:critic", e)
+        # Research Director synthesis (the only thing the user reads first)
+        try:
+            syn = ai_chat([{"role": "system", "content": AI_SAFETY + "\n\nAGENT: You are the Research Director "
+                            "synthesizing the intelligence cycle for the PM's morning read. Sections exactly: "
+                            "WHAT CHANGED / WHAT MATTERS MOST / SECTORS & EXPOSURE / DISAGREEMENTS & WEAK CLAIMS / "
+                            "RESEARCH TODAY / IGNORE. Cite agents by name; carry their confidence numbers; drop "
+                            "anything with confidence < 30 into IGNORE. ~300 words."},
+                           {"role": "user", "content": _j({"findings": cycle["findings"],
+                                                           "challenges": cycle["challenges"]}, 9000)}],
+                          mode="agent:director", max_tokens=700)
+            cycle["summary"] = syn["text"]
+        except Exception as e:
+            cycle["summary"] = "synthesis failed: %s" % e
+            _ops_err("agent:synthesis", e)
+        cycle["finishedAt"] = time.time()
+        cycle["wallMin"] = round((cycle["finishedAt"] - cycle["startedAt"]) / 60, 1)
+        with _agents_lock:
+            _agents_state["cycles"].append(cycle)
+            del _agents_state["cycles"][:-60]
+        _agents_save()
+        return {"ok": True, "cycleId": cycle["id"], "wallMin": cycle["wallMin"]}
+    except Exception as e:
+        with _agents_lock:
+            _agents_state["lastError"] = str(e)
+        _ops_err("agent_cycle", e)
+        return {"ok": False, "error": str(e)}
+    finally:
+        with _agents_lock:
+            _agents_state["running"] = False
+
+
+def _agent_scorecard():
+    """Continuous learning, done honestly: grade archived stances against
+    realized SPY forward returns (risk-on ⇒ positive 10d, risk-off ⇒ negative).
+    Gated n≥20 per agent; below that, counts only. This grades the AGENTS'
+    interpretations — it never touches any trading model."""
+    spy = get_deep_bars(BENCH)
+    if not spy:
+        return {"note": "needs price history"}
+    idx = {dt.datetime.fromtimestamp(b["t"] / 1000, dt.timezone.utc).date().isoformat(): i
+           for i, b in enumerate(spy)}
+    closes = [b["c"] for b in spy]
+    per = {}
+    with _agents_lock:
+        cycles = list(_agents_state["cycles"])
+    for cy in cycles:
+        d0 = dt.datetime.fromtimestamp(cy["startedAt"]).date().isoformat()
+        i0 = idx.get(d0)
+        if i0 is None or i0 + 10 >= len(closes):
+            continue                       # not matured
+        fwd = closes[i0 + 10] / closes[i0] - 1
+        for f in cy["findings"]:
+            if f.get("stance") in ("risk-on", "risk-off") and f.get("confidence", 0) >= 40:
+                hit = (fwd > 0) == (f["stance"] == "risk-on")
+                p = per.setdefault(f["agent"], {"n": 0, "hits": 0})
+                p["n"] += 1
+                p["hits"] += 1 if hit else 0
+    out = {}
+    for aid, p in per.items():
+        out[aid] = {"n": p["n"]}
+        if p["n"] >= 20:
+            out[aid]["hitRate"] = round(100 * p["hits"] / p["n"])
+        else:
+            out[aid]["status"] = "insufficient sample (gate 20)"
+    return {"agents": out, "design": "stance vs SPY 10d forward, matured cycles only",
+            "note": "grades AI interpretations, never trading models"}
+
+
+def agents_view():
+    with _agents_lock:
+        cycles = list(_agents_state["cycles"])
+        running, last_err = _agents_state["running"], _agents_state["lastError"]
+    last = cycles[-1] if cycles else None
+    health = {}
+    for aid, adef in AGENTS.items():
+        runs = [f for cy in cycles[-10:] for f in cy["findings"] if f["agent"] == aid and not f.get("dormantSkip")]
+        health[aid] = {"name": adef["name"], "version": adef["version"],
+                       "dormant": bool(adef.get("dormant")),
+                       "runs10": len(runs),
+                       "parseFailures10": sum(1 for f in runs if not f.get("parsed", True)),
+                       "avgLatencyS": round(sum(f.get("latencyMs", 0) for f in runs) / len(runs) / 1000, 1) if runs else None,
+                       "lastConfidence": runs[-1]["confidence"] if runs else None}
+    return {"agents": health, "running": running, "lastError": last_err,
+            "cycles": len(cycles), "lastCycle": last, "learning": _agent_scorecard(),
+            "policy": "Agents are config entries (AGENTS dict). Structured JSON findings only; every claim cites "
+                      "its DATA/DOCS section; Critic challenges disagreements; Director synthesizes. LLM cycles "
+                      "run scheduled/on-demand (~100s per agent on a local 14B) — deterministic loops monitor "
+                      "continuously. No agent output feeds models or allocation."}
+
+
+def ops_view():
+    with _ops_lock:
+        ops = {"http": {h: dict(v) for h, v in _ops["http"].items()},
+               "cache": {"hits": _ops["cacheHits"], "misses": _ops["cacheMisses"],
+                         "hitRate": round(100 * _ops["cacheHits"] / max(1, _ops["cacheHits"] + _ops["cacheMisses"])),
+                         "entries": len(_cache)},
+               "ragSearches": _ops["ragSearches"], "loopErrors": dict(_ops["errors"])}
+    with _ai_lock:
+        tel = list(_ai_log)
+    ops["ai"] = {"calls": len(tel),
+                 "avgLatencyS": round(sum(t["latencyMs"] for t in tel) / len(tel) / 1000, 1) if tel else None,
+                 "outputTokens": sum(t.get("outputTokens") or 0 for t in tel),
+                 "promptTokens": sum(t.get("promptTokens") or 0 for t in tel),
+                 "byMode": {}}
+    for t in tel:
+        m = (t["mode"] or "?").split(":")[0]
+        ops["ai"]["byMode"][m] = ops["ai"]["byMode"].get(m, 0) + 1
+    ops["rag"] = {"chunks": len(_rag["chunks"]), "mode": RAG_MODE,
+                  "embeddings": ("active (%d vectors)" % len(_rag_embed["vecs"])) if _rag_embed["ok"]
+                  else "inactive — pull %s to enable vector retrieval" % OLLAMA_EMBED_MODEL}
+    ops["dataQuality"] = _data_quality_report()
+    with _agents_lock:
+        ops["agentCycles"] = len(_agents_state["cycles"])
+        ops["cycleRunning"] = _agents_state["running"]
+    ops["note"] = "telemetry window: AI last 60 calls; counters since process start"
+    return ops
+
+
+def _part_findings():
+    with _agents_lock:
+        cycles = list(_agents_state["cycles"])
+    if not cycles:
+        return None
+    last = cycles[-1]
+    return {"cycleAt": dt.datetime.fromtimestamp(last["startedAt"]).isoformat()[:16],
+            "summary": (last.get("summary") or "")[:1800],
+            "findings": [{"agent": f["agent"], "stance": f.get("stance"), "confidence": f.get("confidence"),
+                          "observation": (f.get("observation") or "")[:200]}
+                         for f in last["findings"] if not f.get("dormantSkip")],
+            "challenges": last.get("challenges")}
+
+
+AI_PARTS["findings"] = ("Latest multi-agent intelligence cycle (structured findings + Director synthesis)",
+                        _part_findings)
+AI_MODES["morning"]["parts"].append("findings")
+
+MIOS_CYCLE_HOURS = float(os.environ.get("MIOS_CYCLE_HOURS") or 24)
+
+
+def agents_loop():
+    """Scheduled intelligence cycle: once per MIOS_CYCLE_HOURS when the AI is
+    reachable, so the morning read exists before the user logs in."""
+    _agents_load()
+    time.sleep(900)                        # after warmup + options first sweep
+    while True:
+        with _agents_lock:
+            last = _agents_state["cycles"][-1]["startedAt"] if _agents_state["cycles"] else 0
+        if MIOS_CYCLE_HOURS > 0 and time.time() - last > MIOS_CYCLE_HOURS * 3600:
+            st = ai_status()
+            if st.get("reachable"):
+                run_agent_cycle(trigger="scheduled")
+        time.sleep(1800)
+
+
 _congress_seen = set()
 
 
@@ -5959,7 +6374,12 @@ def research_log_loop():
     date) — compute them on a schedule so calibration can actually mature."""
     time.sleep(480)                      # let the bar universe warm first
     while True:
-        for key, fn in (("scores", sector_scores), ("alloc", allocation_view)):
+        # scores/alloc write daily history; regime/factors/macro/government
+        # are warmed so agent cycles and the AI drawer never ground against
+        # cold caches (agents would honestly report "unavailable" — better to
+        # have the data than the apology)
+        for key, fn in (("scores", sector_scores), ("alloc", allocation_view), ("regime", regime_view),
+                        ("factors", factors_view), ("macro", macro_view), ("government", government_view)):
             try:
                 cache_get(key, 900) or _cache_and_return(key, fn)
             except Exception:
@@ -6890,6 +7310,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("director", 600) or _cache_and_return("director", director_view))
         elif path == "/api/journal/decisions":
             self._json(decisions_view())
+        elif path == "/api/agents":
+            self._json(agents_view())
+        elif path == "/api/ops":
+            self._json(ops_view())
         elif path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -6907,6 +7331,11 @@ class Handler(BaseHTTPRequestHandler):
         "/api/alert/delete": price_alert_delete,
         "/api/journal/decision": decision_add,
         "/api/journal/decision_delete": decision_delete,
+        "/api/agents/run": lambda d: (threading.Thread(target=run_agent_cycle, kwargs={"trigger": "manual"},
+                                                       daemon=True).start() or {"ok": True, "started": True,
+                                                                                "note": "cycle runs in background "
+                                                                                        "(~10-15 min on a 14B) — "
+                                                                                        "watch /api/agents"}),
     }
 
     def do_POST(self):
@@ -6995,7 +7424,7 @@ def main():
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
-               research_log_loop):
+               research_log_loop, agents_loop):
         threading.Thread(target=fn, daemon=True).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on
