@@ -1,5 +1,31 @@
 # Changelog (standalone platform)
 
+## 2026-07-05 · Phase 20 — Edge Falsification Engine
+- **Strategy Zoo** (`STRATEGY_ZOO`): orthogonal families, each REQUIRED to
+  declare its economic rationale + who's on the other side. Testable: RSI(2),
+  momentum, trend-less mean-reversion, breakout (last two included expecting
+  rejection). Untestable-and-honest: deep-value/PEAD/GEX (no free history →
+  edge confidence 0, refuses to fake an OOS test).
+- **Falsification Gate** (`/api/falsification`): every candidate → survival
+  report over ~8yr deep history: walk-forward OOS split (strict), 0.10% cost
+  haircut, **Deflated Sharpe Ratio** (Bailey & López de Prado — deflates
+  best-of-N for the trial count), regime robustness (≥2 regimes), random-entry
+  permutation null (p<0.05), capacity note. `validated` only if all pass; else
+  `candidate`/`rejected` with the killer logged. Can honestly report "NO
+  VALIDATED EDGE" — a valid result.
+- **Regime Router** (`/api/regime_router`): current regime → families with a
+  validated edge positive in it; allowed to say "none", carries its own
+  uncertainty, never forces a trade.
+- **5 new verification checks** wired into the smoke gate: OOS-purity (critical),
+  DSR-deflation-applied, cost-model-present, regime-coverage, paper/live label.
+- **Paper-trade bridge**: top ODE candidates auto-open as labeled `basis:paper`
+  decisions, auto-mature on price → feeds the 30-matured → calibration
+  bottleneck (readiness #1). `/api/paper`.
+- **Z-09 FIXED**: deep-value leverage penalty now sector-relative (D/E
+  percentile within sector) — banks/REITs no longer mis-flagged as value traps.
+- New AI mode `edge-challenge` (adversarial: why the edge is probably spurious).
+  Docs: FALSIFICATION_GATE, STRATEGY_ZOO.
+
 ## 2026-07-05 · Phase 18 + 19 — Zero-Trust Verification & Deep Value Engine
 - **Verification Engine** (`/api/verify`, Trust dashboard on Research tab):
   14 live checks — provenance (no synth in prod), cross-store price

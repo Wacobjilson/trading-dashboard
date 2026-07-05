@@ -253,6 +253,15 @@
     <div class="card"><h2>Highest-conviction research candidates <span class="muted" id="dv-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2>
       <div id="dv-body" class="scrollx"><div class="loading">Fundamentals warming (FMP + SEC EDGAR; rotating coverage under the free-tier daily cap)…</div></div></div>
 
+    <div class="sechead">EDGE FALSIFICATION — the software tries to KILL every candidate edge</div>
+    <div class="card"><h2>Strategy zoo survival reports <span class="muted" id="fx-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="fx-verdict" style="font-size:13px;margin-bottom:6px"></div>
+      <div id="fx-body" class="scrollx"><div class="loading">Running walk-forward falsification over deep history…</div></div></div>
+    <div class="cols cols2">
+      <div class="card"><h2>Regime router — validated edges in the current regime</h2><div id="fx-router"><div class="loading">…</div></div></div>
+      <div class="card"><h2>Paper trades → calibration bottleneck <span class="muted" id="pp-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2><div id="pp-body"><div class="loading">…</div></div></div>
+    </div>
+
     <div class="card" style="font-size:13px"><span class="badge b-appr">RESEARCH MODE</span>
       &nbsp;Everything here computes live from the same 2-year bar cache the production score uses — regime
       classification, historical base rates, analogs and validation. <b class="amber">A 2-year sample is one
@@ -1410,8 +1419,56 @@ async function loadDeepValue(){
       :`<div class="muted" style="padding:8px;font-size:12px">${d.coverage?"scoring…":"fundamentals warming — FMP rotation fills coverage over a few days ("+d.fmpCallsToday+" calls today)"}. ${(d.policy)||""}</div>`;
   }catch(e){document.getElementById("dv-body").innerHTML='<div class="loading">Deep-value engine unavailable.</div>';}
 }
+// ── EDGE FALSIFICATION ──
+const edgeBadge=s=>`<span class="badge ${s==='validated'?'b-ready':s==='candidate'?'b-appr':s==='untestable'?'b-neu':'b-bear'}">${s}</span>`;
+function fxChallenge(){
+  aiOpen(); setTimeout(()=>{ if(aiEl("ai-mode").options.length){aiEl("ai-mode").value="edge-challenge";aiModeChange();}
+    aiEl("ai-q").value="Argue why the surfaced edges are probably spurious"; aiGo({mode:"edge-challenge"}); },_aiStatus?0:400);
+}
+async function loadFalsify(){
+  try{
+    const [d,rr,pp]=await Promise.all([fetch(`${API}/api/falsification`).then(r=>r.json()),
+                                       fetch(`${API}/api/regime_router`).then(r=>r.json()),
+                                       fetch(`${API}/api/paper`).then(r=>r.json())]);
+    if(d.error){document.getElementById("fx-body").innerHTML=`<div class="muted" style="padding:8px">${d.error}</div>`;}
+    else{
+      document.getElementById("fx-status").innerHTML=`· ${d.trialCount} families screened · ran ${d.ranAt?ago(d.ranAt):"—"} <button class="mini" onclick="fxChallenge()">⚔ AI edge-challenge</button>`;
+      const vc=d.validatedEdges.length?"var(--up)":"var(--amber)";
+      document.getElementById("fx-verdict").innerHTML=`<b style="color:${vc}">${d.verdict}</b><div class="muted" style="font-size:11px">${d.philosophy}</div>`;
+      document.getElementById("fx-body").innerHTML=
+        `<table><thead><tr><th>Family</th><th>Status</th><th>Edge conf</th><th>OOS avg</th><th>DSR</th><th>Regimes+</th><th>Perm p</th><th>Survived / killed by</th></tr></thead><tbody>
+        ${d.reports.map(r=>{const oos=r.outOfSample||{},ds=r.deflatedSharpe||{},rg=r.regimeRobustness||{};return`<tr>
+          <td style="font-size:11px"><b>${r.name}</b><div class="muted" style="font-size:9px">${(r.rationale||"").slice(0,70)}…</div></td>
+          <td>${edgeBadge(r.status)}</td>
+          <td class="mono ${r.edgeConfidence>=60?'up':r.edgeConfidence>0?'muted':'down'}">${r.edgeConfidence??"—"}</td>
+          <td class="mono ${dir(oos.avg)}">${oos.avg!=null?oos.avg.toFixed(3)+"%":"—"}</td>
+          <td class="mono ${ds.DSR>=0.95?'up':'muted'}" title="null benchmark SR0 ${ds.nullBenchmarkSR0}, deflated for ${ds.trialsDeflatedFor} trials">${ds.DSR!=null?ds.DSR:"—"}</td>
+          <td class="mono">${rg.positiveRegimes!=null?rg.positiveRegimes+"/"+(rg.need||2):"—"}</td>
+          <td class="mono ${(r.permutation||{}).pValue<0.05?'up':'muted'}">${(r.permutation||{}).pValue??"—"}</td>
+          <td style="white-space:normal;font-size:10px">${r.status==='untestable'?'<span class="muted">'+r.killedBy+'</span>':(r.survived||[]).length?'<span class="up">✓ '+(r.survived||[]).join(", ")+'</span>':''}${r.killedBy&&r.status!=='untestable'?'<div class="down">✗ '+r.killedBy+'</div>':''}</td></tr>`;}).join("")}</tbody></table>
+        <div class="note"><b>Gate:</b> ${d.gate}<br><b>Data:</b> ${d.dataSource} · basis: BACKTEST (never a track record)</div>`;
+    }
+    // regime router
+    if(!rr.error){
+      document.getElementById("fx-router").innerHTML=
+        `<div style="font-size:12px"><b>Current regime:</b> ${rr.currentRegime||"—"} <span class="muted">(confidence ${rr.regimeConfidence??"—"})</span>
+        <div style="margin:6px 0"><b>${rr.recommendation}</b></div>
+        ${(rr.activeEdges||[]).map(e=>`<div class="up" style="font-size:11px">✓ ${e.name} — ${e.status}, avg ${e.regimeAvg}% in-regime (edge conf ${e.edgeConfidence})</div>`).join("")}
+        <div class="note">${rr.regimeCaveat}<br>${rr.policy}</div></div>`;
+    }
+    // paper trades
+    const ps=pp.stats||{};
+    document.getElementById("pp-status").textContent=`· ${ps.towardCalibration||""}`;
+    document.getElementById("pp-body").innerHTML=
+      `<div style="font-size:12px"><b>${ps.open||0}</b> open · <b>${ps.closed||0}</b> matured${ps.winRate!=null?` · win ${ps.winRate}% · avg ${pct(ps.avgRet)}`:""}</div>
+      ${(pp.paperTrades||[]).slice(0,8).map(p=>`<div style="border-top:1px solid var(--border);padding:3px 0;font-size:11px">
+        <b>${p.symbol}</b> <span class="muted">${p.strategy}</span> <span class="badge b-neu">paper</span>
+        ${p.outcome?`<span class="mono ${p.outcome.won?'up':'down'}">${pct(p.outcome.retPct)}</span>`:`<span class="muted">open @ ${p.entryPx} (${p.holdDays}d hold)</span>`}</div>`).join("")||'<div class="muted" style="font-size:11px;padding:4px">no paper trades yet — auto-open from ODE candidates daily</div>'}
+      <div class="note">${pp.note||""}</div>`;
+  }catch(e){document.getElementById("fx-body").innerHTML='<div class="loading">Falsification engine unavailable.</div>';}
+}
 async function loadResearch(){
-  loadDirector(); loadAgents(); loadVerify(); loadDeepValue();
+  loadDirector(); loadAgents(); loadVerify(); loadDeepValue(); loadFalsify();
   try{
     const [reg,val,prob,ana,regy,fx,lab,cal]=await Promise.all(
       ["regime","research","probabilities","analogs","registry","factors","edgelab","calibration"]

@@ -34,7 +34,7 @@ VIEWS = [
     "exp11_view", "integrity_view", "congress_view", "congress_reg_view",
     "government_view", "director_view", "decisions_view", "positions_view",
     "market_summary", "agents_view", "ops_view", "ode_view",
-    "verify_view", "deepvalue_view",
+    "verify_view", "deepvalue_view", "falsification_view", "regime_router", "paper_view",
 ]
 
 failures = []

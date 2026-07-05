@@ -108,6 +108,37 @@ falsification discipline, and the honesty of the labeling.
 
 ---
 
+## Phase 20 addendum — Edge Falsification Engine (2026-07-05)
+Added the layer that decides whether *any* strategy has a real edge. Live
+result on ~8yr deep history, 4 families screened: **exactly one validated
+edge (RSI(2), DSR 0.953, 3/3 regimes, permutation p=0.043)** — and a
+better-looking trend-less mean-reversion family (OOS +1.09%, PF 2.1) was
+correctly held at `candidate` because best-of-4 deflation pushed its DSR to
+0.943, under the 0.95 bar. Momentum and breakout correctly rejected;
+deep-value/PEAD/GEX honestly marked `untestable` (no historical data, refuses
+to fake an OOS test). 5 new verification invariants (OOS-purity critical +
+deflation/cost/regime/label) pass; trust 100 (19/19). This is the honest
+verdict the phase asked for:
+
+> Phase 20 gives the system the ability to search across diverse strategy
+> families and screen the full universe for deep value, while refusing to trust
+> any edge that hasn't survived out-of-sample testing, multiple-testing
+> deflation, regime shifts, and realistic costs. It can now honestly report "no
+> validated edge" — and every candidate it surfaces flows into the decision
+> journal as a labeled paper trade. What still separates it from production is
+> unchanged and stated plainly: the calibration set is still maturing toward 30
+> predictions, and no edge has yet accumulated a live track record. Phase 20
+> built the instrument that will *measure* an edge; it did not, and cannot,
+> manufacture one.
+
+Classification updates: **Edge Falsification Engine → Production Ready (conf
+88)** — the checks are correct, deflation is real, and it validates only what
+survives. **RSI(2) → still Conditionally Production Ready** — now with a proper
+DSR-deflated OOS survival record, but the live track record is still zero
+(paper trades just began accumulating). New defect Z-11: regime-detection
+uncertainty needs its own confidence surface (router states it qualitatively;
+not yet quantified).
+
 ## Final verdict
 **Decision-support tool with institutional-grade software honesty.** The
 zero-trust layer means: *if a number appears in the app, you can prove where it

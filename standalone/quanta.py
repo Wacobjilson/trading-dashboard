@@ -6510,6 +6510,45 @@ def verify_view():
     chk("bar payloads carry a source label", True, "low",
         "chart/signals/futures all stamp source (polygon|synth|deep)", "provenance")
 
+    # 9) EDGE-FALSIFICATION INVARIANTS (Phase 20) — the strategy-level zero-trust
+    try:
+        fv = cache_get("falsify", 6 * 3600) or _falsify_cache.get("report")
+        reps = (fv or {}).get("reports") or []
+    except Exception:
+        reps = []
+    if reps:
+        # OOS-purity: no test-set leakage into training (train end ≤ test start)
+        leak = [r["family"] for r in reps if r.get("oos") and not r["oos"].get("purity")]
+        chk("OOS purity — no train/test leakage", not leak, "critical",
+            "all walk-forward splits chronologically clean" if not leak else "LEAKAGE in: %s" % leak, "falsification")
+        # deflation applied whenever >1 strategy screened
+        scr = [r for r in reps if r.get("basis") == "backtest" and r.get("outOfSample")]
+        undef = [r["family"] for r in scr if (fv or {}).get("trialCount", 0) > 1
+                 and r["status"] in ("validated", "candidate") and not r.get("deflatedSharpe")]
+        chk("multiple-testing deflation applied", not undef, "high",
+            "DSR deflation applied to all screened edges (%d trials)" % (fv or {}).get("trialCount", 0)
+            if not undef else "no deflation on: %s" % undef, "falsification")
+        # cost-model present on every reported edge
+        nocost = [r["family"] for r in scr if not r.get("costModel")]
+        chk("cost/slippage model on every edge", not nocost, "high",
+            "%.2f%% round-trip haircut on all families" % FALSIFY_COST_RT if not nocost else "missing: %s" % nocost,
+            "falsification")
+        # regime coverage: validated ⇒ ≥2 positive regimes
+        badreg = [r["family"] for r in reps if r["status"] == "validated"
+                  and (r.get("regimeRobustness") or {}).get("positiveRegimes", 0) < 2]
+        chk("validated edges tested across ≥2 regimes", not badreg, "high",
+            "no under-tested 'validated' edge" if not badreg else "under-tested: %s" % badreg, "falsification")
+        # paper/live/backtest label present everywhere
+        nolabel = [r["family"] for r in reps if r.get("basis") not in ("backtest", "paper", "live", "none")]
+        pv = paper_view()
+        paper_labeled = all(p.get("basis") == "paper" for p in pv.get("paperTrades", []))
+        chk("every performance number tagged backtest/paper/live", not nolabel and paper_labeled, "high",
+            "falsification=backtest, journal papers=paper — no mislabeled track record"
+            if (not nolabel and paper_labeled) else "unlabeled: %s" % nolabel, "falsification")
+    else:
+        chk("edge falsification engine reporting", True, "info",
+            "falsification report warming (needs deep-history matrix)", "falsification")
+
     # aggregate — critical fails dominate; trust is pass-weighted by severity
     weight = {"critical": 5, "high": 3, "medium": 2, "low": 1, "info": 0}
     tot = sum(weight[c["severity"]] for c in checks if c["severity"] != "info")
@@ -7047,6 +7086,10 @@ def ode_loop():
             ode_scan()
         except Exception as e:
             _ops_err("ode_scan", e)
+        try:
+            _paper_bridge()             # surfaced candidates → labeled paper trades
+        except Exception as e:
+            _ops_err("paper_bridge", e)
         time.sleep(6 * 3600)
 
 
@@ -7254,6 +7297,13 @@ def dv_scan():
     fcfy_pool = [f.get("fcfYield") for f in pool]
     evb_pool = [f.get("evEbitda") for f in pool]
     roic_pool = [f.get("roic") for f in pool]
+    # Z-09 FIX: leverage is sector-relative — banks/REITs/utilities structurally
+    # carry high D/E, so an absolute threshold mis-flagged them as value traps.
+    # Build per-sector D/E pools; penalize on the SECTOR percentile instead.
+    de_by_sector = {}
+    for f in pool:
+        if f.get("debtToEquity") is not None:
+            de_by_sector.setdefault(f.get("sector") or "?", []).append(f["debtToEquity"])
     today = dt.date.today().isoformat()
     with _state_lock:
         held = {p["symbol"] for p in _state["positions"]}
@@ -7275,9 +7325,17 @@ def dv_scan():
         if f.get("currentRatio") is not None:
             fs += min(20, (f["currentRatio"] - 1) * 20)
         if f.get("debtToEquity") is not None:
-            fs -= min(35, max(0, (f["debtToEquity"] - 1) * 25))
-            if f["debtToEquity"] > 2:
-                conflict.append("high leverage (D/E %.1f) — balance-sheet risk" % f["debtToEquity"])
+            sec_pool = de_by_sector.get(f.get("sector") or "?", [])
+            de_pctl = _pctl(sec_pool, f["debtToEquity"]) if len(sec_pool) >= 4 else None
+            if de_pctl is not None:
+                # sector-relative: penalize only leverage HIGH for the sector
+                fs -= min(35, max(0, (de_pctl - 50) / 50 * 35))
+                if de_pctl >= 85:
+                    conflict.append("leverage in the top %d%% of %s peers (D/E %.1f) — balance-sheet risk"
+                                    % (round(100 - de_pctl), f.get("sector") or "sector", f["debtToEquity"]))
+            elif f["debtToEquity"] > 2.5:     # fallback if too few sector peers
+                fs -= min(25, (f["debtToEquity"] - 2.5) * 15)
+                conflict.append("high absolute leverage (D/E %.1f; few sector peers to compare)" % f["debtToEquity"])
         if f.get("interestCoverage") is not None and f["interestCoverage"] < 3:
             fs -= 15; conflict.append("thin interest coverage (%.1fx)" % f["interestCoverage"])
         cats["financialStrength"] = round(max(0, min(100, fs)))
@@ -7458,6 +7516,464 @@ AI_MODES["thesis-challenge"] = {
               "(cheap for a reason), what data would change the conclusion. Use only the provided fundamentals; cite "
               "the specific weak metrics. Be harsh and specific — your job is to prevent a bad thesis, not confirm it."}
 AI_MODES["morning"]["parts"].append("deepvalue")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDGE FALSIFICATION ENGINE (Phase 20). Turns "find an edge" into a discipline:
+# a Zoo of orthogonal strategy families (each must declare its economic
+# rationale and who is on the other side), each pushed through a Falsification
+# Gate — walk-forward OOS split, Deflated Sharpe (multiple-testing deflation,
+# Bailey & López de Prado), regime robustness, realistic costs, a random-entry
+# permutation null, and a capacity note — producing a SURVIVAL REPORT. An edge
+# is 'validated' only after it survives all of that; otherwise 'candidate' or
+# 'rejected', with the killer logged. The engine is allowed — encouraged — to
+# report "no validated edge". Integrity is measured by how many plausible
+# candidates it correctly REJECTS. See FALSIFICATION_GATE.md / STRATEGY_ZOO.md.
+# ─────────────────────────────────────────────────────────────────────────────
+_EULER_MASCHERONI = 0.5772156649015329
+
+
+def _norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _norm_ppf(p):
+    """Inverse normal CDF (Acklam's rational approximation) — no scipy."""
+    if p <= 0:
+        return -1e9
+    if p >= 1:
+        return 1e9
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+
+
+def _sharpe_stats(rets):
+    """Per-trade Sharpe + higher moments (for the deflated Sharpe)."""
+    n = len(rets)
+    if n < 3:
+        return None
+    m = sum(rets) / n
+    sd = (sum((r - m) ** 2 for r in rets) / (n - 1)) ** 0.5
+    if sd == 0:
+        return None
+    sr = m / sd
+    z = [(r - m) / sd for r in rets]
+    skew = sum(v ** 3 for v in z) / n
+    kurt = sum(v ** 4 for v in z) / n            # raw kurtosis (not excess)
+    return {"n": n, "mean": m, "sd": sd, "sharpe": sr, "skew": skew, "kurt": kurt}
+
+
+def _expected_max_sharpe(var_sr, n_trials):
+    """E[max Sharpe] under the null of no skill across N trials (Bailey & LdP)."""
+    if n_trials <= 1 or var_sr <= 0:
+        return 0.0
+    g = _EULER_MASCHERONI
+    return math.sqrt(var_sr) * ((1 - g) * _norm_ppf(1 - 1.0 / n_trials) +
+                                g * _norm_ppf(1 - 1.0 / (n_trials * math.e)))
+
+
+def _deflated_sharpe(st, sr0):
+    """P(true Sharpe > 0) accounting for the null-benchmark sr0 (=E[max SR]).
+    DSR ≥ 0.95 is the falsification bar."""
+    sr, T, sk, ku = st["sharpe"], st["n"], st["skew"], st["kurt"]
+    denom = 1 - sk * sr + ((ku - 1) / 4.0) * sr * sr
+    if denom <= 0 or T < 2:
+        return None
+    z = (sr - sr0) * math.sqrt(T - 1) / math.sqrt(denom)
+    return _norm_cdf(z)
+
+
+# ── Strategy Zoo: orthogonal families, each with a MANDATORY economic
+#    rationale + who-is-on-the-other-side. A family with no rationale is not
+#    admitted (strategy-level 'prove where the number came from'). ────────────
+def _z_rsi2(m, cost):
+    return _rsi2_trades(m, thr=10, exit_n=5, cost_rt=cost)
+
+
+def _z_momentum(m, cost, look=60, hold=20):
+    trades = []
+    dates = m["dates"]
+    for sym, c in m["C"].items():
+        i = 260
+        while i < len(c) - hold - 1:
+            r = (c[i] / c[i - look] - 1) if i - look >= 0 else None
+            if r is not None and r > 0.20:            # strong 60d leader
+                j = min(i + hold, len(c) - 1)
+                trades.append({"sym": sym, "i": i, "exit_i": j, "date": dates[j],
+                               "ret": (c[j] / c[i] - 1) * 100 - cost})
+                i = j + 1
+            else:
+                i += 1
+    return trades
+
+
+def _z_meanrev20(m, cost, hold=5):
+    """Pure mean reversion WITHOUT the 200-SMA trend gate — a deliberately
+    different mechanism from RSI(2). Expected to be weaker; a good test of
+    whether the gate rejects a plausible-but-spurious idea."""
+    trades = []
+    dates = m["dates"]
+    for sym, c in m["C"].items():
+        s20 = _sma_ser(c, 20)
+        i = 260
+        while i < len(c) - hold - 1:
+            if s20[i] and c[i] < s20[i] * 0.94:       # 6% below the 20-SMA
+                j = min(i + hold, len(c) - 1)
+                trades.append({"sym": sym, "i": i, "exit_i": j, "date": dates[j],
+                               "ret": (c[j] / c[i] - 1) * 100 - cost})
+                i = j + 1
+            else:
+                i += 1
+    return trades
+
+
+def _z_breakout(m, cost, look=40, hold=15):
+    """20-day-high breakout continuation. The breakout family FAILED on sectors
+    in EXP-01 — included so the gate can re-reject it honestly on deep data."""
+    trades = []
+    dates = m["dates"]
+    for sym, c in m["C"].items():
+        i = 260
+        while i < len(c) - hold - 1:
+            if c[i] >= max(c[i - look:i]):            # new 40d high
+                j = min(i + hold, len(c) - 1)
+                trades.append({"sym": sym, "i": i, "exit_i": j, "date": dates[j],
+                               "ret": (c[j] / c[i] - 1) * 100 - cost})
+                i = j + 1
+            else:
+                i += 1
+    return trades
+
+
+STRATEGY_ZOO = {
+    "rsi2": {"name": "Short-horizon mean reversion (RSI2)", "fn": _z_rsi2, "holdHint": 5,
+             "rationale": "Oversold liquid ETFs in an uptrend bounce as forced/again sellers exhaust and "
+                          "liquidity providers are paid to absorb the imbalance.",
+             "otherSide": "Panic/stop-loss and margin-call sellers, and index funds mechanically rebalancing — "
+                          "non-economic sellers paying up for immediacy."},
+    "momentum": {"name": "Cross-sectional / time-series momentum", "fn": _z_momentum, "holdHint": 20,
+                 "rationale": "Under-reaction to information and slow institutional capital reallocation let "
+                              "trends persist over weeks-to-months.",
+                 "otherSide": "Early value/mean-reversion sellers and disposition-effect profit-takers who exit "
+                              "winners too soon."},
+    "meanrev20": {"name": "Trend-less deep mean reversion", "fn": _z_meanrev20, "holdHint": 5,
+                  "rationale": "Sharp drops below a short average may over-shoot fair value regardless of trend.",
+                  "otherSide": "Momentum/trend sellers — BUT without a trend filter this may just be catching "
+                               "falling knives; the gate should reveal that."},
+    "breakout": {"name": "High-breakout continuation", "fn": _z_breakout, "holdHint": 15,
+                 "rationale": "New highs signal resolved uncertainty and fresh demand.",
+                 "otherSide": "Range-traders fading the high and breakout-fakeout liquidity — historically the "
+                              "fade has won on sector ETFs (EXP-01)."},
+    # Fundamental / flow families — declared with rationale, but honestly NOT
+    # historically testable on the free tier (no point-in-time fundamentals,
+    # earnings-date history, or options-chain history). Edge confidence = 0
+    # until a data source exists; the engine refuses to fake an OOS test.
+    "deepvalue": {"name": "Deep-value fundamental (Phase 19)", "fn": None, "holdHint": None,
+                  "rationale": "Market over-extrapolates temporary bad news on quality businesses; price reverts "
+                               "to intrinsic value as the news normalizes.",
+                  "otherSide": "Forced/indexed/impatient sellers and career-risk-averse managers avoiding "
+                               "'falling' names.",
+                  "dataStatus": "no point-in-time historical fundamentals on the free tier → OOS backtest not "
+                                "possible; tracked FORWARD-ONLY (Phase 19 thesis outcomes, gate 10)."},
+    "pead": {"name": "Post-earnings-announcement drift", "fn": None, "holdHint": None,
+             "rationale": "Investors under-react to earnings surprises; prices drift in the surprise direction "
+                          "for weeks.",
+             "otherSide": "Under-reacting slow investors.",
+             "dataStatus": "no free historical earnings-date + surprise dataset at scale → not testable here."},
+    "gex": {"name": "Dealer-flow / GEX", "fn": None, "holdHint": None,
+            "rationale": "Dealer gamma hedging mechanically amplifies or dampens moves near large strikes.",
+            "otherSide": "Option dealers hedging inventory.",
+            "dataStatus": "GEX sign rests on the naive +call/−put convention (UNVERIFIABLE in free data, Z-04) "
+                          "and no options-chain history exists → not testable."},
+}
+
+FALSIFY_COST_RT = 0.10            # round-trip cost + slippage haircut (%), applied to EVERY family
+_falsify_lock = threading.Lock()
+_falsify_cache = {"report": None, "ranAt": 0}
+
+
+def _falsify_family(fid, m, sharpe_pool, n_trials):
+    """Run one family through the full gate. Returns a survival report with an
+    explicit basis:'backtest' label and the killer, if any."""
+    fam = STRATEGY_ZOO[fid]
+    if fam["fn"] is None:
+        return {"family": fid, "name": fam["name"], "status": "untestable",
+                "basis": "none", "rationale": fam["rationale"], "otherSide": fam["otherSide"],
+                "dataStatus": fam.get("dataStatus"), "edgeConfidence": 0,
+                "survived": [], "killedBy": "no historical data to run an out-of-sample test — refusing to fake it"}
+    trades = fam["fn"](m, FALSIFY_COST_RT)
+    trades = [t for t in trades if t.get("ret") is not None]
+    trades.sort(key=lambda t: t["i"])
+    report = {"family": fid, "name": fam["name"], "basis": "backtest", "status": "rejected",
+              "rationale": fam["rationale"], "otherSide": fam["otherSide"],
+              "costModel": "%.2f%% round-trip (commission+slippage) applied" % FALSIFY_COST_RT,
+              "trialCount": n_trials, "period": "%s → %s" % (m["dates"][0].isoformat(), m["dates"][-1].isoformat()),
+              "dataSource": m["source"], "nTrades": len(trades), "survived": [], "killedBy": None}
+    if len(trades) < 40:
+        report["killedBy"] = "insufficient trades (%d < 40) for a credible test" % len(trades)
+        report["edgeConfidence"] = 0
+        return report
+    # WALK-FORWARD OOS SPLIT — strict chronological separation
+    split = int(len(trades) * 0.6)
+    train, test = trades[:split], trades[split:]
+    report["oos"] = {"trainN": len(train), "testN": len(test),
+                     "trainEnd": train[-1]["date"].isoformat(), "testStart": test[0]["date"].isoformat(),
+                     "purity": train[-1]["date"] <= test[0]["date"]}
+    tr_ret = [t["ret"] for t in train]
+    te_ret = [t["ret"] for t in test]
+    tr_m = _trade_metrics(tr_ret)
+    te_m = _trade_metrics(te_ret)
+    report["inSample"] = {"avg": tr_m["avg"], "pf": tr_m["pf"], "win": tr_m["win"], "n": tr_m["n"],
+                          "note": "IN-SAMPLE — never an edge on its own"}
+    report["outOfSample"] = {"avg": te_m["avg"], "pf": te_m["pf"], "win": te_m["win"], "n": te_m["n"]}
+    # gate 1: OOS positive after costs
+    oos_pos = te_m["avg"] > 0
+    report["survived"].append("cost haircut (%.2f%%)" % FALSIFY_COST_RT) if oos_pos else None
+    if not oos_pos:
+        report["killedBy"] = "OUT-OF-SAMPLE mean return ≤ 0 after costs (%.3f%%/trade)" % te_m["avg"]
+        report["edgeConfidence"] = 0
+        return report
+    report["survived"].append("out-of-sample positivity")
+    # gate 2: Deflated Sharpe on OOS, deflated for the trial count
+    st = _sharpe_stats(te_ret)
+    dsr = None
+    if st:
+        var_sr = (sum((s - sum(sharpe_pool) / len(sharpe_pool)) ** 2 for s in sharpe_pool) / len(sharpe_pool)
+                  if len(sharpe_pool) > 1 else 0.0)
+        sr0 = _expected_max_sharpe(var_sr, n_trials)
+        dsr = _deflated_sharpe(st, sr0)
+        report["deflatedSharpe"] = {"oosSharpePerTrade": round(st["sharpe"], 3),
+                                    "nullBenchmarkSR0": round(sr0, 3), "trialsDeflatedFor": n_trials,
+                                    "DSR": round(dsr, 3) if dsr is not None else None,
+                                    "bar": 0.95, "method": "Bailey & López de Prado (2014)"}
+    dsr_ok = dsr is not None and dsr >= 0.95
+    if dsr_ok:
+        report["survived"].append("multiple-testing deflation (DSR≥0.95)")
+    # gate 3: regime robustness — positive in ≥2 regime buckets (OOS)
+    buck = {}
+    for t in test:
+        r = regime_at(m, t["i"])
+        if r:
+            buck.setdefault(r["primary"], []).append(t["ret"])
+    reg_pos = {k: round(sum(v) / len(v), 3) for k, v in buck.items() if len(v) >= 5}
+    n_pos_regimes = sum(1 for v in reg_pos.values() if v > 0)
+    report["regimeRobustness"] = {"byRegime": reg_pos, "positiveRegimes": n_pos_regimes,
+                                  "need": 2, "pass": n_pos_regimes >= 2}
+    if n_pos_regimes >= 2:
+        report["survived"].append("regime robustness (%d regimes positive)" % n_pos_regimes)
+    # gate 4: random-entry permutation null (does the SIGNAL beat random timing?)
+    rnd = random.Random(hash(fid) & 0xffffffff)
+    real_mean = te_m["avg"]
+    null_means = []
+    for _ in range(300):
+        acc = []
+        for t in test:
+            c = m["C"][t["sym"]]
+            h = t["exit_i"] - t["i"]
+            if h < 1 or len(c) < 262 + h:
+                continue
+            k = rnd.randint(260, len(c) - h - 1)
+            acc.append((c[k + h] / c[k] - 1) * 100 - FALSIFY_COST_RT)
+        if acc:
+            null_means.append(sum(acc) / len(acc))
+    perm_p = (sum(1 for x in null_means if x >= real_mean) / len(null_means)) if null_means else 1.0
+    report["permutation"] = {"pValue": round(perm_p, 3), "bar": 0.05,
+                             "test": "random-entry, same holding period & costs (does the entry signal add value?)"}
+    perm_ok = perm_p < 0.05
+    if perm_ok:
+        report["survived"].append("permutation null (p<0.05 vs random entry)")
+    # gate 5: capacity (liquid ETF universe → fine; stated, not assumed)
+    report["capacity"] = "OK — sector ETFs are deep-liquidity; per-name capacity not the binding constraint"
+    report["survived"].append("capacity (liquid universe)")
+    # VERDICT — validated needs OOS + cost + DSR + ≥2 regimes + permutation
+    passed = oos_pos and dsr_ok and n_pos_regimes >= 2 and perm_ok
+    if passed:
+        report["status"] = "validated"
+        report["edgeConfidence"] = min(90, round((dsr or 0.95) * 100) - (100 - n_pos_regimes * 25) // 4)
+    else:
+        report["status"] = "candidate"
+        missing = []
+        if not dsr_ok:
+            missing.append("DSR<0.95 (%.2f) — best-of-%d not distinguishable from luck" % (dsr or 0, n_trials))
+        if n_pos_regimes < 2:
+            missing.append("only %d regime(s) positive (need 2)" % n_pos_regimes)
+        if not perm_ok:
+            missing.append("entry signal no better than random (perm p=%.2f)" % perm_p)
+        report["killedBy"] = "; ".join(missing)
+        report["edgeConfidence"] = min(40, len(report["survived"]) * 8)
+    return report
+
+
+def falsification_view():
+    with _falsify_lock:
+        if _falsify_cache["report"] and time.time() - _falsify_cache["ranAt"] < 6 * 3600:
+            return _falsify_cache["report"]
+    m = _sector_matrix()
+    if not m:
+        return {"error": "deep-history matrix warming — falsification needs bars"}
+    testable = [fid for fid, f in STRATEGY_ZOO.items() if f["fn"]]
+    n_trials = len(testable)
+    # first pass: collect OOS per-trade Sharpes across families → variance for deflation
+    pool = []
+    for fid in testable:
+        tr = STRATEGY_ZOO[fid]["fn"](m, FALSIFY_COST_RT)
+        tr = sorted([t for t in tr if t.get("ret") is not None], key=lambda t: t["i"])
+        if len(tr) >= 40:
+            st = _sharpe_stats([t["ret"] for t in tr[int(len(tr) * 0.6):]])
+            if st:
+                pool.append(st["sharpe"])
+    reports = [_falsify_family(fid, m, pool or [0.0], n_trials) for fid in STRATEGY_ZOO]
+    order = {"validated": 0, "candidate": 1, "rejected": 2, "untestable": 3}
+    reports.sort(key=lambda r: (order.get(r["status"], 9), -(r.get("edgeConfidence") or 0)))
+    validated = [r["family"] for r in reports if r["status"] == "validated"]
+    out = {
+        "reports": reports, "trialCount": n_trials,
+        "validatedEdges": validated,
+        "verdict": ("%d validated edge(s): %s" % (len(validated), ", ".join(validated)) if validated else
+                    "NO VALIDATED EDGE this run — and that is a valid, honest result"),
+        "gate": "validated ⇔ out-of-sample positive AFTER %.2f%% costs AND Deflated Sharpe ≥ 0.95 (deflated for "
+                "%d trials) AND positive in ≥2 regimes AND beats a random-entry permutation (p<0.05)"
+                % (FALSIFY_COST_RT, n_trials),
+        "philosophy": "In-sample performance is NEVER an edge. The engine can and should conclude 'no edge'. "
+                      "Integrity = how many plausible candidates it correctly rejects, not how many it validates.",
+        "dataSource": m["source"], "ranAt": time.time(),
+    }
+    with _falsify_lock:
+        _falsify_cache["report"], _falsify_cache["ranAt"] = out, time.time()
+    return out
+
+
+def regime_router():
+    """Current regime + which families have a VALIDATED edge that was positive
+    in this regime. Honestly allowed to say 'none'. Regime detection carries
+    its own uncertainty."""
+    fv = falsification_view()
+    if fv.get("error"):
+        return fv
+    reg = cache_get("regime", 900) or _cache_and_return("regime", regime_view)
+    cur = (reg.get("current") or {}) if not reg.get("error") else {}
+    primary, conf = cur.get("primary"), reg.get("confidence")
+    matches = []
+    for r in fv["reports"]:
+        if r["status"] in ("validated", "candidate"):
+            byr = (r.get("regimeRobustness") or {}).get("byRegime", {})
+            if primary and byr.get(primary, -1) > 0:
+                matches.append({"family": r["family"], "name": r["name"], "status": r["status"],
+                                "regimeAvg": byr[primary], "edgeConfidence": r.get("edgeConfidence")})
+    return {"currentRegime": primary, "regimeConfidence": conf,
+            "regimeCaveat": "Regime detection is backward-looking and itself uncertain (confidence %s). Under-"
+                            "confidence beats a confident wrong answer." % conf,
+            "activeEdges": matches,
+            "recommendation": ("%d strateg%s historically validated/candidate AND positive in the current '%s' "
+                               "regime — research context only, never a trade command"
+                               % (len(matches), "y" if len(matches) == 1 else "ies", primary) if matches else
+                               "NO strategy has a validated edge positive in the current regime — the honest "
+                               "answer is to wait, not to force a trade"),
+            "basis": "backtest", "policy": "Never forces a trade. Backtested history is not a track record."}
+
+
+# ── paper-trade bridge: surfaced candidates auto-enter the decision journal as
+#    labeled PAPER trades → accelerates the 30-matured-predictions → calibration
+#    bottleneck (the readiness assessment's #1 item). Auto-matures on price. ──
+def _paper_bridge():
+    """Once/day: take the top ODE candidates and open PAPER decisions for any
+    not already tracked. Labeled basis:'paper', auto-outcome after the holding
+    period — never a real position, never a recommendation."""
+    try:
+        ode = cache_get("ode", 3600) or _cache_and_return("ode", ode_view)
+    except Exception:
+        return
+    today = dt.date.today().isoformat()
+    with _state_lock:
+        papers = _state.setdefault("paper", [])
+        open_keys = {p["key"] for p in papers if p["status"] == "open"}
+    for o in (ode.get("queue") or [])[:5]:
+        key = "%s|%s|%s" % (o["symbol"], o["strategy"], today)
+        if key in open_keys or any(p["key"].startswith("%s|%s|" % (o["symbol"], o["strategy"]))
+                                   and p["status"] == "open" for p in papers):
+            continue
+        px = _live_px(o["symbol"])
+        if not px:
+            continue
+        hold = STRATEGY_ZOO.get(o["strategy"], {}).get("holdHint") or 10
+        with _state_lock:
+            _state["paper"].append({
+                "key": key, "id": _next_id(), "symbol": o["symbol"], "strategy": o["strategyName"],
+                "basis": "paper", "entryDate": today, "entryPx": round(px, 2), "holdDays": hold,
+                "score": o["score"], "why": o["why"], "status": "open", "outcome": None,
+                "regime": o.get("regime"), "ts": time.time()})
+            del _state["paper"][:-400]
+    # mature any paper trade past its holding window
+    with _state_lock:
+        papers = _state.get("paper", [])
+    for p in papers:
+        if p["status"] != "open":
+            continue
+        age = (dt.date.today() - dt.date.fromisoformat(p["entryDate"])).days
+        if age >= p["holdDays"]:
+            px = _live_px(p["symbol"])
+            if px and p["entryPx"]:
+                with _state_lock:
+                    p["status"] = "closed"
+                    p["outcome"] = {"exitPx": round(px, 2), "retPct": round((px / p["entryPx"] - 1) * 100, 2),
+                                    "won": px > p["entryPx"], "closedDate": today}
+    save_state()
+
+
+def paper_view():
+    with _state_lock:
+        papers = [dict(p) for p in _state.get("paper", [])]
+    closed = [p for p in papers if p["status"] == "closed" and p.get("outcome")]
+    stats = {"open": sum(1 for p in papers if p["status"] == "open"), "closed": len(closed),
+             "maturedTarget": 30, "towardCalibration": "%d/30 matured paper trades" % len(closed)}
+    if len(closed) >= 10:
+        wins = sum(1 for p in closed if p["outcome"]["won"])
+        stats["winRate"] = round(100 * wins / len(closed))
+        stats["avgRet"] = round(sum(p["outcome"]["retPct"] for p in closed) / len(closed), 2)
+    return {"paperTrades": papers[::-1][:40], "stats": stats,
+            "note": "Auto-opened from surfaced ODE candidates. basis='paper' — HYPOTHETICAL, never a live track "
+                    "record, never a recommendation. Feeds the calibration bottleneck honestly."}
+
+
+def _part_falsify():
+    fv = falsification_view()
+    if fv.get("error"):
+        return fv
+    return {"verdict": fv["verdict"], "validatedEdges": fv["validatedEdges"], "trialCount": fv["trialCount"],
+            "reports": [{k: r.get(k) for k in ("family", "status", "edgeConfidence", "killedBy",
+                                               "survived", "outOfSample", "deflatedSharpe", "regimeRobustness",
+                                               "permutation", "rationale")} for r in fv["reports"]]}
+
+
+AI_PARTS["falsify"] = ("Edge falsification survival reports (OOS/DSR/regime/cost/permutation)", _part_falsify)
+AI_MODES["edge-challenge"] = {
+    "title": "Edge challenge (why it's probably spurious)", "rag": True,
+    "ragQuery": "overfitting multiple testing deflated sharpe regime out-of-sample permutation",
+    "parts": ["falsify", "regime"],
+    "system": "You are an adversarial quant reviewer. For the surfaced edge (or the top of the falsification "
+              "report), argue WHY IT IS PROBABLY SPURIOUS: data-snooping / multiple-testing (how many trials?), "
+              "regime artifact (does it lean on one regime?), cost fragility, small sample, look-ahead. Use ONLY "
+              "the survival report's numbers (DSR, trial count, OOS vs in-sample, regime buckets, permutation p). "
+              "If the edge genuinely survived everything, say so — but your default posture is skepticism. Never "
+              "recommend trading it. This is the strategy-level sibling of thesis-challenge."}
+AI_MODES["morning"]["parts"].append("falsify")
 
 MIOS_CYCLE_HOURS = float(os.environ.get("MIOS_CYCLE_HOURS") or 24)
 
@@ -7740,7 +8256,7 @@ def calendar_loop():
 DATA_DIR = os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(DATA_DIR, "quanta_state.json")
 _state_lock = threading.Lock()
-_state = {"positions": [], "closed": [], "price_alerts": [], "decisions": [], "next_id": 1}
+_state = {"positions": [], "closed": [], "price_alerts": [], "decisions": [], "paper": [], "next_id": 1}
 
 
 def load_state():
@@ -8431,6 +8947,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("ode", 300) or _cache_and_return("ode", ode_view))
         elif path == "/api/verify":
             self._json(cache_get("verify", 120) or _cache_and_return("verify", verify_view))
+        elif path == "/api/falsification":
+            self._json(cache_get("falsify", 6 * 3600) or _cache_and_return("falsify", falsification_view))
+        elif path == "/api/regime_router":
+            self._json(regime_router())
+        elif path == "/api/paper":
+            self._json(paper_view())
         elif path == "/api/deepvalue":
             self._json(cache_get("deepvalue", 300) or _cache_and_return("deepvalue", deepvalue_view))
         elif path == "/api/deepvalue/detail":

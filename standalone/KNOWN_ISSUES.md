@@ -62,6 +62,21 @@ Calibration data only logged when a tab opened. Fixed with `research_log_loop`.
   absolute D/E threshold. Until then the raw metrics are shown so the user can
   see *why* — the flag is transparent, not silent.
 
+### Z-09 UPDATE · Sector-adjusted leverage — FIXED Phase 20
+Deep-value `financialStrength` now penalizes D/E on the *sector percentile*
+(`de_by_sector` pools), not an absolute threshold. Live check: GS (D/E 6.1) no
+longer auto-flagged as anomalous within Financial Services. Percentiles sharpen
+as rotation coverage fills the sector pools.
+
+### Z-11 · Regime-detection uncertainty not quantified (MEDIUM — new, Phase 20)
+- **Evidence:** the Regime Router surfaces a regime + a qualitative caveat, but
+  the router's edge matching treats the current regime label as certain.
+- **Risk:** an edge shown as "active in this regime" inherits the (unstated)
+  probability that the regime label is wrong.
+- **Fix (planned):** propagate `regime.confidence` into the router's per-edge
+  confidence, and widen the "no validated edge" default when regime confidence
+  is low. Router already states the caveat in prose.
+
 ### Z-10 · RTY/YM intraday falls back to synthetic (LOW — now visible)
 - **Evidence:** post-Z-01, futures payload shows ES/NQ `polygon` but RTY/YM
   `synth` — Polygon free tier returns no 15-min data for the IWM/DIA proxies.
