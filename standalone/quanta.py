@@ -271,8 +271,10 @@ def fetch_polygon_daily(symbol, days=740):
 
 
 def synth_daily(symbol, n=520):
-    """Deterministic-ish synthetic daily bars with trend + swings, for demo/fallback."""
-    rnd = random.Random(hash(symbol) & 0xffffffff)
+    """Deterministic synthetic daily bars with trend + swings, for demo/fallback.
+    Stable seed (not hash(): PYTHONHASHSEED randomizes str hashes per process,
+    which made demo bars differ across restarts — STRESS_TEST.md)."""
+    rnd = random.Random(sum(ord(ch) * 31 ** i for i, ch in enumerate(symbol)) & 0xffffffff)
     price = SEED_PRICES.get(symbol, 50 + rnd.random() * 250)
     drift = (rnd.random() - 0.45) * 0.0008
     bars = []
@@ -3524,7 +3526,7 @@ def fetch_intraday(proxy, mult=15, days=20):
 
 
 def synth_intraday(proxy, days=20):
-    rnd = random.Random(hash(proxy) & 0xffffff)
+    rnd = random.Random(sum(ord(ch) * 31 ** i for i, ch in enumerate(proxy)) & 0xffffff)
     price = SEED_PRICES.get(proxy, 400)
     bars = []
     today = dt.datetime.now(dt.timezone.utc)
@@ -4453,6 +4455,11 @@ def _gov_follow_study():
 # FOMC decision days (announcement day) from Federal Reserve published
 # schedules, 2019–2026. Unscheduled 2020 emergency actions (Mar 3, Mar 15)
 # excluded — crisis moves would contaminate the scheduled-meeting study.
+# VERIFIED 2026-07-05 against federalreserve.gov: 2021–2026 dates match the
+# official statement press-release links (monetaryYYYYMMDDa) on
+# /monetarypolicy/fomccalendars.htm exactly (44/44); 2019–2020 match the
+# fomchistorical pages (canceled Mar 2020 scheduled meeting correctly absent;
+# non-meeting press releases excluded). Re-verify when appending years.
 FOMC_DECISIONS = [
     "2019-01-30", "2019-03-20", "2019-05-01", "2019-06-19", "2019-07-31", "2019-09-18", "2019-10-30", "2019-12-11",
     "2020-01-29", "2020-04-29", "2020-06-10", "2020-07-29", "2020-09-16", "2020-11-05", "2020-12-16",
@@ -5945,6 +5952,21 @@ AI_MODES.update({
 _congress_seen = set()
 
 
+def research_log_loop():
+    """STRESS_TEST.md Fix #1: evidence logging must never depend on the user
+    opening a tab. sector_scores writes the daily score snapshot and
+    allocation_view writes the daily prediction log (both self-dedupe by
+    date) — compute them on a schedule so calibration can actually mature."""
+    time.sleep(480)                      # let the bar universe warm first
+    while True:
+        for key, fn in (("scores", sector_scores), ("alloc", allocation_view)):
+            try:
+                cache_get(key, 900) or _cache_and_return(key, fn)
+            except Exception:
+                pass                     # next pass retries; loops must not die
+        time.sleep(6 * 3600)
+
+
 def congress_loop():
     _congress_load()
     with _congress_lock:
@@ -6972,7 +6994,8 @@ def main():
     print("  alerts   : signals · setups · position stop/target · price levels (checked ~30s)")
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
-    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop):
+    for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
+               research_log_loop):
         threading.Thread(target=fn, daemon=True).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

@@ -1,5 +1,23 @@
 # Changelog (standalone platform)
 
+## 2026-07-05 · Phase 15 fixes — production hardening
+- **Fix #1**: `research_log_loop` — score snapshots + allocation prediction
+  log now write on a schedule (4x/day, date-deduped), not only when a tab is
+  opened. Calibration can finally mature.
+- **Fix #2**: FOMC_DECISIONS verified against federalreserve.gov — all 44
+  dates 2021–2026 match official statement press-release links exactly;
+  2019–2020 match the historical pages (canceled Mar-2020 meeting correctly
+  excluded). Verification recorded in the code comment.
+- **Fix #3**: `smoketest.py` — 30 views + invariants run on synthetic data as
+  a Docker build gate (~2s, no network needed). First automated regression
+  net for the platform.
+- Also: keyboard shortcuts no longer fire from textareas (decision-journal
+  bug); synthetic bars use a stable seed (PYTHONHASHSEED made demo bars
+  differ across restarts).
+- **Tab consolidation 13 → 10**: News + Calendar merged into Markets;
+  Entries scanner merged into Chart. Futures kept as an execution monitor
+  (its no-signal-edge verdict stands, EXP-02).
+
 ## 2026-07-04 · Phase 14 — Research Director (the platform improving itself)
 - **/api/director**: platform health (self-explaining metrics), evidence-
   growth counters (each states what it unlocks), meta-learning parsed from

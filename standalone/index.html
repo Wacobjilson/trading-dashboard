@@ -86,7 +86,7 @@
 </head>
 <body>
 <header>
-  <div><span class="brand">QUANTA</span><span class="sub">SWING COMPANION · sector intelligence · rotation · options · <kbd>1</kbd>–<kbd>0</kbd> tabs · <kbd>/</kbd> chart</span></div>
+  <div><span class="brand">QUANTA</span><span class="sub">SWING COMPANION · sector intelligence · rotation · options · <kbd>1</kbd>–<kbd>-</kbd> tabs · <kbd>/</kbd> chart</span></div>
   <div style="display:flex;align-items:center">
     <div class="status" id="status">connecting…</div>
     <button id="ai-btn" title="AI research analyst (local Ollama)" style="background:none;border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;padding:2px 8px;margin-right:6px;font-size:12px">✨ AI</button>
@@ -134,13 +134,10 @@
   <button data-tab="options">Options</button>
   <button data-tab="research">Research</button>
   <button data-tab="congress">Government</button>
-  <button data-tab="entries">Entries</button>
   <button data-tab="portfolio">Portfolio</button>
   <button data-tab="chart">Chart</button>
   <button data-tab="futures">Futures 15m</button>
   <button data-tab="markets">Markets</button>
-  <button data-tab="news">News</button>
-  <button data-tab="calendar">Calendar</button>
 </nav>
 <div id="countdown" class="cd-bar cd-hidden"></div>
 <main>
@@ -316,24 +313,6 @@
     <div class="card"><h2>Validation pipeline — same rules as every other model</h2><div id="gv-research"><div class="loading">…</div></div></div>
   </section>
 
-  <!-- ENTRIES -->
-  <section class="tab" id="tab-entries">
-    <div class="card">
-      <div class="ctl">
-        <span class="seg" id="ent-tf"><button data-tf="daily" class="on">Daily</button><button data-tf="weekly">Weekly</button></span>
-        <span class="seg" id="ent-filter"><button data-f="all" class="on">All</button><button data-f="ready">Ready only</button></span>
-        <input class="ipt" id="ent-syms" style="flex:1;min-width:260px" placeholder="blank = all 11 SPDR sector ETFs (or type symbols)" />
-        <button class="go" id="ent-go">Scan</button>
-      </div>
-      <div id="ent-result"><div class="loading">Scanning for 50% retracement setups…</div></div>
-      <div class="note">Swings come from an ATR-scaled <b>ZigZag</b> (real pivots). <b>Score</b> is a multi-factor
-        confluence (hover it for the breakdown): location in the 38.2–61.8% golden pocket, trend alignment,
-        RSI posture, MACD momentum, relative strength vs SPY, pullback volume, reversal candle, and R:R.
-        <b>Ready</b> = in the pocket with score ≥ 55. Stop is ATR-buffered below structure; targets are the prior
-        swing and a 1.272 extension. Click a row to chart it. Heuristic scan — always confirm on your own chart.</div>
-    </div>
-  </section>
-
   <!-- PORTFOLIO -->
   <section class="tab" id="tab-portfolio">
     <div id="pf-summary" class="card" style="font-size:13px">Loading portfolio…</div>
@@ -405,6 +384,20 @@
       <div class="note">Candles + SMA20/50. Dashed lines: swing high (red), swing low (green), Fib 38.2/50/61.8.
         Shaded band = entry zone (golden pocket).</div>
     </div>
+    <div class="card"><h2>Entry scanner — 50% retracement setups</h2>
+      <div class="ctl">
+        <span class="seg" id="ent-tf"><button data-tf="daily" class="on">Daily</button><button data-tf="weekly">Weekly</button></span>
+        <span class="seg" id="ent-filter"><button data-f="all" class="on">All</button><button data-f="ready">Ready only</button></span>
+        <input class="ipt" id="ent-syms" style="flex:1;min-width:260px" placeholder="blank = all 11 SPDR sector ETFs (or type symbols)" />
+        <button class="go" id="ent-go">Scan</button>
+      </div>
+      <div id="ent-result"><div class="loading">Scanning for 50% retracement setups…</div></div>
+      <div class="note">Swings come from an ATR-scaled <b>ZigZag</b> (real pivots). <b>Score</b> is a multi-factor
+        confluence (hover it for the breakdown): location in the 38.2–61.8% golden pocket, trend alignment,
+        RSI posture, MACD momentum, relative strength vs SPY, pullback volume, reversal candle, and R:R.
+        <b>Ready</b> = in the pocket with score ≥ 55. Stop is ATR-buffered below structure; targets are the prior
+        swing and a 1.272 extension. Click a row to chart it. Heuristic scan — always confirm on your own chart.</div>
+    </div>
   </section>
 
   <!-- FUTURES 15-min -->
@@ -424,33 +417,28 @@
     </div>
   </section>
 
-  <!-- MARKETS -->
+  <!-- MARKETS (incl. news + calendar, consolidated Phase 15) -->
   <section class="tab" id="tab-markets">
     <h2>Macro Overview</h2>
     <div class="grid" id="tiles"></div>
     <table><thead><tr id="mk-head"></tr></thead><tbody id="mk-body"></tbody></table>
     <div class="card" id="macro-insight" style="margin-top:16px"><div class="loading">Loading macro insight…</div></div>
-  </section>
-
-  <!-- NEWS -->
-  <section class="tab" id="tab-news">
-    <h2>Market News</h2><div class="card" id="news-list"><div class="loading">Loading news…</div></div>
-  </section>
-
-  <!-- CALENDAR -->
-  <section class="tab" id="tab-calendar">
-    <div class="card">
-      <div class="ctl">
-        <span class="muted" style="font-size:12px">Impact</span>
-        <span class="seg" id="cal-imp"><button data-i="High" class="on">High</button><button data-i="Medium" class="on">Medium</button><button data-i="Low">Low</button></span>
-        <span class="muted" style="font-size:12px;margin-left:8px">Currency</span>
-        <select class="ipt" id="cal-ccy"><option value="">All</option></select>
-        <span class="seg" id="cal-when" style="margin-left:8px"><button data-w="all" class="on">7 days</button><button data-w="today">Today</button></span>
+    <div class="cols cols2" style="margin-top:12px">
+      <div><div class="card">
+        <h2>Economic calendar</h2>
+        <div class="ctl">
+          <span class="muted" style="font-size:12px">Impact</span>
+          <span class="seg" id="cal-imp"><button data-i="High" class="on">High</button><button data-i="Medium" class="on">Medium</button><button data-i="Low">Low</button></span>
+          <span class="muted" style="font-size:12px;margin-left:8px">Currency</span>
+          <select class="ipt" id="cal-ccy"><option value="">All</option></select>
+          <span class="seg" id="cal-when" style="margin-left:8px"><button data-w="all" class="on">7 days</button><button data-w="today">Today</button></span>
+        </div>
+        <div id="cal-econ"><div class="loading">Loading…</div></div>
+        <div class="note" id="cal-notes"></div>
       </div>
-      <div id="cal-econ"><div class="loading">Loading…</div></div>
-      <div class="note" id="cal-notes"></div>
+      <div class="card"><h2>Earnings (7d)</h2><div id="cal-earn"><div class="loading">Loading…</div></div></div></div>
+      <div><div class="card"><h2>Market news</h2><div id="news-list" style="max-height:720px;overflow-y:auto"><div class="loading">Loading news…</div></div></div></div>
     </div>
-    <div class="card"><h2>Earnings (7d)</h2><div id="cal-earn"><div class="loading">Loading…</div></div></div>
   </section>
 </main>
 
@@ -484,13 +472,15 @@ function activate(t){
   if(t==="options")loadOptions();
   if(t==="research")loadResearch();
   if(t==="congress")loadCongress();
-  if(t==="entries"&&!loaded.entries){runEntries();loaded.entries=true;}
   if(t==="portfolio"){loadPortfolio();loadAllocation();djLoad();}
-  if(t==="chart"&&!loaded.chart){loadChart();loaded.chart=true;}
+  if(t==="chart"){if(!loaded.chart){loadChart();loaded.chart=true;}if(!loaded.entries){runEntries();loaded.entries=true;}}
   if(t==="futures"){loadFutures();}
-  if(t==="markets"){if(!loaded.markets){loadQuotes();loaded.markets=true;}loadMacro();}
-  if(t==="news"&&!loaded.news){loadNews();loaded.news=true;}
-  if(t==="calendar"){ if(!loaded.calendar){loadCalendarData();loaded.calendar=true;} else renderCalendar(); }
+  if(t==="markets"){
+    if(!loaded.markets){loadQuotes();loaded.markets=true;}
+    loadMacro();
+    if(!loaded.news){loadNews();loaded.news=true;}
+    if(!loaded.calendar){loadCalendarData();loaded.calendar=true;}else renderCalendar();
+  }
 }
 const tabActive=t=>document.getElementById("tab-"+t).classList.contains("active");
 
@@ -1824,7 +1814,7 @@ async function loadMacro(){
 // ── keyboard shortcuts: 1-9,0,- switch tabs · / focuses chart symbol ──
 const NAV_BTNS=[...document.querySelectorAll("#nav button")];
 document.addEventListener("keydown",e=>{
-  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT"||e.ctrlKey||e.metaKey||e.altKey)return;
+  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT"||e.target.tagName==="TEXTAREA"||e.target.isContentEditable||e.ctrlKey||e.metaKey||e.altKey)return;
   const keys="1234567890-=";
   const i=keys.indexOf(e.key);
   if(i>=0&&i<NAV_BTNS.length){NAV_BTNS[i].click();e.preventDefault();}

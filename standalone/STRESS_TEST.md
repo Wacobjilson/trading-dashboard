@@ -211,12 +211,17 @@ production-grade lineage:**
 1. **Move prediction/scores/state logging into a background daily loop** (not
    request-driven). ~20 lines. Unblocks calibration — the single number that
    decides whether anything here may ever touch capital.
+   **[EXECUTED 2026-07-05 — `research_log_loop`, 4x/day, date-deduped.]**
 2. **Verify FOMC_DECISIONS against the Fed's published calendar** (one-time
    script or manual check; record verification date in the code comment).
    Protects the only measured event study from silent corruption.
+   **[EXECUTED 2026-07-05 — 44/44 dates 2021–2026 match official statement
+   links; 2019–2020 match historical pages; recorded in code.]**
 3. **Add a stdlib smoke-test script** (import quanta with FORCE_SYNTH, call
    every view, assert schema + no exception; run in Docker build). First
    automated regression net for 7k lines. ~1–2 hours.
+   **[EXECUTED 2026-07-05 — smoketest.py, 30 views + invariants, Docker
+   build gate.]**
 
 ---
 
