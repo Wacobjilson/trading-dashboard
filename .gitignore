@@ -51,3 +51,4 @@ standalone/smoke_data/
 standalone/market_bars.json.gz
 standalone/opportunity_queue.json
 standalone/agent_findings.json
+standalone/deepvalue.json

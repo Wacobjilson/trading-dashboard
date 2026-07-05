@@ -245,6 +245,14 @@
       <div class="card"><h2>Operations — nothing is a black box</h2><div id="ag-ops"><div class="loading">…</div></div></div>
     </div>
 
+    <div class="sechead">ZERO-TRUST VERIFICATION — the platform continuously proves it is correct</div>
+    <div class="card"><h2>Trust dashboard <span class="muted" id="vrf-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="vrf-body"><div class="loading">Running verification checks…</div></div></div>
+
+    <div class="sechead">DEEP VALUE RESEARCH — institutional equity research (fundamentals + SEC filings)</div>
+    <div class="card"><h2>Highest-conviction research candidates <span class="muted" id="dv-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="dv-body" class="scrollx"><div class="loading">Fundamentals warming (FMP + SEC EDGAR; rotating coverage under the free-tier daily cap)…</div></div></div>
+
     <div class="card" style="font-size:13px"><span class="badge b-appr">RESEARCH MODE</span>
       &nbsp;Everything here computes live from the same 2-year bar cache the production score uses — regime
       classification, historical base rates, analogs and validation. <b class="amber">A 2-year sample is one
@@ -1351,8 +1359,59 @@ async function loadODE(){
       <div class="note">${(d.learning||{}).note||""}</div>`;
   }catch(e){document.getElementById("ode-queue").innerHTML='<div class="loading">Scanner unavailable.</div>';}
 }
+// ── ZERO-TRUST VERIFICATION ──
+async function loadVerify(){
+  try{
+    const d=await(await fetch(`${API}/api/verify`)).json();
+    const col=d.trustScore>=90?"var(--up)":d.trustScore>=70?"var(--amber)":"var(--down)";
+    document.getElementById("vrf-status").innerHTML=`· pass ${d.passRate} · ran ${d.ranAt?ago(d.ranAt):"—"}`;
+    const catRow=Object.entries(d.byCategory||{}).map(([k,v])=>`<span class="badge ${v.fail?'b-bear':'b-ready'}" title="${v.pass} pass / ${v.fail} fail">${k} ${v.pass}✓${v.fail?"/"+v.fail+"✗":""}</span>`).join(" ");
+    const rows=(d.checks||[]).map(c=>`<tr>
+      <td>${c.pass?'<span class="up">✓</span>':'<span class="down">✗</span>'}</td>
+      <td style="font-size:12px">${c.check}</td>
+      <td><span class="badge ${c.severity==='critical'?'b-bear':c.severity==='high'?'b-appr':'b-neu'}">${c.severity}</span></td>
+      <td class="muted" style="font-size:11px;white-space:normal">${c.detail}</td></tr>`).join("");
+    const workers=Object.entries(d.workers||{}).map(([k,w])=>`${k} ${w.dead?'<span class="down">DEAD</span>':`${w.beats}♥`}`).join(" · ");
+    document.getElementById("vrf-body").innerHTML=
+      `<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        <div style="font-size:34px;font-weight:bold;color:${col}">${d.trustScore}<span style="font-size:14px" class="muted">/100</span></div>
+        <div><div style="font-size:13px"><b>${d.verdict}</b></div><div style="margin-top:4px">${catRow}</div></div></div>
+      ${(d.critical||[]).length?`<div class="card" style="background:rgba(255,77,79,.08);margin-top:8px"><b class="down">CRITICAL:</b> ${d.critical.map(c=>c.check+" — "+c.detail).join("; ")}</div>`:""}
+      <table style="margin-top:8px"><thead><tr><th></th><th>Check</th><th>Severity</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="note">Workers: ${workers}<br>${d.policy}</div>`;
+  }catch(e){document.getElementById("vrf-body").innerHTML='<div class="loading">Verification engine unavailable.</div>';}
+}
+// ── DEEP VALUE RESEARCH ──
+function dvExplain(sym,challenge){
+  fetch(`${API}/api/deepvalue/detail?symbol=${sym}`).then(r=>r.json()).then(f=>{
+    aiOpen(); setTimeout(()=>{ const m=challenge?"thesis-challenge":"deepvalue";
+      if(aiEl("ai-mode").options.length){aiEl("ai-mode").value=m;aiModeChange();}
+      aiEl("ai-q").value=`${challenge?"Attack the":"Research"} ${sym} thesis`;
+      aiGo({mode:m,q:`${challenge?"Attack this":"Write a research note on this"} deep-value thesis`,data:f}); },_aiStatus?0:400);
+  });
+}
+async function loadDeepValue(){
+  try{
+    const d=await(await fetch(`${API}/api/deepvalue`)).json();
+    document.getElementById("dv-status").textContent=`· coverage ${d.coverage}/${d.universe} (${d.coveragePct}%) · FMP calls today ${d.fmpCallsToday}/${d.fmpDailyCap} · scanned ${d.scannedAt?ago(d.scannedAt):"never"}`;
+    document.getElementById("dv-body").innerHTML=(d.candidates&&d.candidates.length)?
+      `<table><thead><tr><th>Sym</th><th>Score</th><th>Conf</th><th>Quality</th><th>Value</th><th>Balance</th><th>Implied g</th><th>Thesis signal</th><th>Since</th><th></th></tr></thead><tbody>
+      ${d.candidates.slice(0,20).map(c=>{const g=c.categories||{};return`<tr>
+        <td><b class="clk" onclick="openChart('${c.symbol}')">${c.symbol}</b>${c.valueTrapFlag?' <span class="badge b-bear" title="cheap but weak balance sheet">trap?</span>':''}${c.portfolioOverlap?' <span class="badge b-appr">held</span>':''}<div class="muted" style="font-size:9px">${(c.name||"").slice(0,22)}</div></td>
+        <td class="mono amber" title="quality ${g.quality} · valuation ${g.valuation} · strength ${g.financialStrength} · agreement ${g.evidenceAgreement}">${c.score}</td>
+        <td class="mono ${c.confidence>=55?'up':c.confidence<35?'down':'muted'}">${c.confidence}</td>
+        <td class="mono muted">${g.quality??"—"}</td><td class="mono muted">${g.valuation??"—"}</td><td class="mono muted">${g.financialStrength??"—"}</td>
+        <td class="mono muted" title="${c.marginOfSafetyNote||''}">${c.impliedGrowthPricedIn!=null?c.impliedGrowthPricedIn+"%":"—"}</td>
+        <td style="white-space:normal;font-size:10px">${(c.support||[])[0]||""}${(c.conflict||[]).length?`<div class="down">⚠ ${c.conflict[0]}</div>`:""}</td>
+        <td class="mono ${dir(c.retSinceResearch)}" style="font-size:10px">${c.retSinceResearch!=null?pct(c.retSinceResearch):"—"}</td>
+        <td style="white-space:nowrap"><button class="mini" title="research note" onclick="dvExplain('${c.symbol}',false)">✨</button>
+          <button class="mini" title="attack the thesis" onclick="dvExplain('${c.symbol}',true)">⚔</button></td></tr>`;}).join("")}</tbody></table>
+      <div class="note">${d.scoring}<br><b>Data:</b> ${d.dataSources}<br>${d.policy}<br><b>Learning:</b> ${(d.learning||{}).note||""}${d.learning&&d.learning.highScoreAvgRet!=null?` — high-score avg ${pct(d.learning.highScoreAvgRet)} vs low-score ${pct(d.learning.lowScoreAvgRet)}`:""}</div>`
+      :`<div class="muted" style="padding:8px;font-size:12px">${d.coverage?"scoring…":"fundamentals warming — FMP rotation fills coverage over a few days ("+d.fmpCallsToday+" calls today)"}. ${(d.policy)||""}</div>`;
+  }catch(e){document.getElementById("dv-body").innerHTML='<div class="loading">Deep-value engine unavailable.</div>';}
+}
 async function loadResearch(){
-  loadDirector(); loadAgents();
+  loadDirector(); loadAgents(); loadVerify(); loadDeepValue();
   try{
     const [reg,val,prob,ana,regy,fx,lab,cal]=await Promise.all(
       ["regime","research","probabilities","analogs","registry","factors","edgelab","calibration"]

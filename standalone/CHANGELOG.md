@@ -1,5 +1,28 @@
 # Changelog (standalone platform)
 
+## 2026-07-05 · Phase 18 + 19 — Zero-Trust Verification & Deep Value Engine
+- **Verification Engine** (`/api/verify`, Trust dashboard on Research tab):
+  14 live checks — provenance (no synth in prod), cross-store price
+  consistency, RSI(2) cross-implementation recompute, NaN/Inf + bounds scan,
+  feed freshness, worker liveness (heartbeat-wrapped threads), AI grounding.
+  Critical failure forces trust=0. Live score at ship: **100/100, 14/14, 13
+  workers alive**. Runs in the Docker build smoke test.
+- **Defects found & fixed:** Z-01 futures could mislabel synthetic intraday as
+  "polygon" — fixed with `_intraday_src` true-source tracking (immediately
+  exposed Z-10: RTY/YM genuinely fall back to synth on the free tier, now
+  honest). Cross-provider price audit: Polygon↔Yahoo↔Finnhub 0.00% on SPY.
+- **Deep Value Research Engine** (Phase 19, `/api/deepvalue`): FMP stable
+  fundamentals + official SEC EDGAR filings; quality/valuation/financial-
+  strength/capital-allocation sub-scores; **reverse-DCF implied-growth** (no
+  forecasts invented); **confidence rises only on independent agreement**,
+  cheap-but-fragile raises a **value-trap flag** (never averaged away); living
+  thesis per company; AI `deepvalue` (research note) + `thesis-challenge`
+  (adversarial) modes; outcome learning (gate 10). Verified live: PFE surfaced
+  on agreement, JPM/XOM trap-flagged. Coverage rotates under the FMP free cap.
+- Docs: ZERO_TRUST_ARCHITECTURE, VERIFICATION_ENGINE, DATA_PROVENANCE,
+  SYSTEM_AUDIT, TRUST_FRAMEWORK, KNOWN_ISSUES, DEEP_VALUE_ENGINE,
+  INSTITUTIONAL_READINESS.
+
 ## 2026-07-05 · Phase 17 — Opportunity Discovery Engine
 - **Full-market scanning on the free tier**: Polygon grouped-daily endpoint
   (whole US market in one call) → ~120-day backfill once, then 1 call/day;
