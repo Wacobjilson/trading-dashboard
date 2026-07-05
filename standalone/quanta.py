@@ -7975,6 +7975,203 @@ AI_MODES["edge-challenge"] = {
               "recommend trading it. This is the strategy-level sibling of thesis-challenge."}
 AI_MODES["morning"]["parts"].append("falsify")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ALWAYS-ON PM DESK (Phase 21). A standing portfolio-manager view that runs
+# 24/7: reads sector money-flow from the RRG quadrants, maintains an
+# overweight/underweight book, and pushes buy/sell CALL-OUTS in two honest
+# conviction tiers — VALIDATED (RSI(2) timing, the one edge that survived
+# falsification) and DIRECTIONAL (rotation positioning; the top-3/1m model is
+# a candidate edge, PF 2.92 / 30 trades, and RS *alpha* was rejected in
+# EXP-11, so it is context, not proof). The AI PM writes a standing brief on a
+# tight cadence. Nothing auto-trades. See PM_DESK.md.
+# ─────────────────────────────────────────────────────────────────────────────
+CYCLICAL_SECTORS = {"XLK", "XLY", "XLI", "XLF", "XLB", "XLE", "XLC"}
+DEFENSIVE_SECTORS = {"XLP", "XLU", "XLV", "XLRE"}
+PM_CYCLE_HOURS = float(os.environ.get("PM_CYCLE_HOURS") or 4)
+_pm = {"callouts": [], "prevQuad": {}, "prevBook": {}, "brief": None, "briefAt": 0}
+_pm_lock = threading.Lock()
+
+
+def _pm_callout(action, symbol, detail, conviction, validated, level="info"):
+    rec = {"ts": time.time(), "action": action, "symbol": symbol, "detail": detail,
+           "conviction": conviction, "validated": validated}
+    with _pm_lock:
+        _pm["callouts"].insert(0, rec)
+        del _pm["callouts"][40:]
+    return rec
+
+
+def pm_desk_view():
+    rot = cache_get("sectors", 120) or _cache_and_return("sectors", rotation)
+    if rot.get("warm", {}).get("warming") or not rot.get("sectors"):
+        return {"warming": True, "note": "sector bars warming"}
+    reg = cache_get("regime", 900) or _cache_and_return("regime", regime_view)
+    cur = (reg.get("current") or {}) if not reg.get("error") else {}
+    sig = signals()
+    buys = {s["symbol"]: s for s in sig.get("sectors", []) if s.get("signal") == "BUY"}
+    arming = {s["symbol"]: s for s in sig.get("sectors", []) if s.get("signal") == "Arming"}
+    model = rot.get("model") or {}
+    holdings = set(model.get("holdings") or [])
+
+    book, ow, uw = [], [], []
+    for s in rot["sectors"]:
+        sym, q, mom = s["symbol"], s.get("quadrant"), s.get("rsMom") or 0
+        a200, trend = s.get("above200"), s.get("trend")
+        # positioning logic (directional): leaders/improving-with-momentum = OW
+        if q == "Leading" or (q == "Improving" and mom > 3 and a200):
+            stance, why = "Overweight", "%s quadrant, RS momentum %+.1f%s" % (q, mom, ", above 200-DMA" if a200 else "")
+            ow.append(sym)
+        elif q == "Lagging" or (q == "Weakening" and mom < 0):
+            stance, why = "Underweight", "%s quadrant, RS momentum %+.1f%s" % (q, mom, ", below trend" if trend == "down" else "")
+            uw.append(sym)
+        else:
+            stance, why = "Neutral", "%s quadrant, RS momentum %+.1f" % (q, mom)
+        # conviction: model agreement + trend + momentum sign
+        agree = sum([sym in holdings, bool(a200), mom > 0 if stance == "Overweight" else mom < 0])
+        conv = "High" if agree == 3 else "Medium" if agree == 2 else "Low"
+        book.append({"symbol": sym, "name": s["name"], "stance": stance, "conviction": conv,
+                     "quadrant": q, "rsMom": mom, "rs1m": s.get("rs1m"), "aboveTrend": a200,
+                     "inModel": sym in holdings, "rsi2": s.get("rsi2"),
+                     "hasBuy": sym in buys, "why": why})
+    book.sort(key=lambda x: ({"Overweight": 0, "Neutral": 1, "Underweight": 2}[x["stance"]], -(x["rsMom"] or 0)))
+
+    # money-flow reading: cyclical vs defensive leadership
+    ow_cyc = sum(1 for s in ow if s in CYCLICAL_SECTORS)
+    ow_def = sum(1 for s in ow if s in DEFENSIVE_SECTORS)
+    if ow_cyc > ow_def + 1:
+        flow, stance_word = "money rotating INTO cyclicals (risk-on lean)", "risk-on"
+    elif ow_def > ow_cyc + 1:
+        flow, stance_word = "money rotating INTO defensives (risk-off / late-cycle lean)", "risk-off"
+    else:
+        flow, stance_word = "mixed / broad rotation — no decisive cyclical-vs-defensive tilt", "neutral"
+
+    # the actionable, VALIDATED call-outs first: RSI(2) buys/exits
+    validated_calls = []
+    for sym, s in buys.items():
+        validated_calls.append({"action": "BUY", "symbol": sym, "conviction": "Validated edge (RSI2)",
+                                "detail": "RSI(2) %.1f oversold in an uptrend — the one out-of-sample-validated "
+                                          "timing edge; enter near the close, exit on close > 5-DMA"
+                                          % (s.get("rsi2") or 0)})
+    with _pm_lock:
+        recent = list(_pm["callouts"])[:12]
+    return {
+        "asOf": dt.date.today().isoformat(), "generatedAt": time.time(),
+        "regime": cur.get("primary"), "regimeConfidence": reg.get("confidence"),
+        "stance": stance_word, "moneyFlow": flow,
+        "overweight": ow, "underweight": uw,
+        "book": book,
+        "validatedCallouts": validated_calls,
+        "armingWatch": list(arming.keys()),
+        "rotationModel": {"holdings": sorted(holdings), "rule": model.get("rule"),
+                          "stats": model.get("stats"), "caveat": model.get("caveat")},
+        "recentCallouts": recent,
+        "aiBrief": _pm["brief"], "aiBriefAt": _pm["briefAt"],
+        "convictionKey": {
+            "Validated edge (RSI2)": "survived out-of-sample + costs + deflation + regime + permutation — act on it",
+            "Directional": "rotation positioning; candidate-edge model (PF 2.92/30 trades). RS ALPHA was REJECTED "
+                           "(EXP-11) — this is where money is flowing, NOT a proven outperformance bet"},
+        "disclaimer": "The PM desk runs 24/7 and calls out buys/sells, but only RSI(2) timing rests on a "
+                      "validated edge. Sector-rotation positioning is directional context — size it as such. "
+                      "Nothing here auto-trades; you execute in ThinkOrSwim.",
+    }
+
+
+def _check_pm_alerts():
+    """24/7 call-outs: RRG quadrant transitions (money rotating in/out) and
+    overweight/underweight changes — pushed through the standard alert engine
+    so they hit the bell + browser notifications."""
+    rot = cache_get("sectors", 120) or _cache_and_return("sectors", rotation)
+    if not rot.get("sectors"):
+        return
+    # quadrant transitions — the classic money-rotation signal
+    IN = {"Improving": "money starting to rotate IN (RS turning up from lagging)",
+          "Leading": "now LEADING — strongest relative strength + momentum"}
+    OUT = {"Weakening": "money starting to rotate OUT (RS rolling over from leading)",
+           "Lagging": "now LAGGING — weakest relative strength"}
+    for s in rot["sectors"]:
+        sym, q = s["symbol"], s.get("quadrant")
+        with _pm_lock:
+            prev = _pm["prevQuad"].get(sym)
+            _pm["prevQuad"][sym] = q
+        if prev and q and q != prev:
+            if q in IN:
+                lvl = "buy" if q == "Leading" else "info"
+                msg = "ROTATION · %s → %s: %s (RS mom %+.1f). Directional call-out — rotation positioning, not a validated edge." % (prev, q, IN[q], s.get("rsMom") or 0)
+                push_alert("pm", sym, msg, lvl, s.get("price"), dedupe_hours=48, key="quad-%s-%s" % (sym, q))
+                _pm_callout("rotate-in", sym, IN[q], "Directional", False, lvl)
+            elif q in OUT:
+                lvl = "sell" if q == "Lagging" else "warn"
+                msg = "ROTATION · %s → %s: %s (RS mom %+.1f). Directional call-out — consider trimming exposure." % (prev, q, OUT[q], s.get("rsMom") or 0)
+                push_alert("pm", sym, msg, lvl, s.get("price"), dedupe_hours=48, key="quad-%s-%s" % (sym, q))
+                _pm_callout("rotate-out", sym, OUT[q], "Directional", False, lvl)
+    # stance flip (risk-on ↔ risk-off) is a higher-order call-out
+    pm = pm_desk_view()
+    if not pm.get("warming"):
+        with _pm_lock:
+            prev_stance = _pm.get("prevStance")
+            _pm["prevStance"] = pm["stance"]
+        if prev_stance and prev_stance != pm["stance"]:
+            push_alert("pm", "MARKET", "POSITIONING SHIFT — %s: %s. OW: %s · UW: %s. Directional read."
+                       % (pm["stance"].upper(), pm["moneyFlow"], ", ".join(pm["overweight"]) or "—",
+                          ", ".join(pm["underweight"]) or "—"), "setup", dedupe_hours=24,
+                       key="stance-" + pm["stance"])
+            _pm_callout("stance-shift", "MARKET", "%s — %s" % (pm["stance"], pm["moneyFlow"]), "Directional", False, "setup")
+
+
+def _part_pm():
+    v = pm_desk_view()
+    if v.get("warming"):
+        return None
+    return {"stance": v["stance"], "moneyFlow": v["moneyFlow"], "regime": v["regime"],
+            "overweight": v["overweight"], "underweight": v["underweight"],
+            "book": [{k: b[k] for k in ("symbol", "stance", "conviction", "quadrant", "rsMom", "hasBuy")}
+                     for b in v["book"]],
+            "validatedCallouts": v["validatedCallouts"], "rotationModel": v["rotationModel"]}
+
+
+AI_PARTS["pm"] = ("PM desk: money-flow, overweight/underweight book, validated call-outs", _part_pm)
+AI_MODES["pm-desk"] = {
+    "title": "Portfolio manager brief", "rag": True, "ragQuery": "rotation regime positioning validated edge risk",
+    "parts": ["pm", "regime", "scores", "options", "portfolio", "government", "falsify"],
+    "system": "You are the portfolio manager running this book 24/7. From the DATA, write a concise standing "
+              "brief with EXPLICIT positioning: current stance (risk-on/off), where money is rotating (name the "
+              "sectors and the RRG quadrants), your overweight / underweight calls, and any actionable buy/sell "
+              "call-outs RIGHT NOW. TWO-TIER honesty is mandatory: mark RSI(2) timing calls as VALIDATED and "
+              "every rotation/positioning call as DIRECTIONAL (RS alpha was rejected in EXP-11 — it's where money "
+              "flows, not a proven edge). Give the PM's actual opinion and conviction, but never present "
+              "directional as validated, and never say 'I am buying' — you advise, the human executes. End with "
+              "the single highest-conviction action for today.",
+    "user": "Give me your portfolio-manager brief and today's positioning call-outs."}
+AI_MODES["morning"]["parts"].append("pm")
+
+
+def pm_loop():
+    """The AI PM writes a fresh standing brief every PM_CYCLE_HOURS (when Ollama
+    is reachable) and pushes a one-line digest call-out. The DETERMINISTIC PM
+    desk + rotation call-outs already run 24/7 in the 30s alert sweep — this
+    adds the narrative PM voice on a tight cadence."""
+    time.sleep(1200)
+    while True:
+        try:
+            with _pm_lock:
+                last = _pm["briefAt"]
+            if PM_CYCLE_HOURS > 0 and time.time() - last > PM_CYCLE_HOURS * 3600 and ai_status().get("reachable"):
+                out = []
+                ai_run({"mode": "pm-desk", "stream": False}, out.append)
+                brief = "".join(out)
+                import re as _re
+                brief = _re.sub(r"<think>[\s\S]*?</think>", "", brief).strip()
+                with _pm_lock:
+                    _pm["brief"], _pm["briefAt"] = brief, time.time()
+                first = brief.split("\n")[0][:180] if brief else ""
+                if first:
+                    push_alert("pm", "PM BRIEF", "PM desk updated — %s" % first, "info",
+                               dedupe_hours=PM_CYCLE_HOURS, key="pm-brief")
+        except Exception as e:
+            _ops_err("pm_loop", e)
+        time.sleep(1800)
+
+
 MIOS_CYCLE_HOURS = float(os.environ.get("MIOS_CYCLE_HOURS") or 24)
 
 
@@ -8778,7 +8975,7 @@ def _check_portfolio_risk():
 
 
 def check_alerts():
-    for fn in (_check_signal_alerts, _check_setup_alerts, _check_rotation_alerts,
+    for fn in (_check_signal_alerts, _check_setup_alerts, _check_rotation_alerts, _check_pm_alerts,
                _check_position_alerts, _check_price_alerts, _check_portfolio_risk):
         try:
             fn()
@@ -8951,6 +9148,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("falsify", 6 * 3600) or _cache_and_return("falsify", falsification_view))
         elif path == "/api/regime_router":
             self._json(regime_router())
+        elif path == "/api/pm":
+            self._json(cache_get("pm", 60) or _cache_and_return("pm", pm_desk_view))
         elif path == "/api/paper":
             self._json(paper_view())
         elif path == "/api/deepvalue":
@@ -9068,7 +9267,7 @@ def main():
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
-               research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop):
+               research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop, pm_loop):
         threading.Thread(target=_hb_wrap(fn), daemon=True, name=fn.__name__).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

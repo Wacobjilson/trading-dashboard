@@ -197,6 +197,7 @@
   <!-- INTEL (market intelligence engine — the synthesis view) -->
   <section class="tab active" id="tab-intel">
     <div class="card" id="intel-regime" style="font-size:13px;padding:10px 16px">Loading regime…</div>
+    <div class="card" id="pm-desk" style="font-size:13px"><div class="loading">PM desk warming — reading sector money-flow…</div></div>
     <div class="card" id="intel-cio" style="font-size:13px"><div class="loading">Preparing committee briefing…</div></div>
     <div class="card" id="intel-opps" style="font-size:13px"><div class="loading">Ranking opportunities…</div></div>
     <div class="card"><h2>Market-wide opportunity discovery <span class="muted" id="ode-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2>
@@ -1215,8 +1216,41 @@ function renderPfAlloc(){
     <div style="margin-top:6px;font-size:12px"><b>Factor exposures of this book:</b> ${(d.factorExposures||[]).map(x=>`<span class="${x.warn?'amber':'muted'}">${x.factor} ${x.exposure>0?'+':''}${x.exposure}${x.warn?' ⚠':''}</span>`).join(" · ")}</div>
     <div class="note">${(d.notes||[]).join(" ")}</div>`;
 }
+const pmStanceBadge=s=>`<span class="badge ${s==='risk-on'?'b-long':s==='risk-off'?'b-short':'b-neu'}">${(s||'neutral').toUpperCase()}</span>`;
+const pmStanceCol=s=>s==='Overweight'?'up':s==='Underweight'?'down':'muted';
+async function loadPMDesk(){
+  try{
+    const d=await(await fetch(`${API}/api/pm`)).json();
+    const el=document.getElementById("pm-desk");
+    if(d.warming){el.innerHTML='<div class="loading">PM desk warming — sector bars loading…</div>';return;}
+    const vc=(d.validatedCallouts||[]).map(c=>`<div style="margin:3px 0"><span class="badge b-ready">BUY · VALIDATED</span> <b>${c.symbol}</b> — ${c.detail}</div>`).join("");
+    const rc=(d.recentCallouts||[]).slice(0,6).map(c=>`<div style="font-size:11px;padding:2px 0;border-top:1px solid var(--border)">
+      <span class="mono muted">${ago(c.ts)}</span> <span class="badge ${c.action==='rotate-in'?'b-long':c.action==='rotate-out'?'b-short':'b-neu'}">${c.action}</span>
+      <b>${c.symbol}</b> ${c.detail} <span class="muted" style="font-size:10px">[${c.conviction}]</span></div>`).join("");
+    const book=(d.book||[]).map(b=>`<tr>
+      <td><b class="clk" onclick="openChart('${b.symbol}')">${b.symbol}</b>${b.hasBuy?' <span class="badge b-ready" title="RSI2 BUY now">BUY</span>':''}</td>
+      <td class="${pmStanceCol(b.stance)}" style="font-size:12px">${b.stance}</td>
+      <td><span class="badge ${b.conviction==='High'?'b-appr':'b-neu'}" style="font-size:9px">${b.conviction}</span></td>
+      <td class="mono muted" style="font-size:11px">${b.quadrant}</td>
+      <td class="mono ${dir(b.rsMom)}">${b.rsMom!=null?(b.rsMom>0?'+':'')+b.rsMom:'—'}</td>
+      <td class="muted" style="font-size:11px;white-space:normal">${b.why}</td></tr>`).join("");
+    el.innerHTML=
+      `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+        <b style="font-size:14px">PM Desk</b> ${pmStanceBadge(d.stance)}
+        <span class="muted">${d.moneyFlow}</span>
+        <span class="mono muted" style="font-size:11px;margin-left:auto">regime: ${d.regime||'—'} · updated ${ago(d.generatedAt)}</span></div>
+      <div style="font-size:12px;margin-bottom:6px"><b>Overweight:</b> <span class="up">${(d.overweight||[]).join(", ")||"—"}</span> · <b>Underweight:</b> <span class="down">${(d.underweight||[]).join(", ")||"—"}</span></div>
+      ${vc?`<div style="margin:6px 0">${vc}</div>`:'<div class="muted" style="font-size:12px;margin:4px 0">No validated RSI(2) buy right now — watch: '+((d.armingWatch||[]).join(", ")||"none arming")+'</div>'}
+      <details style="margin-top:4px"><summary style="cursor:pointer;font-size:12px" class="muted">positioning book (all 11 sectors) &amp; call-out log</summary>
+        <table style="margin-top:6px"><thead><tr><th>Sec</th><th>Stance</th><th>Conv</th><th>Quadrant</th><th>RS mom</th><th>Why</th></tr></thead><tbody>${book}</tbody></table>
+        ${rc?'<div style="margin-top:6px"><b style="font-size:11px">Recent call-outs</b>'+rc+'</div>':''}
+        ${d.aiBrief?`<div class="note" style="margin-top:6px"><b>AI PM brief</b> (${ago(d.aiBriefAt)}):<br>${d.aiBrief.slice(0,600).replace(/\n/g,"<br>")}</div>`:''}
+      </details>
+      <div class="note">${d.disclaimer} <button class="mini" onclick="aiOpen('pm-desk');aiGo({mode:'pm-desk'})">✨ full PM brief</button></div>`;
+  }catch(e){document.getElementById("pm-desk").innerHTML='<div class="loading">PM desk unavailable.</div>';}
+}
 async function loadIntel(){
-  loadSummary(); loadOpps(); loadAllocation();
+  loadSummary(); loadOpps(); loadAllocation(); loadPMDesk();
   if(!_cgHeat)fetch(`${API}/api/congress`).then(r=>r.json()).then(d=>{_cgHeat=d.heat||[];}).catch(()=>{});
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();

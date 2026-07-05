@@ -1,5 +1,20 @@
 # Changelog (standalone platform)
 
+## 2026-07-05 · Phase 21 — Always-On PM Desk
+- **Standing portfolio-manager view** (`/api/pm`, PM Desk card on Intel):
+  reads sector money-flow from the RRG quadrants → overweight/underweight book
+  with High/Med/Low conviction, current risk-on/off stance, cyclical-vs-
+  defensive rotation narrative. Runs 24/7 (deterministic, in the 30s sweep).
+- **Buy/sell call-outs in two honest tiers**: VALIDATED (RSI(2) timing — the
+  falsification-proven edge) and DIRECTIONAL (rotation positioning — candidate
+  model, RS alpha rejected EXP-11). Quadrant transitions (money rotating in/
+  out), stance flips, and RSI(2) buys push through the alert engine → bell +
+  browser notifications. Every call-out labeled by tier.
+- **AI PM persona** (`pm-desk` mode + `pm_loop`): writes a standing brief with
+  explicit positioning + today's highest-conviction action every
+  `PM_CYCLE_HOURS` (default 4h). Pushes a one-line digest. MIOS deep cycle
+  tightened to 12h. Nothing auto-trades. Doc: PM_DESK.md.
+
 ## 2026-07-05 · Phase 20 — Edge Falsification Engine
 - **Strategy Zoo** (`STRATEGY_ZOO`): orthogonal families, each REQUIRED to
   declare its economic rationale + who's on the other side. Testable: RSI(2),
