@@ -47,3 +47,4 @@ options_history.json
 predictions_history.json
 standalone/deep/
 congress_trades.json
+standalone/smoke_data/

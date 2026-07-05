@@ -13,3 +13,4 @@ options_history.json
 predictions_history.json
 deep/
 congress_trades.json
+smoke_data/
