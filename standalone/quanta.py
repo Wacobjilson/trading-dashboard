@@ -7913,9 +7913,10 @@ def _paper_bridge():
         if not px:
             continue
         hold = STRATEGY_ZOO.get(o["strategy"], {}).get("holdHint") or 10
-        with _state_lock:
+        pid = _next_id()                 # MUST be outside _state_lock — _next_id
+        with _state_lock:                # acquires it too (Lock is non-reentrant)
             _state["paper"].append({
-                "key": key, "id": _next_id(), "symbol": o["symbol"], "strategy": o["strategyName"],
+                "key": key, "id": pid, "symbol": o["symbol"], "strategy": o["strategyName"],
                 "basis": "paper", "entryDate": today, "entryPx": round(px, 2), "holdDays": hold,
                 "score": o["score"], "why": o["why"], "status": "open", "outcome": None,
                 "regime": o.get("regime"), "ts": time.time()})
@@ -8452,7 +8453,8 @@ def calendar_loop():
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_DIR = os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(DATA_DIR, "quanta_state.json")
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()   # reentrant: hardens against nested-acquire self-deadlocks
+                                  # (e.g. calling _next_id() while holding it — see Phase-21 fix)
 _state = {"positions": [], "closed": [], "price_alerts": [], "decisions": [], "paper": [], "next_id": 1}
 
 
