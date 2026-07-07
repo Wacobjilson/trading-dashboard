@@ -169,11 +169,17 @@ def _hb_wrap(fn):
     return runner
 
 
+# SEC's fair-access policy rejects generic User-Agents (403). It requires a
+# descriptive UA with a contact — configurable so the contact isn't hardcoded.
+_SEC_UA = os.environ.get("SEC_USER_AGENT") or "quanta-research-dashboard contact@quanta.local"
+
+
 def http_get_json(url, timeout=15):
     host = urllib.parse.urlparse(url).netloc
+    ua = _SEC_UA if host.endswith("sec.gov") else "quanta-standalone"
     t0 = time.time()
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "quanta-standalone"})
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             out = json.loads(resp.read().decode("utf-8"))
         with _ops_lock:
@@ -8196,6 +8202,774 @@ def pm_loop():
         time.sleep(1800)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# CAPITAL CYCLE — AI  (Phase 22, namespace: cc_ / CC_)
+# A supply-side, mean-reversion lens (Marathon / Chancellor's *Capital
+# Returns*) specialized to detect when the AI capex/equity boom is topping. The
+# tell of a top is MAXIMUM capital commitment + peak narrative + DETERIORATING
+# incremental economics — not price. The core job is measuring the widening gap
+# between capital committed (capex, issuance) and returns realized (ROIC,
+# margins) across the AI complex. Every indicator degrades to "no data" rather
+# than failing the panel, shows its raw series + timestamp, and is thresholded
+# from CC_CONFIG (tune without touching logic). Decision-support, not an oracle.
+# See CAPITAL_CYCLE.md.
+# ═════════════════════════════════════════════════════════════════════════════
+CC_CONFIG = {
+    "basket": {
+        "hyperscalers": ["MSFT", "GOOGL", "AMZN", "META", "ORCL"],
+        "semis": ["NVDA", "AMD", "AVGO", "MU"],
+        "ai_software": ["NOW", "PLTR", "SNOW", "CRM"],
+    },
+    "capexLeaders": ["MSFT", "GOOGL", "AMZN", "META", "ORCL"],
+    # entity pairs to watch for circular / vendor financing (supplier ⇄ customer)
+    "circularEntities": ["NVIDIA", "CoreWeave", "OpenAI", "Oracle", "Microsoft", "Amazon",
+                         "Anthropic", "Nebius", "AMD", "Broadcom"],
+    "thresholds": {
+        "capexYoY_surging": 0.25,          # capex YoY growth considered "surging" (top-decile proxy)
+        "capexRev_elevated": 0.20,         # capex/revenue ratio considered elevated
+        "roic_declineQuarters": 2,         # consecutive periods of falling ROIC = deteriorating
+        "valuationPctile_euphoria": 90,    # EV/Sales percentile vs own history
+        "circularityScore_alert": 4,       # circular-financing hit score
+        "creditCrackBps": 100,             # HY OAS widening off its 6-mo low (bps)
+        "breadthConc_fragile": 55,         # top-name share of basket move (%)
+        "sentimentFroth": 0.25,            # basket mean news sentiment (bullish froth)
+        "narrativeSpikePctile": 85,        # "AI bubble" article-volume percentile
+    },
+    # composite weights — the capex-UP-while-returns-DOWN divergence dominates,
+    # because that specific combination separates a real top from healthy growth.
+    "weights": {"capexReturnDivergence": 0.30, "valuation": 0.15, "credit": 0.15,
+                "breadth": 0.10, "circular": 0.10, "sentiment": 0.08, "narrative": 0.05,
+                "power": 0.04, "issuance": 0.03},
+}
+_cc_lock = threading.Lock()
+_cc = {"fund": {}, "valHist": {}, "sentiment": {}, "power": None, "narrative": None,
+       "circular": None, "credit": None, "builtAt": 0}
+
+
+def _cc_path():
+    return os.path.join(os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__)),
+                        "capital_cycle.json")
+
+
+def _cc_save():
+    try:
+        with _cc_lock:
+            body = json.dumps({k: _cc[k] for k in ("fund", "valHist", "sentiment", "power",
+                                                   "narrative", "circular", "credit")})
+        with open(_cc_path() + ".tmp", "w") as f:
+            f.write(body)
+        os.replace(_cc_path() + ".tmp", _cc_path())
+    except OSError as e:
+        _ops_err("cc_save", e)
+
+
+def _cc_load():
+    try:
+        with open(_cc_path()) as f:
+            d = json.load(f)
+        with _cc_lock:
+            _cc.update({k: d.get(k, _cc[k]) for k in d})
+    except (OSError, ValueError):
+        pass
+
+
+def _cc_all_basket():
+    return sorted({s for g in CC_CONFIG["basket"].values() for s in g})
+
+
+def _ind(value, series=None, source="", note="", available=True, **extra):
+    """Uniform indicator envelope — value + raw series + timestamp + source, so
+    nothing is a black box and missing feeds show 'no data' not an error."""
+    d = {"available": bool(available) and value is not None, "value": value,
+         "series": series or [], "source": source, "asOf": time.time(), "note": note}
+    d.update(extra)
+    return d
+
+
+# ── 1 & 3. Supply/capex + returns/monetization ──────────────────────────────
+# Capex + revenue come from official SEC EDGAR XBRL (FREE; FMP's statement
+# endpoints are 402/premium). ROIC + valuation multiples come from FMP's free
+# key-metrics-ttm / ratios-ttm. Best-of-both, all free, fully sourced.
+def _cc_cik(sym):
+    _dv_cik_map()
+    with _dv_lock:
+        return _dv["cik"].get(sym.upper())
+
+
+def _edgar_annual(cik, concepts):
+    """First matching us-gaap concept → {fiscal-year-end: full-year value}."""
+    for concept in concepts:
+        try:
+            d = http_get_json("https://data.sec.gov/api/xbrl/companyconcept/CIK%s/us-gaap/%s.json"
+                              % (cik, concept), timeout=25)
+        except Exception:
+            continue
+        out = {}
+        for x in d.get("units", {}).get("USD", []):
+            if x.get("form") not in ("10-K", "10-K/A") or x.get("fp") != "FY":
+                continue
+            s, e = x.get("start"), x.get("end")
+            try:
+                if s and e and (dt.date.fromisoformat(e) - dt.date.fromisoformat(s)).days < 300:
+                    continue                 # skip a quarter buried in the annual filing
+            except ValueError:
+                pass
+            try:
+                if e and dt.date.fromisoformat(e) < dt.date.today() - dt.timedelta(days=8 * 365):
+                    continue                 # drop stale concept tails (e.g. AMZN's old capex tag)
+            except ValueError:
+                continue
+            if e and x.get("val") is not None:
+                out[e] = float(x["val"])     # dedupe by FY-end (latest filed wins)
+        if out:
+            return out
+    return {}
+
+
+def _cc_fetch_fund(sym):
+    cik = _cc_cik(sym)
+    fund = {"symbol": sym, "annual": [], "roicTTM": None, "evSalesTTM": None,
+            "evEbitdaTTM": None, "grossMarginTTM": None,
+            "source": "SEC EDGAR XBRL (capex/revenue) + FMP key-metrics-ttm (ROIC/EV)",
+            "fetchedAt": time.time()}
+    if cik:
+        capex = _edgar_annual(cik, ["PaymentsToAcquirePropertyPlantAndEquipment",
+                                    "PaymentsToAcquireProductiveAssets"])
+        rev = _edgar_annual(cik, ["RevenueFromContractWithCustomerExcludingAssessedTax",
+                                  "Revenues", "RevenueFromContractWithCustomerIncludingAssessedTax"])
+        gp = _edgar_annual(cik, ["GrossProfit"])
+        dep = _edgar_annual(cik, ["DepreciationDepletionAndAmortization",
+                                  "DepreciationAmortizationAndAccretionNet", "DepreciationAndAmortization"])
+        for e in sorted(set(capex) | set(rev)):
+            r, cx = rev.get(e), capex.get(e)
+            fund["annual"].append({"date": e, "revenue": r, "capex": cx,
+                                   "capexRev": (cx / r) if (cx and r) else None,
+                                   "grossMargin": (gp[e] / r) if (e in gp and r) else None,
+                                   "dep": dep.get(e)})
+    # ROIC + valuation multiples from FMP free TTM endpoints
+    g = lambda d, *ks: next((d[x] for x in ks if isinstance(d, dict) and d.get(x) is not None), None)
+    try:
+        km = _fmp_stable("key-metrics-ttm?symbol=%s" % sym)
+        rat = _fmp_stable("ratios-ttm?symbol=%s" % sym)
+        k = (km or [{}])[0] if isinstance(km, list) else {}
+        rr = (rat or [{}])[0] if isinstance(rat, list) else {}
+        fund.update({"roicTTM": g(k, "returnOnInvestedCapitalTTM", "roicTTM", "returnOnInvestedCapital"),
+                     "evSalesTTM": g(k, "evToSalesTTM"), "evEbitdaTTM": g(k, "evToEBITDATTM"),
+                     "grossMarginTTM": g(rr, "grossProfitMarginTTM")})
+    except Exception as e:
+        _ops_err("cc_fmp_ttm", e)
+    return fund if (fund["annual"] or fund["roicTTM"] is not None) else None
+
+
+def _cc_capex_panel():
+    with _cc_lock:
+        fund = {s: dict(v) for s, v in _cc["fund"].items()}
+    leaders = [fund[s] for s in CC_CONFIG["capexLeaders"] if s in fund and fund[s].get("annual")]
+    if not leaders:
+        return {"panel": "Supply / capex", "available": False,
+                "note": "AI-capex fundamentals warming — no data yet", "indicators": []}
+    # PER-COMPANY metrics then average — robust to differing fiscal years and
+    # partial coverage (aggregating raw sums across misaligned FYs gives garbage).
+    yoys, capexrevs, per_co, latest_total = [], [], [], 0.0
+    for f in leaders:
+        cx = [r for r in f["annual"] if r.get("capex")]
+        if len(cx) >= 2:
+            last, prev = cx[-1], cx[-2]
+            if prev["capex"]:
+                yoy = last["capex"] / prev["capex"] - 1
+                yoys.append(yoy)
+                latest_total += last["capex"]
+                per_co.append({"sym": f["symbol"], "yoy": round(yoy, 2),
+                               "latestCapexB": round(last["capex"] / 1e9, 1), "fy": last["date"][:4]})
+            if last.get("capexRev"):
+                capexrevs.append(last["capexRev"])
+    inds = []
+    if yoys:
+        mean_yoy = sum(yoys) / len(yoys)
+        inds.append(_ind(round(mean_yoy, 3),
+                         series=[(c["sym"] + " FY" + c["fy"], c["latestCapexB"]) for c in per_co],
+                         source="SEC EDGAR XBRL", label="Capex YoY growth",
+                         note="mean latest-FY capex growth across AI leaders (total $%.0fB); surging = build-out boom"
+                              % (latest_total / 1e9),
+                         surging=mean_yoy >= CC_CONFIG["thresholds"]["capexYoY_surging"]))
+    if capexrevs:
+        mcr = sum(capexrevs) / len(capexrevs)
+        inds.append(_ind(round(mcr, 3), series=[(c["sym"], c["yoy"]) for c in per_co],
+                         source="SEC EDGAR + FMP", label="Capex / revenue",
+                         note="mean capex intensity of the build-out",
+                         elevated=mcr >= CC_CONFIG["thresholds"]["capexRev_elevated"]))
+    return {"panel": "Supply / capex (the build-out)", "available": bool(inds),
+            "indicators": inds, "leaders": [c["sym"] for c in per_co]}
+
+
+def _cc_returns_panel():
+    with _cc_lock:
+        fund = {s: dict(v) for s, v in _cc["fund"].items()}
+    leaders = [fund[s] for s in CC_CONFIG["capexLeaders"] if s in fund]
+    if not leaders:
+        return {"panel": "Returns / monetization", "available": False,
+                "note": "fundamentals warming — no data", "indicators": []}
+    roics = [f["roicTTM"] for f in leaders if f.get("roicTTM") is not None]
+    inds = []
+    if roics:
+        inds.append(_ind(round(sum(roics) / len(roics), 3),
+                         series=[(f["symbol"], round(f["roicTTM"], 3)) for f in leaders if f.get("roicTTM") is not None],
+                         source="FMP key-metrics-ttm", label="Mean ROIC (capex leaders)",
+                         note="returns on invested capital — should be FALLING at a genuine top"))
+    # gross-margin trend (rising GPU depreciation eating margins is a late-cycle tell)
+    gm_now = [f["grossMarginTTM"] for f in leaders if f.get("grossMarginTTM") is not None]
+    if gm_now:
+        # margin direction from the annual series (last vs 2yr-ago)
+        deltas = []
+        for f in leaders:
+            ann = [r for r in f.get("annual", []) if r.get("grossMargin") is not None]
+            if len(ann) >= 2:
+                deltas.append(ann[-1]["grossMargin"] - ann[-3]["grossMargin"] if len(ann) >= 3
+                              else ann[-1]["grossMargin"] - ann[-2]["grossMargin"])
+        inds.append(_ind(round(sum(gm_now) / len(gm_now), 3),
+                         series=[(f["symbol"], round(f["grossMarginTTM"], 3)) for f in leaders if f.get("grossMarginTTM") is not None],
+                         source="FMP", label="Mean gross margin",
+                         note="rising GPU depreciation compressing margins = late-cycle tell",
+                         marginDirection=("falling" if deltas and sum(deltas) < -0.01 else
+                                          "rising" if deltas and sum(deltas) > 0.01 else "flat")))
+    return {"panel": "Returns / monetization (the deteriorating part)", "available": bool(inds), "indicators": inds}
+
+
+def _cc_divergence():
+    """THE core signal: capex surging WHILE incremental returns fall. Returns a
+    0–100 bubble-risk contribution and the exact conditions."""
+    cap = _cc_capex_panel()
+    ret = _cc_returns_panel()
+    capex_yoy = next((i["value"] for i in cap.get("indicators", []) if i.get("label") == "Capex YoY growth"), None)
+    margin_dir = next((i.get("marginDirection") for i in ret.get("indicators", []) if i.get("label", "").startswith("Mean gross margin")), None)
+    # ROIC direction from stored history (accumulates); fall back to margin dir
+    with _cc_lock:
+        roic_hist = _cc.get("valHist", {}).get("_roic", [])
+    roic_falling = None
+    if len(roic_hist) >= CC_CONFIG["thresholds"]["roic_declineQuarters"] + 1:
+        recent = [v for _t, v in roic_hist[-4:]]
+        roic_falling = all(recent[i] >= recent[i + 1] for i in range(len(recent) - 1))
+    surging = capex_yoy is not None and capex_yoy >= CC_CONFIG["thresholds"]["capexYoY_surging"]
+    deteriorating = (roic_falling is True) or (margin_dir == "falling")
+    score = 0
+    conditions = []
+    if surging:
+        score += 50; conditions.append("capex YoY %+.0f%% (surging)" % (capex_yoy * 100))
+    if deteriorating:
+        score += 50
+        conditions.append("returns deteriorating (%s)" % ("ROIC falling" if roic_falling else "margins compressing"))
+    elif margin_dir == "rising":
+        conditions.append("margins still rising (healthy expansion, not a top)")
+    return {"score": score, "surging": surging, "deteriorating": deteriorating,
+            "capexYoY": capex_yoy, "marginDirection": margin_dir, "roicFalling": roic_falling,
+            "conditions": conditions,
+            "read": ("CAPEX-RETURN DIVERGENCE: capital still surging while economics deteriorate — the classic top tell"
+                     if surging and deteriorating else
+                     "capex surging but returns holding — expansion, not yet a top" if surging else
+                     "capex growth moderating" if capex_yoy is not None else "insufficient data")}
+
+
+# ── 4. Valuation (accumulating percentile vs own history) ────────────────────
+def _cc_valuation_panel():
+    with _cc_lock:
+        fund = {s: dict(v) for s, v in _cc["fund"].items()}
+        valhist = dict(_cc.get("valHist", {}))
+    evs = [f["evSalesTTM"] for f in fund.values() if f.get("evSalesTTM") is not None]
+    inds = []
+    if evs:
+        cur = sum(evs) / len(evs)
+        hist = [v for _t, v in valhist.get("evSales", [])]
+        pctl = _pctl(hist, cur) if len(hist) >= 20 else None
+        inds.append(_ind(round(cur, 2),
+                         series=[(_t[:10], round(v, 2)) for _t, v in valhist.get("evSales", [])][-60:],
+                         source="FMP", label="Basket EV/Sales",
+                         note="mean forward-ish EV/Sales of the AI basket; percentile vs own accumulated history",
+                         percentile=round(pctl) if pctl is not None else None,
+                         euphoric=pctl is not None and pctl >= CC_CONFIG["thresholds"]["valuationPctile_euphoria"],
+                         histNote="percentile accumulates from daily snapshots (%d days)" % len(hist)))
+    # earnings yield vs real rate (ERP proxy)
+    fr = fetch_fred_series("DFII10")
+    if fr:
+        real = fr[-1][1]
+        pes = [f.get("evEbitdaTTM") for f in fund.values() if f.get("evEbitdaTTM")]
+        inds.append(_ind(round(real, 2), series=[(d.isoformat(), v) for d, v in fr[-60:]],
+                         source="FRED DFII10", label="Real 10y yield (%)",
+                         note="higher real rates raise the bar for long-duration AI cash flows"))
+    return {"panel": "Valuation", "available": bool(inds), "indicators": inds}
+
+
+# ── 6. Circular / vendor financing (SEC EDGAR full-text search) ──────────────
+def _cc_fetch_circular():
+    """Score circular/vendor financing via SEC EDGAR full-text search: recent
+    filings co-mentioning AI-complex counterparties with investment/financing
+    language. Rising = elevated bubble risk (the dotcom Lucent/Nortel tell)."""
+    def efts_count(q, forms="8-K,10-K,10-Q"):
+        try:
+            d = http_get_json("https://efts.sec.gov/LATEST/search-index?q=%s&forms=%s&startdt=%s&enddt=%s"
+                              % (urllib.parse.quote(q), urllib.parse.quote(forms),
+                                 (dt.date.today() - dt.timedelta(days=180)).isoformat(), dt.date.today().isoformat()),
+                              timeout=25)
+            return (d.get("hits", {}).get("total", {}) or {}).get("value", 0)
+        except Exception as e:
+            _ops_err("efts", e)
+            return None
+    queries = [
+        ('"strategic investment" "artificial intelligence"', "AI strategic-investment filings (180d)"),
+        ('"vendor financing"', "vendor-financing mentions (180d)"),
+        ('"NVIDIA" "invest"', "NVIDIA + invest co-mentions"),
+        ('"CoreWeave"', "CoreWeave references in filings"),
+    ]
+    rows, score = [], 0
+    for q, label in queries:
+        n = efts_count(q)
+        rows.append({"query": q, "label": label, "hits": n})
+        if n is not None and n > 50:
+            score += 1
+        if n is not None and n > 200:
+            score += 1
+        time.sleep(0.5)
+    return {"score": score, "rows": rows, "source": "SEC EDGAR full-text search (efts.sec.gov)",
+            "fetchedAt": time.time(),
+            "note": "keyword/co-mention proxy over 180d of filings — a screen for further manual review, "
+                    "not a confirmed circular-financing finding"}
+
+
+def _cc_circular_panel():
+    with _cc_lock:
+        c = _cc.get("circular")
+    if not c:
+        return {"panel": "Circular / vendor financing", "available": False,
+                "note": "EDGAR circular-financing scan warming — no data", "indicators": []}
+    thr = CC_CONFIG["thresholds"]["circularityScore_alert"]
+    return {"panel": "Circular / vendor financing (AI-specific, high priority)", "available": True,
+            "indicators": [_ind(c["score"], series=[(r["label"], r["hits"]) for r in c["rows"]],
+                                source=c["source"], label="Circularity score",
+                                note=c["note"], alert=c["score"] >= thr, threshold=thr)],
+            "prominent": True}
+
+
+# ── 7. Credit & liquidity (FRED spreads) ─────────────────────────────────────
+def _cc_credit_panel():
+    hy = fetch_fred_series("BAMLH0A0HYM2")            # HY OAS
+    if not hy:
+        return {"panel": "Credit & liquidity", "available": False,
+                "note": "FRED credit series unavailable", "indicators": []}
+    cur = hy[-1][1]
+    lo_6mo = min(v for d, v in hy if d >= dt.date.today() - dt.timedelta(days=180))
+    widen_bps = (cur - lo_6mo) * 100
+    thr = CC_CONFIG["thresholds"]["creditCrackBps"]
+    return {"panel": "Credit & liquidity", "available": True,
+            "indicators": [_ind(round(cur, 2), series=[(d.isoformat(), v) for d, v in hy[-90:]],
+                                source="FRED BAMLH0A0HYM2 (HY OAS)", label="High-yield OAS (%)",
+                                note="tech/DC issuer-specific spreads need paid data; HY aggregate is the free proxy. "
+                                     "Widening off the 6-mo low = early crack in the financing chain",
+                                wideningBps=round(widen_bps), sixMoLow=round(lo_6mo, 2),
+                                crack=widen_bps >= thr, threshold=thr)]}
+
+
+# ── 8. Breadth / concentration (Polygon grouped-daily via the ODE store) ─────
+def _cc_breadth_panel():
+    with _mkt_lock:
+        syms = {s: {"c": d["c"][:]} for s, d in _mkt["sym"].items()}
+        dates = list(_mkt["dates"])
+    basket = [s for s in _cc_all_basket() if s in syms and len(syms[s]["c"]) >= 25]
+    if len(basket) < 4 or len(dates) < 25:
+        return {"panel": "Breadth / concentration", "available": False,
+                "note": "market store warming (needs AI names + ≥25 days)", "indicators": []}
+    # each basket name's 20-day return; concentration = top name's share of total positive move
+    rets = {s: (syms[s]["c"][-1] / syms[s]["c"][-21] - 1) * 100 for s in basket}
+    above50 = sum(1 for s in basket if len(syms[s]["c"]) >= 50 and
+                  syms[s]["c"][-1] > sum(syms[s]["c"][-50:]) / 50)
+    pos = {s: r for s, r in rets.items() if r > 0}
+    conc = (max(pos.values()) / sum(pos.values()) * 100) if pos else None
+    thr = CC_CONFIG["thresholds"]["breadthConc_fragile"]
+    return {"panel": "Breadth / concentration", "available": True,
+            "indicators": [
+                _ind(round(above50 / len(basket) * 100), series=[(s, round(rets[s], 1)) for s in basket],
+                     source="Polygon grouped-daily", label="AI basket breadth (% > 50-DMA)",
+                     note="narrowing breadth while price holds = fragile top"),
+                _ind(round(conc) if conc is not None else None,
+                     series=[(s, round(r, 1)) for s, r in sorted(pos.items(), key=lambda x: -x[1])],
+                     source="Polygon", label="Top-name concentration (% of basket up-move)",
+                     note="one name carrying the move = fragile", fragile=conc is not None and conc >= thr, threshold=thr)]}
+
+
+# ── 9. Physical bottlenecks — power (EIA) ────────────────────────────────────
+def _cc_fetch_power():
+    key = _key("eia")
+    if not key:
+        return None
+    try:
+        # US48 = Lower-48 aggregate (one long series, not ~300 BAs). EIA rejects
+        # unencoded [ ] — pre-encode the array params.
+        d = http_get_json("https://api.eia.gov/v2/electricity/rto/daily-region-data/data/?api_key=%s"
+                          "&data%%5B0%%5D=value&facets%%5Btype%%5D%%5B%%5D=D&facets%%5Brespondent%%5D%%5B%%5D=US48"
+                          "&frequency=daily&sort%%5B0%%5D%%5Bcolumn%%5D=period&sort%%5B0%%5D%%5Bdirection%%5D=desc"
+                          "&length=2500" % key, timeout=35)
+    except Exception as e:
+        _ops_err("eia", e)
+        return None
+    rows = (d.get("response", {}) or {}).get("data", []) if isinstance(d, dict) else []
+    byday = {}
+    for r in rows:                           # US48 only → dedupe to one value per day
+        if isinstance(r, dict) and r.get("value") is not None:
+            try:
+                byday[r.get("period")] = float(r["value"])
+            except (TypeError, ValueError):
+                pass
+    series = sorted((p, v) for p, v in byday.items() if p)
+    if len(series) < 60:
+        return None
+    return {"series": series, "fetchedAt": time.time(), "source": "EIA-930 grid monitor (US48 daily demand)"}
+
+
+def _cc_power_panel():
+    with _cc_lock:
+        p = _cc.get("power")
+    if not p or len(p.get("series", [])) < 60:
+        return {"panel": "Physical bottlenecks — power", "available": False,
+                "note": "EIA power-demand series warming — no data", "indicators": []}
+    s = p["series"]
+    # trailing-30d vs same window a year prior (YoY) — data centers drive marginal demand
+    recent = sum(v for _d, v in s[-30:]) / 30
+    yr_ago = [v for d, v in s if d[:7] and s[0][0] <= d]
+    yoy = None
+    if len(s) >= 365 + 30:
+        base = sum(v for _d, v in s[-395:-365]) / 30
+        yoy = (recent / base - 1) if base else None
+    return {"panel": "Physical bottlenecks (power draw proxy)", "available": True,
+            "indicators": [_ind(round(yoy, 3) if yoy is not None else round(recent),
+                                series=[(d, round(v)) for d, v in s[-90:]],
+                                source=p["source"], label="US electricity demand YoY" if yoy is not None else "US demand (30d avg MWh)",
+                                note="proxy for data-center power draw; a shift from surging to slack = demand rollover. "
+                                     "GPU lead times / cloud utilization have NO free feed (shown as no-data).")]}
+
+
+# ── 5. Behavioral / sentiment (Alpha Vantage news + GDELT narrative) ─────────
+def _cc_fetch_sentiment(sym):
+    key = _key("alphavantage")
+    if not key:
+        return None
+    try:
+        d = http_get_json("https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=%s&limit=50&apikey=%s"
+                          % (sym, key), timeout=25)
+    except Exception as e:
+        _ops_err("alphavantage", e)
+        return None
+    feed = d.get("feed")
+    if not feed:
+        return {"unavailable": str(d)[:120]}
+    scores = []
+    for item in feed:
+        for ts in item.get("ticker_sentiment", []):
+            if ts.get("ticker") == sym:
+                try:
+                    scores.append(float(ts["ticker_sentiment_score"]))
+                except (KeyError, ValueError):
+                    pass
+    return {"n": len(scores), "mean": round(sum(scores) / len(scores), 3) if scores else None,
+            "fetchedAt": time.time()}
+
+
+def _cc_fetch_narrative():
+    try:
+        d = http_get_json("https://api.gdeltproject.org/api/v2/doc/doc?query=%s&mode=timelinevolraw"
+                          "&format=json&timespan=6m" % urllib.parse.quote('"AI bubble"'), timeout=25)
+        pts = (d.get("timeline") or [{}])[0].get("data", []) if isinstance(d, dict) else []
+        series = [(p.get("date", "")[:8], p.get("value")) for p in pts if p.get("value") is not None]
+        return {"series": series, "fetchedAt": time.time()} if series else None
+    except Exception as e:
+        _ops_err("gdelt", e)
+        return None
+
+
+def _cc_sentiment_panel():
+    with _cc_lock:
+        sent = dict(_cc.get("sentiment", {}))
+        narr = _cc.get("narrative")
+    inds = []
+    vals = [v["mean"] for v in sent.values() if isinstance(v, dict) and v.get("mean") is not None]
+    if vals:
+        mean = sum(vals) / len(vals)
+        thr = CC_CONFIG["thresholds"]["sentimentFroth"]
+        inds.append(_ind(round(mean, 3), series=[(s, v.get("mean")) for s, v in sent.items() if isinstance(v, dict)],
+                         source="Alpha Vantage NEWS_SENTIMENT (25 req/day — slow rotation)",
+                         label="AI basket news sentiment", note="elevated bullish sentiment = late-cycle froth",
+                         froth=mean >= thr, threshold=thr))
+    if narr and narr.get("series"):
+        s = narr["series"]
+        cur = s[-1][1]
+        hist = [v for _d, v in s]
+        pctl = _pctl(hist, cur)
+        inds.append(_ind(cur, series=[(d, v) for d, v in s[-90:]], source="GDELT (keyless)",
+                         label="'AI bubble' article volume", note="narrative-intensity proxy; spike = peak-narrative",
+                         percentile=round(pctl) if pctl is not None else None,
+                         spike=pctl is not None and pctl >= CC_CONFIG["thresholds"]["narrativeSpikePctile"]))
+    return {"panel": "Behavioral / sentiment", "available": bool(inds), "indicators": inds,
+            "gaps": "VC/PE deal-flow, retail participation & options-froth on the basket have no clean free feed — omitted, not estimated"}
+
+
+def _cc_issuance_panel():
+    """Equity issuance proxy via EDGAR full-text (S-1/424B/ATM). VC/PE & IPO/
+    SPAC tagging is thin on free tiers — shown as proxy."""
+    try:
+        d = http_get_json("https://efts.sec.gov/LATEST/search-index?q=%s&forms=424B5,S-1&startdt=%s&enddt=%s"
+                          % (urllib.parse.quote('"at-the-market" "artificial intelligence"'),
+                             (dt.date.today() - dt.timedelta(days=180)).isoformat(), dt.date.today().isoformat()),
+                          timeout=25)
+        n = (d.get("hits", {}).get("total", {}) or {}).get("value")
+    except Exception as e:
+        _ops_err("efts_issuance", e)
+        n = None
+    if n is None:
+        return {"panel": "Capital raising / issuance", "available": False,
+                "note": "EDGAR issuance scan unavailable", "indicators": []}
+    return {"panel": "Capital raising (fuel entering)", "available": True,
+            "indicators": [_ind(n, source="SEC EDGAR full-text (424B5/S-1)", label="AI-tagged ATM/offering filings (180d)",
+                                note="equity-issuance proxy; VC/PE mega-round & IPO/SPAC flow have no free feed")]}
+
+
+# ── composite four-phase model ───────────────────────────────────────────────
+def _cc_composite():
+    div = _cc_divergence()
+    val = _cc_valuation_panel()
+    cred = _cc_credit_panel()
+    brd = _cc_breadth_panel()
+    circ = _cc_circular_panel()
+    sent = _cc_sentiment_panel()
+    pwr = _cc_power_panel()
+    iss = _cc_issuance_panel()
+    w = CC_CONFIG["weights"]
+    parts, tot_w = [], 0.0
+    risk = 0.0
+
+    def add(name, contrib, weight, detail):
+        nonlocal risk, tot_w
+        if contrib is None:
+            parts.append({"factor": name, "contribution": None, "weight": weight, "detail": detail + " (no data)"})
+            return
+        risk += contrib * weight; tot_w += weight
+        parts.append({"factor": name, "contribution": round(contrib), "weight": weight, "detail": detail})
+
+    add("Capex-return divergence", div["score"], w["capexReturnDivergence"], div["read"])
+    valpc = next((i.get("percentile") for i in val.get("indicators", []) if i.get("label") == "Basket EV/Sales"), None)
+    add("Valuation", valpc, w["valuation"], "EV/Sales percentile vs own history" if valpc is not None else "percentile accumulating")
+    crk = next((i for i in cred.get("indicators", [])), None)
+    add("Credit", min(100, crk.get("wideningBps", 0)) if crk else None, w["credit"],
+        "HY OAS widening %s bps off 6-mo low" % (crk.get("wideningBps") if crk else "?"))
+    concf = next((i.get("value") for i in brd.get("indicators", []) if "concentration" in i.get("label", "").lower()), None)
+    add("Breadth/concentration", concf, w["breadth"], "top-name share of basket up-move")
+    cscore = next((i["value"] for i in circ.get("indicators", [])), None)
+    add("Circular financing", (cscore / 8 * 100) if cscore is not None else None, w["circular"], "EDGAR circularity score")
+    froth = next((i.get("value") for i in sent.get("indicators", []) if i.get("label", "").endswith("sentiment")), None)
+    add("Sentiment", ((froth + 0.35) / 0.7 * 100) if froth is not None else None, w["sentiment"], "basket news sentiment")
+    npc = next((i.get("percentile") for i in sent.get("indicators", []) if "article" in i.get("label", "")), None)
+    add("Narrative", npc, w["narrative"], "'AI bubble' article-volume percentile")
+    pyoy = next((i.get("value") for i in pwr.get("indicators", []) if "YoY" in i.get("label", "")), None)
+    add("Power demand", (50 - pyoy * 200) if isinstance(pyoy, float) else None, w["power"],
+        "inverse: slackening demand raises rollover risk")
+    add("Issuance", None, w["issuance"], "issuance proxy (not scored into risk)")
+
+    riskScore = round(risk / tot_w) if tot_w else None
+    # phase logic — divergence dominates the classification
+    diverging = div["surging"] and div["deteriorating"]
+    cracking = (crk and crk.get("crack")) or (concf is not None and concf >= CC_CONFIG["thresholds"]["breadthConc_fragile"])
+    if riskScore is None:
+        phase, note = "Insufficient data", "not enough feeds live to classify the cycle phase yet"
+    elif diverging and (riskScore >= 60 or cracking):
+        phase = "Contraction" if cracking else "Abundance / Peak Supply"
+        note = ("de-rating underway: divergence + a crack (credit/breadth)" if cracking
+                else "bubble-top RISK HIGH: capital still surging while returns roll over")
+    elif diverging:
+        phase, note = "Abundance / Peak Supply", "capex maxed and economics deteriorating — elevated top risk"
+    elif riskScore >= 60:
+        phase, note = "Abundance / Peak Supply", "elevated readings, but the core divergence isn't confirmed yet"
+    elif riskScore <= 30 and div.get("capexYoY") is not None and div["capexYoY"] < 0:
+        phase, note = "Trough / Scarcity", "capital withdrawn, capacity shrinking — bottoming"
+    else:
+        phase, note = "Recovery / Expansion", "returns holding or improving; healthy build-out, not a top"
+    return {"phase": phase, "riskScore": riskScore, "note": note, "divergence": div,
+            "contributions": parts,
+            "panels": [_cc_capex_panel(), _cc_returns_panel(), val, sent, circ, cred, brd, pwr, iss]}
+
+
+CC_SIGNALS = []
+
+
+def capital_cycle_view():
+    comp = _cc_composite()
+    div = comp["divergence"]
+    thr = CC_CONFIG["thresholds"]
+    signals = []
+
+    def sig(name, state, conditions, series_from):
+        signals.append({"name": name, "state": state, "conditions": conditions,
+                        "contributing": series_from, "ts": time.time()})
+
+    # Capex-Return Divergence Warning
+    if div["surging"] and div["deteriorating"]:
+        sig("Capex-Return Divergence", "Trigger",
+            "capex surging (%+.0f%%) AND returns deteriorating (%s)" % ((div["capexYoY"] or 0) * 100,
+             "ROIC falling" if div["roicFalling"] else "margins compressing"),
+            ["capex leaders capex YoY", "ROIC/margin trend"])
+    elif div["surging"]:
+        sig("Capex-Return Divergence", "Watch", "capex surging; returns not yet confirmed deteriorating",
+            ["capex YoY"])
+    # Circular-financing
+    circ = next((p for p in comp["panels"] if p["panel"].startswith("Circular")), {})
+    cscore = next((i["value"] for i in circ.get("indicators", [])), None)
+    if cscore is not None:
+        st = "Trigger" if cscore >= thr["circularityScore_alert"] + 1 else "Warning" if cscore >= thr["circularityScore_alert"] else "Watch"
+        sig("Circular-Financing Alert", st, "EDGAR circularity score %s (threshold %s)" % (cscore, thr["circularityScore_alert"]),
+            ["EDGAR full-text co-mentions"])
+    # Euphoria
+    val = next((p for p in comp["panels"] if p["panel"] == "Valuation"), {})
+    valpc = next((i.get("percentile") for i in val.get("indicators", []) if i.get("label") == "Basket EV/Sales"), None)
+    sent = next((p for p in comp["panels"] if p["panel"].startswith("Behavioral")), {})
+    froth = next((i.get("froth") for i in sent.get("indicators", []) if i.get("label", "").endswith("sentiment")), None)
+    if valpc is not None and valpc >= thr["valuationPctile_euphoria"]:
+        sig("Euphoria Trigger", "Trigger" if froth else "Warning",
+            "valuation %dth pctile%s" % (valpc, " + bullish sentiment froth" if froth else ""),
+            ["EV/Sales percentile", "news sentiment"])
+    # Credit crack
+    cred = next((p for p in comp["panels"] if p["panel"].startswith("Credit")), {})
+    ci = next((i for i in cred.get("indicators", [])), None)
+    if ci and ci.get("wideningBps") is not None:
+        st = "Trigger" if ci.get("crack") else "Warning" if ci["wideningBps"] >= thr["creditCrackBps"] * 0.6 else "Watch"
+        sig("Credit Crack", st, "HY OAS +%d bps off 6-mo low (threshold %d)" % (ci["wideningBps"], thr["creditCrackBps"]),
+            ["HY OAS (FRED)"])
+    # Breadth break
+    brd = next((p for p in comp["panels"] if p["panel"].startswith("Breadth")), {})
+    concf = next((i for i in brd.get("indicators", []) if "concentration" in i.get("label", "").lower()), None)
+    if concf and concf.get("value") is not None:
+        sig("Breadth Break", "Warning" if concf.get("fragile") else "Watch",
+            "top-name concentration %d%% of basket up-move" % concf["value"], ["basket 20d returns"])
+    # Rollover confirmation
+    if comp["phase"] == "Contraction":
+        sig("Rollover Confirmation", "Trigger", "composite phase flipped to Contraction — it's de-rating",
+            ["composite phase"])
+    comp["signals"] = signals
+    comp["config"] = CC_CONFIG
+    comp["disclaimer"] = ("Decision-support, not an oracle. This measures the capital-cycle setup (capital vs "
+                          "returns) for the AI complex; it does NOT time the top. Every indicator drills to its "
+                          "raw series + timestamp; missing feeds show 'no data', never a fabricated value.")
+    comp["dataGaps"] = ["VC/PE deal flow (no free feed)", "issuer-level DC credit spreads (paid; HY proxy used)",
+                        "GPU lead times / cloud utilization (no feed)", "quality forward consensus (FMP premium)"]
+    return comp
+
+
+def cc_replay():
+    """Lightweight replay: run the divergence + credit + narrative logic over
+    the history we actually have (FRED spreads = years; GDELT = 6mo; capex =
+    annual). Honest about coverage — this is a sanity check, not a backtest of
+    a tradable rule."""
+    hy = fetch_fred_series("BAMLH0A0HYM2")
+    events = []
+    if hy:
+        # historical credit cracks: OAS jumps > 150bps within 60 sessions
+        vals = hy
+        for i in range(60, len(vals)):
+            lo = min(v for _d, v in vals[i - 60:i])
+            if (vals[i][1] - lo) * 100 >= 150:
+                events.append({"date": vals[i][0].isoformat(), "signal": "Credit Crack",
+                               "detail": "HY OAS +%dbps off 60d low" % round((vals[i][1] - lo) * 100)})
+    # dedupe to first-of-cluster
+    dedup, last = [], None
+    for e in events:
+        d0 = dt.date.fromisoformat(e["date"])
+        if last is None or (d0 - last).days > 90:
+            dedup.append(e)
+        last = d0
+    return {"note": "Replay over available free history. Credit-crack logic flags 2018Q4, 2020 COVID, 2022 "
+                    "de-rate, etc. where present — validates the mechanic, NOT a tradable edge. Fundamental "
+                    "divergence history is limited by FMP free-tier statement depth.",
+            "creditCrackEvents": dedup[-12:], "source": "FRED BAMLH0A0HYM2"}
+
+
+def _check_cc_alerts():
+    """Fire staged Capital-Cycle signals through the standard alert engine."""
+    try:
+        cc = cache_get("capital_cycle", 3600) or _cache_and_return("capital_cycle", capital_cycle_view)
+    except Exception:
+        return
+    for s in cc.get("signals", []):
+        if s["state"] in ("Warning", "Trigger"):
+            lvl = "sell" if s["state"] == "Trigger" else "warn"
+            push_alert("capcycle", "AI-COMPLEX",
+                       "CAPITAL CYCLE · %s [%s]: %s" % (s["name"], s["state"], s["conditions"]),
+                       lvl, dedupe_hours=24, key="cc-%s-%s" % (s["name"], s["state"]))
+
+
+def cc_loop():
+    _cc_load()
+    time.sleep(700)
+    av_budget = 4                     # Alpha Vantage: 25/day total — spend few here
+    while True:
+        if not FORCE_SYNTH:
+            # fundamentals for the capex leaders + basket (FMP, 6-day cache, budgeted)
+            for sym in _cc_all_basket():
+                with _cc_lock:
+                    f = _cc["fund"].get(sym)
+                if f and time.time() - f.get("fetchedAt", 0) < 6 * 86400:
+                    continue
+                try:
+                    rec = _cc_fetch_fund(sym)
+                    if rec:
+                        with _cc_lock:
+                            _cc["fund"][sym] = rec
+                except Exception as e:
+                    _ops_err("cc_fund", e)
+                time.sleep(2)
+            # daily valuation + ROIC snapshot (accumulates the percentile history)
+            with _cc_lock:
+                evs = [f["evSalesTTM"] for f in _cc["fund"].values() if f.get("evSalesTTM") is not None]
+                roics = [f["roicTTM"] for f in _cc["fund"].values() if f.get("roicTTM") is not None]
+                today = dt.date.today().isoformat()
+                vh = _cc.setdefault("valHist", {})
+                if evs and not any(t[:10] == today for t, _v in vh.get("evSales", [])):
+                    vh.setdefault("evSales", []).append((dt.datetime.now().isoformat(), sum(evs) / len(evs)))
+                    vh["evSales"] = vh["evSales"][-400:]
+                if roics and not any(t[:10] == today for t, _v in vh.get("_roic", [])):
+                    vh.setdefault("_roic", []).append((today, sum(roics) / len(roics)))
+                    vh["_roic"] = vh["_roic"][-90:]
+            # power, narrative, circular, sentiment (rotate a couple names for AV budget)
+            try:
+                p = _cc_fetch_power()
+                if p:
+                    with _cc_lock:
+                        _cc["power"] = p
+            except Exception as e:
+                _ops_err("cc_power", e)
+            try:
+                n = _cc_fetch_narrative()
+                if n:
+                    with _cc_lock:
+                        _cc["narrative"] = n
+            except Exception as e:
+                _ops_err("cc_narrative", e)
+            try:
+                with _cc_lock:
+                    _cc["circular"] = _cc_fetch_circular()
+            except Exception as e:
+                _ops_err("cc_circular", e)
+            spent = 0
+            for sym in ["NVDA", "MSFT", "ORCL", "AMZN"]:
+                if spent >= av_budget:
+                    break
+                with _cc_lock:
+                    s = _cc["sentiment"].get(sym)
+                if s and time.time() - s.get("fetchedAt", 0) < 20 * 3600:
+                    continue
+                r = _cc_fetch_sentiment(sym)
+                spent += 1
+                if r:
+                    with _cc_lock:
+                        _cc["sentiment"][sym] = r
+                time.sleep(15)         # AV rate limit
+            _cc_save()
+        time.sleep(12 * 3600)
+
+
 MIOS_CYCLE_HOURS = float(os.environ.get("MIOS_CYCLE_HOURS") or 24)
 
 
@@ -9001,7 +9775,7 @@ def _check_portfolio_risk():
 
 def check_alerts():
     for fn in (_check_signal_alerts, _check_setup_alerts, _check_rotation_alerts, _check_pm_alerts,
-               _check_position_alerts, _check_price_alerts, _check_portfolio_risk):
+               _check_cc_alerts, _check_position_alerts, _check_price_alerts, _check_portfolio_risk):
         try:
             fn()
         except Exception as e:
@@ -9175,6 +9949,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(regime_router())
         elif path == "/api/pm":
             self._json(cache_get("pm", 60) or _cache_and_return("pm", pm_desk_view))
+        elif path == "/api/capital_cycle":
+            self._json(cache_get("capital_cycle", 3600) or _cache_and_return("capital_cycle", capital_cycle_view))
+        elif path == "/api/capital_cycle/replay":
+            self._json(cache_get("cc_replay", 6 * 3600) or _cache_and_return("cc_replay", cc_replay))
         elif path == "/api/paper":
             self._json(paper_view())
         elif path == "/api/deepvalue":
@@ -9292,7 +10070,7 @@ def main():
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
-               research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop, pm_loop):
+               research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop, pm_loop, cc_loop):
         threading.Thread(target=_hb_wrap(fn), daemon=True, name=fn.__name__).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

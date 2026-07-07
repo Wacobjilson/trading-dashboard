@@ -129,6 +129,27 @@
   .gd-trow:first-child{border-top:none}
   .gd-trow .t{font-family:monospace;font-size:11px;color:var(--amber);font-weight:600}
   .gd-trow .d{color:var(--muted)} .gd-trow .d b{color:var(--text)}
+  /* ── Capital Cycle tab ── */
+  .cc-gauge{display:flex;align-items:center;gap:16px}
+  .cc-score{font-size:42px;font-weight:700;line-height:1;font-family:monospace}
+  .cc-phase-lab{font-size:17px;font-weight:650}
+  .cc-spark{display:flex;align-items:flex-end;gap:1px;height:34px;margin-top:6px}
+  .cc-spark i{flex:1;background:var(--accent);opacity:.55;min-height:2px;border-radius:1px}
+  .cc-panel{border:1px solid var(--border);border-radius:9px;padding:12px 14px;margin-top:10px;background:var(--panel)}
+  .cc-panel h3{margin:0 0 8px;font-size:13px;letter-spacing:.02em}
+  .cc-panel h3 .na{font-size:10px;color:var(--muted);font-weight:normal;font-family:monospace;text-transform:uppercase;letter-spacing:.08em}
+  .cc-ind{border-top:1px solid var(--border);padding:8px 0;font-size:12px}
+  .cc-ind:first-of-type{border-top:none}
+  .cc-ind .row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .cc-ind .val{font-family:monospace;font-weight:700;font-size:14px}
+  .cc-ind .lab{font-weight:600}
+  .cc-ind .src{margin-left:auto;font-family:monospace;font-size:9.5px;color:var(--muted)}
+  .cc-ind .note{color:var(--muted);font-size:11px;margin-top:2px}
+  .cc-series{display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:4px;font-family:monospace;font-size:10px;color:var(--muted)}
+  .cc-sig{border-left:3px solid var(--border);padding:8px 12px;margin:6px 0;background:var(--panel);border-radius:0 8px 8px 0}
+  .cc-sig.Trigger{border-left-color:var(--down)} .cc-sig.Warning{border-left-color:var(--amber)} .cc-sig.Watch{border-left-color:var(--accent)}
+  .cc-sig .st{font-family:monospace;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
+  .cc-sig.Trigger .st{color:var(--down)} .cc-sig.Warning .st{color:var(--amber)} .cc-sig.Watch .st{color:var(--accent)}
   .scrollx{overflow-x:auto;}
   .sbar{display:inline-block;vertical-align:middle;background:var(--panelAlt);border:1px solid var(--border);border-radius:3px;height:10px;width:64px;position:relative;overflow:hidden;margin-right:6px;}
   .sbar>span{position:absolute;left:0;top:0;bottom:0;}
@@ -190,6 +211,7 @@
   <button data-tab="chart">Chart</button>
   <button data-tab="futures">Futures 15m</button>
   <button data-tab="markets">Markets</button>
+  <button data-tab="capcycle">Capital Cycle</button>
   <button data-tab="guide">Guide</button>
 </nav>
 <div id="countdown" class="cd-bar cd-hidden"></div>
@@ -526,6 +548,27 @@
     </div>
   </section>
 
+  <!-- CAPITAL CYCLE — AI -->
+  <section class="tab" id="tab-capcycle">
+    <div class="card" style="font-size:13px"><span class="badge b-neu">CAPITAL CYCLE · AI</span>
+      &nbsp;A supply-side lens (Marathon / Chancellor's <i>Capital Returns</i>) specialized to detect when the AI
+      capex/equity boom is topping. The tell of a top is <b>maximum capital commitment + peak narrative +
+      deteriorating incremental economics</b> — not price. <b class="amber">Decision-support, not an oracle</b>;
+      it measures the setup, it doesn't time the top. Every number drills to its raw series + timestamp; missing
+      feeds show "no data".</div>
+    <div class="cols cols2">
+      <div class="card" id="cc-phase"><div class="loading">Assembling the capital-cycle picture…</div></div>
+      <div class="card" id="cc-divergence"><div class="loading">…</div></div>
+    </div>
+    <div class="card" id="cc-signals"><h2>Signals — staged Watch → Warning → Trigger</h2><div id="cc-sig-body"><div class="loading">…</div></div></div>
+    <div class="card" id="cc-circular" style="display:none"></div>
+    <div id="cc-panels"></div>
+    <div class="cols cols2">
+      <div class="card" id="cc-replay"><h2>Replay — how the logic behaved through past stress</h2><div id="cc-replay-body"><div class="loading">…</div></div></div>
+      <div class="card" id="cc-gaps"><h2>Data honesty — what's real vs. no-data</h2><div id="cc-gaps-body"><div class="loading">…</div></div></div>
+    </div>
+  </section>
+
   <!-- GUIDE — daily operating flowchart -->
   <section class="tab" id="tab-guide">
     <div class="card">
@@ -674,6 +717,7 @@ function activate(t){
     if(!loaded.news){loadNews();loaded.news=true;}
     if(!loaded.calendar){loadCalendarData();loaded.calendar=true;}else renderCalendar();
   }
+  if(t==="capcycle")loadCapCycle();
 }
 const tabActive=t=>document.getElementById("tab-"+t).classList.contains("active");
 
@@ -2226,6 +2270,84 @@ async function loadMacro(){
     el.innerHTML=`<h2>Macro → sector influence</h2>${reg}<div class="scrollx"><table><thead><tr><th>Proxy</th><th>Price</th><th>1w</th><th>1m</th><th>3m</th><th>Sector influence</th></tr></thead><tbody>${rows}</tbody></table></div>
       <div class="note">${d.note||''}</div>`;
   }catch(e){document.getElementById("macro-insight").innerHTML='<div class="loading">Macro insight failed.</div>';}
+}
+
+// ── CAPITAL CYCLE — AI ──
+const ccPhaseCol=p=>/Contraction|Peak Supply|Abundance/.test(p||'')?'var(--down)':/Trough/.test(p||'')?'var(--amber)':/Recovery|Expansion/.test(p||'')?'var(--up)':'var(--muted)';
+function ccSpark(series){
+  const vals=(series||[]).map(x=>Array.isArray(x)?x[1]:x).filter(v=>typeof v==='number');
+  if(vals.length<2)return'';
+  const lo=Math.min(...vals),hi=Math.max(...vals),rng=hi-lo||1;
+  return `<div class="cc-spark">${vals.slice(-40).map(v=>`<i style="height:${8+(v-lo)/rng*26}px"></i>`).join('')}</div>`;
+}
+function ccInd(i){
+  if(!i.available)return `<div class="cc-ind"><span class="lab">${i.label||''}</span> <span class="muted" style="font-size:11px">no data — ${i.note||''}</span></div>`;
+  const flags=[];
+  if(i.surging)flags.push('<span class="badge b-bear">surging</span>');
+  if(i.elevated||i.euphoric||i.froth||i.spike||i.fragile||i.crack||i.alert)flags.push('<span class="badge b-bear">elevated</span>');
+  const pctl=i.percentile!=null?` · <span class="mono">${i.percentile}th pctile</span>`:'';
+  const extra=i.wideningBps!=null?` · +${i.wideningBps}bps off low`:(i.marginDirection?` · margins ${i.marginDirection}`:'');
+  const ser=(i.series||[]).slice(-14).map(x=>Array.isArray(x)?`${x[0]}:${typeof x[1]==='number'?x[1]:'—'}`:x).join('  ');
+  return `<div class="cc-ind"><div class="row"><span class="val ${dir(typeof i.value==='number'&&i.label&&/ROIC|margin|breadth/i.test(i.label)?i.value:null)}">${typeof i.value==='number'?(Math.abs(i.value)<3&&/YoY|margin|ROIC|Sales|sentiment/i.test(i.label||'')?i.value:i.value):i.value}</span>
+    <span class="lab">${i.label||''}</span> ${flags.join(' ')}${pctl}${extra}
+    <span class="src">${i.source||''}</span></div>
+    <div class="note">${i.note||''}</div>${ccSpark(i.series)}
+    ${ser?`<div class="cc-series">${ser}</div>`:''}</div>`;
+}
+function ccPanel(p){
+  if(!p)return'';
+  const na=p.available?'':'<span class="na">no data</span>';
+  const body=p.available?(p.indicators||[]).map(ccInd).join(''):`<div class="muted" style="font-size:11px">${p.note||'no data'}</div>`;
+  return `<div class="cc-panel"><h3>${p.panel} ${na}</h3>${body}${p.gaps?`<div class="note" style="margin-top:6px">omitted (no free feed): ${p.gaps}</div>`:''}</div>`;
+}
+async function loadCapCycle(){
+  try{
+    const d=await(await fetch(`${API}/api/capital_cycle`)).json();
+    const col=ccPhaseCol(d.phase);
+    const rs=d.riskScore;
+    document.getElementById("cc-phase").innerHTML=
+      `<h2>Capital Cycle phase</h2>
+       <div class="cc-gauge"><div class="cc-score" style="color:${col}">${rs!=null?rs:'—'}<span style="font-size:13px" class="muted">/100 risk</span></div>
+         <div><div class="cc-phase-lab" style="color:${col}">${d.phase}</div><div class="muted" style="font-size:12px">${d.note}</div></div></div>
+       <div class="note">${d.disclaimer}</div>`;
+    // composite contribution breakdown
+    const contribs=(d.contributions||[]).map(c=>`<div style="display:flex;gap:8px;font-size:11px;padding:2px 0"><span style="width:150px" class="muted">${c.factor}</span>
+       <span class="mono" style="width:42px;text-align:right;color:${c.contribution==null?'var(--muted)':c.contribution>=60?'var(--down)':c.contribution>=35?'var(--amber)':'var(--up)'}">${c.contribution==null?'n/d':c.contribution}</span>
+       <span class="muted" style="font-size:10px">w${c.weight} · ${c.detail}</span></div>`).join('');
+    const div=d.divergence||{};
+    document.getElementById("cc-divergence").innerHTML=
+      `<h2>Core signal — capex-return divergence</h2>
+       <div style="font-size:13px;padding:4px 0"><b style="color:${div.surging&&div.deteriorating?'var(--down)':'var(--muted)'}">${div.read||'—'}</b></div>
+       <div class="muted" style="font-size:12px">${(div.conditions||[]).join(' · ')||'accumulating capex & ROIC history'}</div>
+       <div style="margin-top:8px">${contribs}</div>
+       <div class="note">The "returns deteriorating WHILE capital still surges" combination is weighted most — it's what separates a real top from healthy expansion.</div>`;
+    // signals
+    const sigs=(d.signals||[]);
+    document.getElementById("cc-sig-body").innerHTML=sigs.length?sigs.map(s=>
+      `<div class="cc-sig ${s.state}"><span class="st">${s.state}</span> <b>${s.name}</b>
+        <div class="muted" style="font-size:12px;margin-top:2px">${s.conditions}</div>
+        <div class="muted" style="font-size:10px">contributing: ${(s.contributing||[]).join(', ')}</div></div>`).join(''):
+      '<div class="muted" style="padding:6px;font-size:12px">No Watch/Warning/Trigger conditions met — the setup isn\'t flashing yet (a valid, useful answer).</div>';
+    // circular financing — prominent card
+    const circ=(d.panels||[]).find(p=>p.panel&&p.panel.startsWith('Circular'));
+    const cc=document.getElementById("cc-circular");
+    if(circ){cc.style.display='block';cc.innerHTML=`<h2>⚠ Circular / vendor financing <span class="muted" style="font-weight:normal;font-size:11px">(AI-specific, high-priority)</span></h2>${ccPanel(circ)}`;}
+    // remaining panels
+    const order=['Supply','Returns','Valuation','Behavioral','Credit','Breadth','Physical','Capital raising'];
+    const panels=(d.panels||[]).filter(p=>p.panel&&!p.panel.startsWith('Circular'));
+    panels.sort((a,b)=>order.findIndex(o=>a.panel.startsWith(o))-order.findIndex(o=>b.panel.startsWith(o)));
+    document.getElementById("cc-panels").innerHTML=`<div class="cols cols2">${panels.map(ccPanel).join('')}</div>`;
+    // gaps
+    document.getElementById("cc-gaps-body").innerHTML=
+      `<div style="font-size:12px" class="muted">Per the guardrails — these have no credible free feed and are shown as "no data", never faked:</div>
+       <ul style="margin:6px 0 0 16px;font-size:12px;color:var(--muted)">${(d.dataGaps||[]).map(g=>`<li>${g}</li>`).join('')}</ul>`;
+    // replay
+    fetch(`${API}/api/capital_cycle/replay`).then(r=>r.json()).then(rp=>{
+      document.getElementById("cc-replay-body").innerHTML=
+        `<div class="muted" style="font-size:12px">${rp.note||''}</div>
+         <div style="margin-top:6px">${(rp.creditCrackEvents||[]).map(e=>`<div style="font-size:11px;padding:2px 0"><span class="mono amber">${e.date}</span> ${e.signal} — <span class="muted">${e.detail}</span></div>`).join('')||'<span class="muted" style="font-size:11px">no historical crack events in the available window</span>'}</div>`;
+    }).catch(()=>{});
+  }catch(e){document.getElementById("cc-phase").innerHTML='<div class="loading">Capital Cycle module unavailable.</div>';}
 }
 
 // ── keyboard shortcuts: 1-9,0,- switch tabs · / focuses chart symbol ──
