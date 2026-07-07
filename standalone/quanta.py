@@ -5009,11 +5009,22 @@ AI_CFG = {
 _ai_lock = threading.Lock()
 _ai_log = []          # telemetry: last 60 calls (mode, latency, tokens)
 _ai_cache = {}        # prompt-hash -> {"text","ts"} (10-min TTL)
+# A single local model can only generate one response at a time. Without a
+# gate, the agent cycle + PM loop + user drawer calls queue INSIDE Ollama while
+# each request's client timeout runs from send-time — a call can wait 150s then
+# time out before it even starts. The gate serializes access so every call gets
+# the whole model at its natural speed. Acquired per-call (released between the
+# cycle's agents) so a user request can slip in between, not wait 13 min.
+_ollama_gate = threading.Lock()
+# keep_alive keeps the 14B resident between the cycle's sequential calls so it
+# isn't unloaded+reloaded (a reload alone can blow the timeout).
+OLLAMA_KEEPALIVE = os.environ.get("OLLAMA_KEEPALIVE", "30m")
 
 
 def _ollama_chat(messages, opts, stream_cb=None):
     def call(with_think_param):
         body = {"model": opts["model"], "messages": messages, "stream": stream_cb is not None,
+                "keep_alive": OLLAMA_KEEPALIVE,
                 "options": {"temperature": opts["temperature"], "num_ctx": opts["numCtx"],
                             "num_predict": opts["maxTokens"]}}
         if opts.get("jsonMode"):
@@ -5097,11 +5108,17 @@ def ai_chat(messages, mode="ask", stream_cb=None, json_mode=False, max_tokens=No
     last = None
     for attempt in range(opts["retries"] + 1):
         try:
-            res = fn(messages, opts, stream_cb)
+            # Serialize on the single local model. Acquire the gate FIRST so the
+            # provider timeout only covers actual generation, never queue-wait.
+            waited = time.time()
+            with _ollama_gate:
+                queued = time.time() - waited
+                res = fn(messages, opts, stream_cb)
+            res["queuedS"] = round(queued, 1)
             with _ai_lock:
                 _ai_log.append({"ts": int(time.time()), "mode": mode, "model": opts["model"],
                                 "latencyMs": res["latencyMs"], "promptTokens": res["promptTokens"],
-                                "outputTokens": res["outputTokens"]})
+                                "outputTokens": res["outputTokens"], "queuedS": res["queuedS"]})
                 del _ai_log[:-60]
             return res
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
@@ -8156,7 +8173,13 @@ def pm_loop():
         try:
             with _pm_lock:
                 last = _pm["briefAt"]
-            if PM_CYCLE_HOURS > 0 and time.time() - last > PM_CYCLE_HOURS * 3600 and ai_status().get("reachable"):
+            with _agents_lock:
+                cycle_running = _agents_state["running"]
+            # defer if the MIOS cycle is mid-run — no point queuing the PM brief
+            # behind 9 agents on the one local model (the gate would serialize it
+            # anyway, but this keeps the brief timely instead of 13 min stale)
+            if (PM_CYCLE_HOURS > 0 and not cycle_running
+                    and time.time() - last > PM_CYCLE_HOURS * 3600 and ai_status().get("reachable")):
                 out = []
                 ai_run({"mode": "pm-desk", "stream": False}, out.append)
                 brief = "".join(out)
