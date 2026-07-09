@@ -3824,10 +3824,27 @@ def fetch_options_summary(symbol):
             if flip is None or abs(x - spot) < abs(flip - spot):
                 flip = x
     ks = sorted(by_strike)
+    near = [k for k in ks if 0.8 * spot <= k <= 1.2 * spot]   # wide band = the GEX-profile chart
 
-    near = [k for k in ks if 0.8 * spot <= k <= 1.2 * spot]
-    call_wall = max(near, key=lambda k: by_strike[k]["coi"], default=None)
-    put_wall = max(near, key=lambda k: by_strike[k]["poi"], default=None)
+    # Walls = where OI actually pins price NEAR-TERM. Summing 90d OI in a ±20%
+    # band lets far-dated round-number strikes (600/800) dominate and sit
+    # unrealistically far from spot. Restrict to short-dated expiries + a tight
+    # band, and put the call wall above spot / put wall below, so a "wall" means
+    # "where this week's flow clusters", i.e. plausible resistance/support.
+    WALL_DTE, WALL_PCT = 14, 0.08
+    wall_oi = {}
+    for c in con:
+        if c["dte"] <= WALL_DTE and abs(c["k"] / spot - 1.0) <= WALL_PCT:
+            w = wall_oi.setdefault(c["k"], {"coi": 0, "poi": 0})
+            w["coi" if c["cp"] == "C" else "poi"] += c["oi"]
+    if wall_oi:
+        up = [k for k in wall_oi if k >= spot] or list(wall_oi)
+        dn = [k for k in wall_oi if k <= spot] or list(wall_oi)
+        call_wall = max(up, key=lambda k: wall_oi[k]["coi"])
+        put_wall = max(dn, key=lambda k: wall_oi[k]["poi"])
+    else:                                   # illiquid name: fall back to the wide definition
+        call_wall = max(near, key=lambda k: by_strike[k]["coi"], default=None)
+        put_wall = max(near, key=lambda k: by_strike[k]["poi"], default=None)
 
     # front expiry (nearest with >=1 DTE): max pain, expected move, ATM IV, skew
     front = min((c["exp"] for c in con if c["dte"] >= 1), default=None)

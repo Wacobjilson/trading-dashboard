@@ -1387,7 +1387,7 @@ async function loadOptions(){
       card("Net GEX (per 1%)",M(d.netGEX),d.netGEX!=null?(d.netGEX>0?'stabilizing (naive conv.)':'destabilizing (naive conv.)'):'',d.netGEX>0?'up':'down')+
       card("Net DEX",M(d.netDEX),"delta × OI × 100 × spot")+
       card("Gamma flip",d.gammaFlip!=null?fmt(d.gammaFlip):'n/a (net GEX positive at all strikes)',"cum. GEX zero-cross (approx.)")+
-      card("Call / Put wall",`${d.callWall!=null?fmt(d.callWall,0):'—'} / ${d.putWall!=null?fmt(d.putWall,0):'—'}`,"max OI strikes ±20%")+
+      card("Call / Put wall",`${d.callWall!=null?fmt(d.callWall,0):'—'} / ${d.putWall!=null?fmt(d.putWall,0):'—'}`,"max OI ≤14d, ±8% (above/below spot)")+
       card("Max pain (front)",d.maxPain!=null?fmt(d.maxPain,0):'—',`front expiry ${d.expMoveDTE!=null?d.expMoveDTE+'d':''}`)+
       card("Expected move",d.expMovePct!=null?'±'+d.expMovePct+'%':'—',"front ATM straddle / spot")+
       card("P/C ratio",`${d.pcrOI!=null?d.pcrOI.toFixed(2):'—'} OI · ${d.pcrVol!=null?d.pcrVol.toFixed(2):'—'} vol`,"",d.pcrOI!=null?(d.pcrOI<0.9?'up':d.pcrOI>1.2?'down':''):'')+
