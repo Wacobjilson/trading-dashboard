@@ -44,6 +44,22 @@ healthy expansion.
    data-center-draw proxy. GPU lead times / cloud utilization have no feed → no-data.
 9. **Capital raising** — AI-tagged ATM/S-1 issuance count (EDGAR full-text proxy).
 
+## Historical / statistical reference (`CC_REFERENCE`)
+A curated library of **what tops have historically looked like** + the AI
+spend-vs-revenue reality, so the read is framed against known bubble
+signatures, not just live numbers. Analyst-supplied external facts/estimates/
+projections, each tagged by `type` (historical fact / reported / estimate /
+projection / survey / study / derived) — **NOT a live feed and NOT scored into
+the risk number.** Examples: Dotcom (51% of 1999 IPOs tech → NASDAQ −75%, ~29%
+of growth cos survived a decade), Blackstone 2007 (founders cashed out $2.6B →
+−90%), SPACs 2021 (613 raised $160B → −67%/−59%); AI stats ($725B 2026E spend
++77%, ~$110B revenue ≈15% monetized, Deloitte 74%-want/20%-see, MIT 95%-zero-
+ROI, OpenAI −$38.5B 2025 loss / >$100B 2025–29 burn / $852B ≈65× rev). The
+module surfaces these plus a "how today rhymes" synthesis tying the LIVE
+company-level capex-return divergence to the industry-wide gap and the
+insider-cash-out tell. Also injected into the AI PM + morning briefs
+(`AI_PARTS["capcycle"]`) so the PM reasons with the statistics.
+
 ## Composite four-phase model
 `Abundance / Peak Supply` → `Contraction` → `Trough / Scarcity` →
 `Recovery / Expansion`. A 0–100 risk score (weighted contributions, shown

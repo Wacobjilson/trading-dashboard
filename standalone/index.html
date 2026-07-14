@@ -567,6 +567,7 @@
       <div class="card" id="cc-divergence"><div class="loading">…</div></div>
     </div>
     <div class="card" id="cc-signals"><h2>Signals — staged Watch → Warning → Trigger</h2><div id="cc-sig-body"><div class="loading">…</div></div></div>
+    <div class="card" id="cc-reference"><h2>Historical analogs &amp; AI spend-vs-revenue reality</h2><div id="cc-ref-body"><div class="loading">…</div></div></div>
     <div class="card" id="cc-circular" style="display:none"></div>
     <div id="cc-panels"></div>
     <div class="cols cols2">
@@ -2426,6 +2427,28 @@ async function loadCapCycle(){
     const panels=(d.panels||[]).filter(p=>p.panel&&!p.panel.startsWith('Circular'));
     panels.sort((a,b)=>order.findIndex(o=>a.panel.startsWith(o))-order.findIndex(o=>b.panel.startsWith(o)));
     document.getElementById("cc-panels").innerHTML=`<div class="cols cols2">${panels.map(ccPanel).join('')}</div>`;
+    // historical analogs & AI spend/revenue reference
+    const ref=d.reference;
+    if(ref){
+      const typeCol=t=>/fact|reported/.test(t)?'var(--up)':/projection|estimate|derived/.test(t)?'var(--amber)':'var(--muted)';
+      document.getElementById("cc-ref-body").innerHTML=
+        `<div class="cols cols2">
+          <div><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">What tops have looked like</div>
+            ${(ref.analogs||[]).map(a=>`<div style="border-top:1px solid var(--border);padding:6px 0;font-size:12px">
+              <b>${a.episode}</b> <span class="badge b-neu" style="font-size:9px">${a.type}</span>
+              <div class="muted" style="font-size:11px"><b>Top signal:</b> ${a.topSignal}</div>
+              <div class="muted" style="font-size:11px"><b>Outcome:</b> <span class="down">${a.outcome}</span></div>
+              <div style="font-size:11px"><b>Lesson:</b> ${a.lesson}</div></div>`).join('')}</div>
+          <div><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">AI spend vs. revenue reality</div>
+            ${(ref.aiStats||[]).map(s=>`<div style="border-top:1px solid var(--border);padding:5px 0;font-size:12px;display:flex;gap:8px;align-items:baseline">
+              <b class="mono" style="color:${typeCol(s.type)}">${s.value}</b>
+              <span>${s.metric}${s.context?` <span class="muted">(${s.context})</span>`:''}</span>
+              <span class="badge b-neu" style="font-size:8px;margin-left:auto">${s.type}</span></div>`).join('')}</div>
+        </div>
+        <div style="margin-top:8px"><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">How today rhymes</div>
+          <ul style="margin:4px 0 0 16px;font-size:12px">${(ref.rhymes||[]).map(r=>`<li>${r}</li>`).join('')}</ul></div>
+        <div class="note"><b class="amber">Green</b> = reported fact · <b class="amber">amber</b> = estimate/projection (forecast, not fact). ${ref.note}</div>`;
+    }
     // gaps
     document.getElementById("cc-gaps-body").innerHTML=
       `<div style="font-size:12px" class="muted">Per the guardrails — these have no credible free feed and are shown as "no data", never faked:</div>

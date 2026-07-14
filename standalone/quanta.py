@@ -8661,6 +8661,45 @@ def pm_loop():
 # from CC_CONFIG (tune without touching logic). Decision-support, not an oracle.
 # See CAPITAL_CYCLE.md.
 # ═════════════════════════════════════════════════════════════════════════════
+# Curated statistical / historical reference — the "what tops look like" library.
+# These are ANALYST-SUPPLIED external facts/estimates/projections, NOT live
+# feeds. Every item carries its type so forecasts are never read as facts. They
+# frame today's live-computed readings against known bubble signatures.
+CC_REFERENCE = {
+    "analogs": [
+        {"episode": "Dotcom bubble (1999–2002)",
+         "topSignal": "51% of 1999 IPOs were tech — peak issuance + peak concentration + peak narrative",
+         "outcome": "NASDAQ fell 75%+; only ~29% of 1996–2000 emerging-growth companies were still "
+                    "independent public companies a decade later",
+         "lesson": "peak issuance + narrative concentration marks the top, not price", "type": "historical fact"},
+        {"episode": "Blackstone IPO (2007)",
+         "topSignal": "founders cashed out ~$2.6B AT the IPO",
+         "outcome": "stock fell ~90% into the financial crisis",
+         "lesson": "insiders monetizing into the euphoria is a classic top tell", "type": "historical fact"},
+        {"episode": "SPAC boom (2021)",
+         "topSignal": "613 SPACs raised $160B+ — vehicle proliferation on easy capital",
+         "outcome": "2021 cohort avg value −67%; 2022 cohort −59%",
+         "lesson": "financing-vehicle proliferation = late-cycle capital abundance", "type": "historical fact"},
+    ],
+    "aiStats": [
+        {"metric": "Big Tech AI infrastructure spend, 2026", "value": "~$725B", "context": "+77% YoY",
+         "type": "projection"},
+        {"metric": "AI economy revenue (trailing 12m)", "value": "~$110B",
+         "context": "≈15% of Big Tech's annual AI spend alone", "type": "estimate"},
+        {"metric": "AI spend-to-revenue gap", "value": "≈6.6× (only ~15% monetized)",
+         "context": "capital committed vs revenue realized — the capital-cycle gap, industry-wide", "type": "derived"},
+        {"metric": "Corporate AI ROI — Deloitte (n=3,000 leaders)",
+         "value": "74% want AI to grow revenue; only 20% have seen it", "type": "survey"},
+        {"metric": "Corporate AI ROI — MIT study", "value": "95% of AI projects produced zero measurable return",
+         "type": "study"},
+        {"metric": "OpenAI net loss, 2025", "value": "−$38.5B", "type": "reported"},
+        {"metric": "OpenAI projected cash burn, 2025–2029", "value": ">$100B", "type": "projection"},
+        {"metric": "OpenAI valuation", "value": "$852B (~65× revenue)", "type": "reported"},
+    ],
+    "source": "Analyst-curated reference data from external journalistic/academic sources — NOT a live feed. "
+              "Projections/estimates are forecasts, not facts. Used as historical context, not scored live.",
+}
+
 CC_CONFIG = {
     "basket": {
         "hyperscalers": ["MSFT", "GOOGL", "AMZN", "META", "ORCL"],
@@ -9240,6 +9279,30 @@ def _cc_composite():
             "panels": [_cc_capex_panel(), _cc_returns_panel(), val, sent, circ, cred, brd, pwr, iss]}
 
 
+def _cc_reference(div):
+    """Frame today's LIVE readings against the curated historical top signatures
+    and the AI spend/revenue reality. Analyst-supplied context, clearly labeled;
+    it does not move the live risk score."""
+    live = []
+    if div.get("capexYoY") is not None:
+        live.append("live: AI-leader capex %+.0f%% YoY (SEC EDGAR)" % (div["capexYoY"] * 100))
+    live.append("live: the platform measures the same capital-vs-returns gap at the COMPANY level from filings; "
+                "the reference stats below put an INDUSTRY-wide number on it (~$725B spend vs ~$110B revenue).")
+    # which historical signatures rhyme with what we currently detect
+    rhymes = []
+    if div.get("surging"):
+        rhymes.append("capex still surging → rhymes with Dotcom peak-issuance and SPAC capital abundance")
+    rhymes.append("AI monetization ~15% of spend + MIT 95%-zero-ROI → the 'returns not showing up yet' half of "
+                  "every top signature (returns deteriorate while capital surges)")
+    rhymes.append("watch for insider cash-outs / secondary offerings into strength — the Blackstone-2007 tell "
+                  "(the platform's issuance + congressional-selling feeds are where that would appear)")
+    return {"panel": "Historical analogs & AI spend-vs-revenue reality", "available": True, "prominent": True,
+            "analogs": CC_REFERENCE["analogs"], "aiStats": CC_REFERENCE["aiStats"],
+            "liveVsHistory": live, "rhymes": rhymes, "source": CC_REFERENCE["source"],
+            "note": "Curated reference facts/estimates/projections (analyst-supplied, external sources) — NOT a "
+                    "live feed and NOT scored into the risk number. History rhymes; it doesn't repeat on schedule."}
+
+
 CC_SIGNALS = []
 
 
@@ -9297,12 +9360,29 @@ def capital_cycle_view():
             ["composite phase"])
     comp["signals"] = signals
     comp["config"] = CC_CONFIG
+    comp["reference"] = _cc_reference(div)
     comp["disclaimer"] = ("Decision-support, not an oracle. This measures the capital-cycle setup (capital vs "
                           "returns) for the AI complex; it does NOT time the top. Every indicator drills to its "
                           "raw series + timestamp; missing feeds show 'no data', never a fabricated value.")
     comp["dataGaps"] = ["VC/PE deal flow (no free feed)", "issuer-level DC credit spreads (paid; HY proxy used)",
                         "GPU lead times / cloud utilization (no feed)", "quality forward consensus (FMP premium)"]
     return comp
+
+
+def _part_capcycle():
+    v = cache_get("capital_cycle", 3600)
+    base = {"historicalAnalogs": CC_REFERENCE["analogs"], "aiSpendVsRevenue": CC_REFERENCE["aiStats"],
+            "referenceNote": CC_REFERENCE["source"]}
+    if v:
+        base.update({"phase": v.get("phase"), "riskScore": v.get("riskScore"),
+                     "divergence": (v.get("divergence") or {}).get("read"),
+                     "signals": [(s["name"], s["state"]) for s in v.get("signals", [])]})
+    return base
+
+
+AI_PARTS["capcycle"] = ("AI capital-cycle bubble read + historical top analogs + spend/revenue stats", _part_capcycle)
+AI_MODES["pm-desk"]["parts"].append("capcycle")
+AI_MODES["morning"]["parts"].append("capcycle")
 
 
 def cc_replay():
