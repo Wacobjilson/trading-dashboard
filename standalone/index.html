@@ -218,6 +218,7 @@
 <main>
   <!-- INTEL (market intelligence engine — the synthesis view) -->
   <section class="tab active" id="tab-intel">
+    <div class="card" id="today" style="border:1px solid var(--amber)"><div class="loading">Reading the market…</div></div>
     <div class="card" id="intel-regime" style="font-size:13px;padding:10px 16px">Loading regime…</div>
     <div class="card" id="pm-desk" style="font-size:13px"><div class="loading">PM desk warming — reading sector money-flow…</div></div>
     <div class="card" id="intel-cio" style="font-size:13px"><div class="loading">Preparing committee briefing…</div></div>
@@ -1343,8 +1344,46 @@ async function loadRunners(){
       :`<div class="muted" style="padding:8px;font-size:12px">No runners meeting the filter (rel vol ≥3×, move ≥6%, $1–50). ${d.universe?"":"Volume history still warming."} ${d.disclaimer||""}</div>`);
   }catch(e){document.getElementById("run-body").innerHTML='<div class="loading">Runner scanner unavailable.</div>';}
 }
+async function loadToday(){
+  try{
+    const [pm,reg,sig,ema,ode,run]=await Promise.all([
+      fetch(`${API}/api/pm`).then(r=>r.json()).catch(()=>({})),
+      fetch(`${API}/api/regime`).then(r=>r.json()).catch(()=>({})),
+      fetch(`${API}/api/signals`).then(r=>r.json()).catch(()=>({})),
+      fetch(`${API}/api/ema`).then(r=>r.json()).catch(()=>({})),
+      fetch(`${API}/api/ode`).then(r=>r.json()).catch(()=>({})),
+      fetch(`${API}/api/runners`).then(r=>r.json()).catch(()=>({}))]);
+    const regime=(reg.current||{}).primary||pm.regime||'—';
+    const stance=(pm.stance||'neutral');
+    const scol=stance==='risk-on'?'var(--up)':stance==='risk-off'?'var(--down)':'var(--muted)';
+    // concrete entries, highest conviction first
+    const entries=[];
+    (sig.sectors||[]).filter(s=>s.signal==='BUY').forEach(s=>entries.push({tier:'VALIDATED',sym:s.symbol,what:`RSI(2) BUY — oversold in uptrend (RSI2 ${s.rsi2==null?'':s.rsi2.toFixed(0)})`,col:'var(--up)'}));
+    (ema.rows||[]).filter(r=>r.aligned&&(r.daily||{}).ready).forEach(r=>{const p=(r.daily.plan||{});entries.push({tier:'EMA A',sym:r.symbol,what:`9/21 EMA pullback entry ~${fmt(p.entry)} · stop ${fmt(p.stop)} · ${p.rr}R`,col:'var(--amber)'});});
+    (ode.queue||[]).slice(0,2).forEach(o=>entries.push({tier:'SCAN',sym:o.symbol,what:`${o.strategyName} — ${(o.why||'').slice(0,54)}`,col:'var(--muted)'}));
+    (run.candidates||[]).filter(c=>c.score>=70).slice(0,2).forEach(c=>entries.push({tier:'RUNNER',sym:c.symbol,what:`${c.relVol}× vol · ${pct(c.movePct)}${c.catalyst?' · catalyst':''}${c.lowFloat?' · low-float':''}`,col:'var(--down)'}));
+    const ow=(pm.overweight||[]),uw=(pm.underweight||[]);
+    document.getElementById("today").innerHTML=
+      `<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+        <h2 style="margin:0">Today — your one-glance read</h2><span class="muted mono" style="font-size:10px">auto · no input needed · updates live</span></div>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin:8px 0 4px">
+        <div><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">Direction</div>
+          <div style="font-size:18px;font-weight:650;color:${scol}">${stance.toUpperCase()}</div>
+          <div class="muted" style="font-size:11px">regime: ${regime}</div></div>
+        <div><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em">Money flowing</div>
+          <div style="font-size:12px;max-width:42ch">${pm.moneyFlow||'—'}</div>
+          <div style="font-size:11px;margin-top:2px"><span class="up">OW: ${ow.join(', ')||'—'}</span> · <span class="down">UW: ${uw.join(', ')||'—'}</span></div></div>
+      </div>
+      <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-top:6px">Entries right now</div>
+      ${entries.length?entries.map(e=>`<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12.5px;border-top:1px solid var(--border)">
+        <span class="badge" style="background:${e.col}22;color:${e.col};border:1px solid ${e.col}55;font-size:9px">${e.tier}</span>
+        <b class="clk" onclick="openChart('${e.sym}')">${e.sym}</b><span class="muted">${e.what}</span></div>`).join('')
+        :'<div class="muted" style="font-size:12px;padding:4px 0">No high-conviction entry right now — the honest answer is to wait. Setups will alert you via the 🔔 bell (turn on notifications).</div>'}
+      <div class="note">This pulls together the validated RSI(2) signal, the 9/21 EMA scanner, the market-wide opportunity scan, catalyst runners, and the PM-desk direction — automatically. Nothing here needs you to journal or input anything. Validated = act on it; the rest is ranked research context.</div>`;
+  }catch(e){document.getElementById("today").innerHTML='<div class="loading">Today read unavailable.</div>';}
+}
 async function loadIntel(){
-  loadSummary(); loadOpps(); loadAllocation(); loadPMDesk(); loadRunners();
+  loadToday(); loadSummary(); loadOpps(); loadAllocation(); loadPMDesk(); loadRunners();
   if(!_cgHeat)fetch(`${API}/api/congress`).then(r=>r.json()).then(d=>{_cgHeat=d.heat||[];}).catch(()=>{});
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();
