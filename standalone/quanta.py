@@ -361,13 +361,16 @@ def synth_daily(symbol, n=520):
 
 
 def load_bars(symbol):
-    """Fetch daily bars for a symbol (polygon, else synthetic). Returns (bars, source)."""
+    """Fetch daily bars. In PRODUCTION (polygon key, not FORCE_SYNTH) a failed
+    fetch returns (None, None) — the store is NEVER poisoned with synthetic bars
+    that would masquerade as real (zero-trust). Synthetic bars are demo-mode only."""
     if not FORCE_SYNTH and API_KEYS.get("polygon"):
         try:
             return fetch_polygon_daily(symbol), "polygon"
-        except Exception:
-            pass
-    return synth_daily(symbol), "synth"
+        except Exception as e:
+            _ops_err("bars_fetch:%s" % symbol, e)
+            return None, None            # fail honestly; keep prior real bars / retry
+    return synth_daily(symbol), "synth"   # demo mode only
 
 
 def get_bars(symbol):
@@ -376,21 +379,30 @@ def get_bars(symbol):
 
 
 def bars_loop():
-    """Background warmer. Daily bars only change once/day, so refresh slowly and
-    pace Polygon calls to respect the 5 req/min free-tier limit."""
+    """Background warmer. Daily bars change once/day; refresh slowly and pace
+    Polygon to the 5 req/min free tier. On a failed fetch it does NOT overwrite
+    good bars or store synth — it leaves the symbol for a quick retry so a
+    transient rate-limit can't poison the sector data for hours."""
     use_polygon = bool(API_KEYS.get("polygon")) and not FORCE_SYNTH
     while True:
+        missing = False
         for symbol in BAR_UNIVERSE:
             meta = _bars_meta.get(symbol)
-            if meta and (time.time() - meta["updated"]) < 6 * 3600:
+            have_real = symbol in _bars and (meta or {}).get("source") in ("polygon", None) \
+                and (meta or {}).get("source") != "synth"
+            if meta and have_real and (time.time() - meta["updated"]) < 6 * 3600:
                 continue
             bars, src = load_bars(symbol)
+            if bars is None:                 # production fetch failed
+                missing = True
+                continue                     # keep any prior bars; retry shortly
             with _bars_lock:
                 _bars[symbol] = bars
                 _bars_meta[symbol] = {"updated": time.time(), "source": src}
             if use_polygon and src == "polygon":
                 time.sleep(12)  # ≈5 calls/min
-        time.sleep(300)
+        # if rate-limits left symbols un-warmed, retry in 2 min, not 6 h
+        time.sleep(120 if missing else 300)
 
 
 def warm_status():
