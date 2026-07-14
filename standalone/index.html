@@ -226,6 +226,8 @@
       <div id="ode-queue" class="scrollx"><div class="loading">Scanner warming (full-market history backfills ~30 min on first run)…</div></div>
       <details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:12px">strategy library, learning &amp; options discovery</summary>
         <div id="ode-lib" style="font-size:12px;margin-top:6px"></div></details></div>
+    <div class="card"><h2>Catalyst runners — low float · volume · news <span class="muted" id="run-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="run-body" class="scrollx"><div class="loading">Runner scan warming (needs the full-market volume history)…</div></div></div>
     <div class="card" id="intel-summary" style="font-size:13px;white-space:pre-line">Loading market summary…</div>
     <div class="card"><h2>Sector intelligence scores <span class="muted" style="text-transform:none;letter-spacing:0" id="intel-weights"></span></h2>
       <div class="scrollx" id="intel-table"><div class="loading">Scoring sectors…</div></div>
@@ -1320,8 +1322,29 @@ async function loadPMDesk(){
       <div class="note">${d.disclaimer} <button class="mini" onclick="aiOpen('pm-desk');aiGo({mode:'pm-desk'})">✨ full PM brief</button></div>`;
   }catch(e){document.getElementById("pm-desk").innerHTML='<div class="loading">PM desk unavailable.</div>';}
 }
+async function loadRunners(){
+  try{
+    const d=await(await fetch(`${API}/api/runners`)).json();
+    const l=d.learning||{};
+    document.getElementById("run-status").textContent=`· universe ${d.universe||0} names · scanned ${d.scannedAt?ago(d.scannedAt):"never"}`;
+    const rows=(d.candidates||[]);
+    document.getElementById("run-body").innerHTML=(rows.length?
+      `<table><thead><tr><th>Sym</th><th>Score</th><th>Setup</th><th>Rel vol</th><th>Move</th><th>$ vol</th><th>Float (sh)</th><th>Catalyst</th></tr></thead><tbody>
+      ${rows.map(c=>`<tr class="clk" onclick="openChart('${c.symbol}')">
+        <td><b>${c.symbol}</b>${c.microFloat?' <span class="badge b-bear" title="micro float <20M shares">µ-float</span>':c.lowFloat?' <span class="badge b-appr" title="low float <50M shares">low-float</span>':''}</td>
+        <td class="mono amber">${c.score}</td>
+        <td style="font-size:11px;white-space:normal">${c.setup}</td>
+        <td class="mono up">${c.relVol}×</td>
+        <td class="mono ${dir(c.movePct)}">${pct(c.movePct)}</td>
+        <td class="mono muted">${c.dollarVolM}M</td>
+        <td class="mono muted">${c.sharesOutM!=null?c.sharesOutM+'M':'—'}</td>
+        <td style="font-size:10px;white-space:normal">${c.catalyst?`<span class="up">✓ ${c.catalystCount} hdl</span><div class="muted">${(c.catalystHeadline||'').slice(0,60)}</div>`:'<span class="muted">none in 3d</span>'}</td></tr>`).join("")}</tbody></table>
+      <div class="note">${d.scoring}<br><b class="down">${d.disclaimer}</b><br>Gaps: ${d.dataGaps}<br><b>Learning:</b> ${l.note||l.verdict||""}${l.avgRet5d!=null?` — avg 5d ${pct(l.avgRet5d)}, MFE ${pct(l.avgMFE)} / MAE ${pct(l.avgMAE)} (n=${l.n})`:""}</div>`
+      :`<div class="muted" style="padding:8px;font-size:12px">No runners meeting the filter (rel vol ≥3×, move ≥6%, $1–50). ${d.universe?"":"Volume history still warming."} ${d.disclaimer||""}</div>`);
+  }catch(e){document.getElementById("run-body").innerHTML='<div class="loading">Runner scanner unavailable.</div>';}
+}
 async function loadIntel(){
-  loadSummary(); loadOpps(); loadAllocation(); loadPMDesk();
+  loadSummary(); loadOpps(); loadAllocation(); loadPMDesk(); loadRunners();
   if(!_cgHeat)fetch(`${API}/api/congress`).then(r=>r.json()).then(d=>{_cgHeat=d.heat||[];}).catch(()=>{});
   try{
     const d=await(await fetch(`${API}/api/scores`)).json();

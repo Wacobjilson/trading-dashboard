@@ -6874,6 +6874,7 @@ def market_loop():
                 continue
             if rows:
                 _mkt_ingest(di, rows)
+                _runner_ingest(di, rows)   # capture volume for the low-float runner scan
                 added += 1
             time.sleep(14)                 # free-tier pacing, shared budget
         if added:
@@ -6890,7 +6891,267 @@ def market_loop():
                 ode_scan()
             except Exception as e:
                 _ops_err("ode_scan", e)
+            try:
+                runner_scan()
+            except Exception as e:
+                _ops_err("runner_scan", e)
         time.sleep(3600)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CATALYST RUNNER scanner — low-float stocks seeing volume with a fresh news
+# catalyst (the small-cap momentum "runner" hunt). HONEST FRAMING: this is the
+# hardest place to find a real edge — survivorship bias, you often can't get
+# filled, halts, and borrow costs eat the apparent edge. So the scanner SURFACES
+# setups and tracks every one FORWARD to outcome; there is no clean historical
+# backtest (the deep-history store is liquid names only). Treat it as a hunting
+# ground, not a validated system. "Float" is shares-outstanding (Polygon ref) —
+# a proxy for true free float, which isn't in free data. See RUNNERS.md.
+# ─────────────────────────────────────────────────────────────────────────────
+RUNNER_CFG = {"minPrice": 1.0, "maxPrice": 50.0, "relVol": 3.0, "movePct": 0.06,
+              "lowFloatShares": 50e6, "microFloatShares": 20e6, "newsDays": 3}
+_runner_lock = threading.Lock()
+_runner = {"bars": {}, "shares": {}, "news": {}, "candidates": [], "tracked": {}, "scannedAt": None}
+
+
+def _runner_path():
+    return os.path.join(os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__)),
+                        "runners.json")
+
+
+def _runner_save():
+    try:
+        with _runner_lock:
+            body = json.dumps({"shares": _runner["shares"], "news": _runner["news"],
+                               "candidates": _runner["candidates"], "tracked": _runner["tracked"],
+                               "scannedAt": _runner["scannedAt"]})
+        with open(_runner_path() + ".tmp", "w") as f:
+            f.write(body)
+        os.replace(_runner_path() + ".tmp", _runner_path())
+    except OSError as e:
+        _ops_err("runner_save", e)
+
+
+def _runner_load():
+    try:
+        with open(_runner_path()) as f:
+            d = json.load(f)
+        with _runner_lock:
+            _runner.update({k: d.get(k, _runner[k]) for k in ("shares", "news", "candidates", "tracked", "scannedAt")})
+    except (OSError, ValueError):
+        pass
+
+
+def _runner_ingest(date_iso, rows):
+    """Capture (volume, close) per runner-eligible name each day → rolling 25d."""
+    with _runner_lock:
+        for r in rows:
+            sym, c, v = r.get("T"), r.get("c"), r.get("v")
+            if not sym or not c or not v or c < RUNNER_CFG["minPrice"] or c > RUNNER_CFG["maxPrice"]:
+                continue
+            if "." in sym or len(sym) > 5:
+                continue
+            b = _runner["bars"].setdefault(sym, {})
+            b[date_iso] = (v, c)
+            if len(b) > 25:
+                for dk in sorted(b)[:-25]:
+                    del b[dk]
+        # drop names gone quiet (no recent print) to bound memory
+        if len(_runner["bars"]) > 6000:
+            cutoff = sorted({d for b in _runner["bars"].values() for d in b})[-15:]
+            cutset = set(cutoff)
+            for s in [s for s, b in _runner["bars"].items() if not (set(b) & cutset)]:
+                del _runner["bars"][s]
+
+
+def _runner_shares(sym):
+    with _runner_lock:
+        s = _runner["shares"].get(sym)
+    if s and time.time() - s.get("at", 0) < 30 * 86400:
+        return s.get("shares")
+    if FORCE_SYNTH or not API_KEYS.get("polygon"):
+        return None
+    try:
+        d = http_get_json("https://api.polygon.io/v3/reference/tickers/%s?apiKey=%s"
+                          % (urllib.parse.quote(sym), urllib.parse.quote(API_KEYS["polygon"])), timeout=20)
+        sh = (d.get("results") or {}).get("share_class_shares_outstanding") or \
+             (d.get("results") or {}).get("weighted_shares_outstanding")
+    except Exception as e:
+        _ops_err("runner_shares", e)
+        sh = None
+    with _runner_lock:
+        _runner["shares"][sym] = {"shares": sh, "at": time.time()}
+    return sh
+
+
+def _runner_news(sym):
+    with _runner_lock:
+        n = _runner["news"].get(sym)
+    if n and time.time() - n.get("at", 0) < 12 * 3600:
+        return n
+    if not API_KEYS.get("finnhub"):
+        return None
+    frm = (dt.date.today() - dt.timedelta(days=RUNNER_CFG["newsDays"])).isoformat()
+    try:
+        d = http_get_json("%s/company-news?symbol=%s&from=%s&to=%s&token=%s"
+                          % (FINNHUB, urllib.parse.quote(sym), frm, dt.date.today().isoformat(),
+                             urllib.parse.quote(API_KEYS["finnhub"])), timeout=20)
+        items = d if isinstance(d, list) else []
+    except Exception as e:
+        _ops_err("runner_news", e)
+        items = []
+    rec = {"fresh": bool(items), "count": len(items),
+           "top": (items[0].get("headline", "")[:110] if items else None),
+           "at": time.time()}
+    with _runner_lock:
+        _runner["news"][sym] = rec
+    return rec
+
+
+def runner_scan(enrich=12):
+    with _runner_lock:
+        bars = {s: dict(b) for s, b in _runner["bars"].items()}
+    cands = []
+    for sym, b in bars.items():
+        if len(b) < 8:
+            continue
+        dates = sorted(b)
+        tv, tc = b[dates[-1]]
+        prev = [b[d][0] for d in dates[:-1]][-20:]
+        avg = sum(prev) / len(prev) if prev else 0
+        if not avg:
+            continue
+        relvol = tv / avg
+        pc = b[dates[-2]][1]
+        move = (tc / pc - 1) if pc else 0
+        if relvol >= RUNNER_CFG["relVol"] and abs(move) >= RUNNER_CFG["movePct"]:
+            cands.append({"symbol": sym, "price": round(tc, 2), "relVol": round(relvol, 1),
+                          "movePct": round(move * 100, 1), "dollarVolM": round(tv * tc / 1e6, 1),
+                          "asOfDate": dates[-1]})
+    cands.sort(key=lambda x: -(x["relVol"] * abs(x["movePct"])))
+    cands = cands[:enrich]
+    for c in cands:
+        sh = _runner_shares(c["symbol"])
+        c["sharesOutM"] = round(sh / 1e6) if sh else None
+        c["lowFloat"] = sh is not None and sh < RUNNER_CFG["lowFloatShares"]
+        c["microFloat"] = sh is not None and sh < RUNNER_CFG["microFloatShares"]
+        cat = _runner_news(c["symbol"]) or {}
+        c["catalyst"] = cat.get("fresh", False)
+        c["catalystHeadline"] = cat.get("top")
+        c["catalystCount"] = cat.get("count", 0)
+        score = min(45, c["relVol"] * 4) + min(22, abs(c["movePct"]) * 1.4)
+        if c["microFloat"]:
+            score += 26
+        elif c["lowFloat"]:
+            score += 13
+        if c["catalyst"]:
+            score += 22
+        c["score"] = round(score)
+        c["setup"] = ("Low-float runner + fresh catalyst" if (c["lowFloat"] and c["catalyst"]) else
+                      "Catalyst + volume" if c["catalyst"] else
+                      "Low-float volume spike" if c["lowFloat"] else "Volume spike (unconfirmed float)")
+        c["direction"] = "up" if c["movePct"] > 0 else "down"
+    cands.sort(key=lambda x: -x["score"])
+    today = dt.date.today().isoformat()
+    with _runner_lock:
+        tracked = _runner["tracked"]
+        # open forward-tracking on new surfaced runners (score-worthy)
+        for c in cands:
+            key = "%s|%s" % (c["symbol"], c["asOfDate"])
+            if c["score"] >= 45 and key not in tracked:
+                tracked[key] = {"symbol": c["symbol"], "date": c["asOfDate"], "entryPx": c["price"],
+                                "score": c["score"], "setup": c["setup"], "lowFloat": c["lowFloat"],
+                                "catalyst": c["catalyst"], "status": "open",
+                                "mfePct": 0.0, "maePct": 0.0, "retPct": None}
+        # mature: update return/MFE/MAE, close after ~5 trading days
+        for key, t in list(tracked.items()):
+            if t["status"] != "open":
+                continue
+            px = _live_px(t["symbol"])
+            if px and t["entryPx"]:
+                ret = (px / t["entryPx"] - 1) * 100
+                t["retPct"] = round(ret, 1)
+                t["mfePct"] = round(max(t["mfePct"], ret), 1)
+                t["maePct"] = round(min(t["maePct"], ret), 1)
+            age = (dt.date.fromisoformat(today) - dt.date.fromisoformat(t["date"])).days
+            if age >= 7:
+                t["status"] = "closed"
+        if len(tracked) > 600:
+            for k in sorted(tracked, key=lambda k: tracked[k]["date"])[:len(tracked) - 600]:
+                del tracked[k]
+        _runner["candidates"] = cands
+        _runner["scannedAt"] = time.time()
+    _runner_save()
+    return {"ok": True, "candidates": len(cands)}
+
+
+def _runner_learning():
+    with _runner_lock:
+        done = [t for t in _runner["tracked"].values() if t["status"] == "closed" and t.get("retPct") is not None]
+    if len(done) < 20:
+        return {"n": len(done), "note": "runner-edge verdict unlocks at 20 closed outcomes (have %d). Honest "
+                                        "test: do surfaced runners actually go up, or is it hindsight?" % len(done)}
+    hi = [t for t in done if t.get("catalyst")]
+    avg = lambda xs: round(sum(t["retPct"] for t in xs) / len(xs), 1) if xs else None
+    mfe = round(sum(t["mfePct"] for t in done) / len(done), 1)
+    mae = round(sum(t["maePct"] for t in done) / len(done), 1)
+    verdict = ("interesting — catalyst runners show positive forward returns; propose a pre-registered test"
+               if avg(done) and avg(done) > 0 and abs(mfe) > abs(mae) else
+               "no forward edge — surfaced runners are as likely to fade as run (classic hindsight trap)")
+    return {"n": len(done), "avgRet5d": avg(done), "avgWithCatalyst": avg(hi),
+            "avgMFE": mfe, "avgMAE": mae, "verdict": verdict,
+            "note": "forward-tracked from surfacing (no entry-fill assumption). Grades the SCANNER, not a "
+                    "tradable backtest — fills/halts/borrow are why this can't be cleanly backtested."}
+
+
+def runners_view():
+    with _runner_lock:
+        cands = [dict(c) for c in _runner["candidates"]]
+        scanned = _runner["scannedAt"]
+        universe = len(_runner["bars"])
+    return {"candidates": cands, "scannedAt": scanned, "universe": universe,
+            "config": RUNNER_CFG, "learning": _runner_learning(),
+            "scoring": "score = relVol + |move| + low-float bonus (micro <20M / low <50M shares) + fresh-catalyst "
+                       "bonus. 'Float' = shares outstanding (Polygon ref), a PROXY for true free float.",
+            "dataGaps": "true free float, short interest, borrow/locate, and halt status have no free feed — a "
+                        "real runner playbook needs all four; treat surfaced names as a starting watchlist only.",
+            "disclaimer": "Low-float momentum runners are the hardest place to find a real edge: survivorship, "
+                          "you often can't get filled, halts, and borrow costs. This SURFACES setups and tracks "
+                          "them forward — it is a hunting ground, NOT a validated system. Never chase; confirm "
+                          "float/borrow/halts on your broker."}
+
+
+def runner_loop():
+    _runner_load()
+    time.sleep(800)
+    while True:
+        try:
+            # bootstrap: the market store may already be backfilled (so market_loop
+            # won't re-fetch), but _runner needs its own recent volume depth — seed
+            # ~15 grouped days once.
+            with _runner_lock:
+                depth = max((len(b) for b in _runner["bars"].values()), default=0)
+            if depth < 8 and API_KEYS.get("polygon") and not FORCE_SYNTH:
+                day, got, probe = dt.date.today() - dt.timedelta(days=1), 0, 0
+                while got < 15 and probe < 30:
+                    probe += 1
+                    di = day.isoformat()
+                    day -= dt.timedelta(days=1)
+                    if dt.date.fromisoformat(di).weekday() >= 5:
+                        continue
+                    try:
+                        rows = fetch_grouped_daily(di)
+                        if rows:
+                            _runner_ingest(di, rows)
+                            got += 1
+                    except Exception as e:
+                        _ops_err("runner_seed", e)
+                    time.sleep(14)
+            if _runner.get("bars"):
+                runner_scan()
+        except Exception as e:
+            _ops_err("runner_loop", e)
+        time.sleep(3 * 3600)
 
 
 # ── strategy library: modular, each with an explicit validation stage ───────
@@ -10152,6 +10413,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(ops_view())
         elif path == "/api/ode":
             self._json(cache_get("ode", 300) or _cache_and_return("ode", ode_view))
+        elif path == "/api/runners":
+            self._json(cache_get("runners", 300) or _cache_and_return("runners", runners_view))
         elif path == "/api/verify":
             self._json(cache_get("verify", 120) or _cache_and_return("verify", verify_view))
         elif path == "/api/falsification":
@@ -10281,7 +10544,8 @@ def main():
     print("  open     : http://localhost:%d/" % PORT)
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
-               research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop, pm_loop, cc_loop):
+               research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop, pm_loop, cc_loop,
+               runner_loop):
         threading.Thread(target=_hb_wrap(fn), daemon=True, name=fn.__name__).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

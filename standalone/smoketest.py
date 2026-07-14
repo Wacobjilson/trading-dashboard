@@ -35,7 +35,7 @@ VIEWS = [
     "government_view", "director_view", "decisions_view", "positions_view",
     "market_summary", "agents_view", "ops_view", "ode_view",
     "verify_view", "deepvalue_view", "falsification_view", "regime_router", "paper_view",
-    "pm_desk_view", "capital_cycle_view", "cc_replay", "ema_scan_view",
+    "pm_desk_view", "capital_cycle_view", "cc_replay", "ema_scan_view", "runners_view",
 ]
 
 failures = []
