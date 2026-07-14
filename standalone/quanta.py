@@ -3519,6 +3519,109 @@ def signals():
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 9/21 EMA swing strategy — trend + pullback engine (daily/weekly + intraday).
+# Rules: EMA9 > EMA21 = uptrend. Best swing entry = a pullback INTO the 9–21 EMA
+# zone within an established trend, then continuation; stop beyond the 21 EMA,
+# exit on a 9-below-21 cross. Multi-timeframe (weekly trend + daily trigger).
+# This is DESCRIPTIVE scanning until it survives the falsification gate (it is
+# entered in the Strategy Zoo so you can see its real out-of-sample verdict).
+# ─────────────────────────────────────────────────────────────────────────────
+def _ema_state(bars):
+    """9/21 EMA swing state for one OHLC series (any timeframe)."""
+    if not bars or len(bars) < 25:
+        return None
+    c = [b["c"] for b in bars]
+    e9s, e21s = ema_series(c, 9), ema_series(c, 21)
+    if e9s[-1] is None or e21s[-1] is None:
+        return None
+    e9, e21, price = e9s[-1], e21s[-1], c[-1]
+    bull = e9 > e21
+    # bars since the last 9/21 cross
+    since = 1
+    for i in range(len(c) - 1, 1, -1):
+        if e9s[i] is None or e9s[i - 1] is None:
+            break
+        if (e9s[i] > e21s[i]) != (e9s[i - 1] > e21s[i - 1]):
+            break
+        since += 1
+    d9 = (price / e9 - 1) * 100          # % above/below the fast EMA
+    d21 = (price / e21 - 1) * 100
+    spread = (e9 / e21 - 1) * 100        # 9-vs-21 spread (trend strength)
+    av = atr(bars, 14) or (price * 0.02)
+    inzone = min(e9, e21) - 0.15 * av <= price <= max(e9, e21) + 0.15 * av
+    # classify the setup
+    if bull:
+        if since <= 3:
+            setup, note = "Fresh bull cross", "9 EMA just crossed above 21 — new uptrend; wait for the first pullback"
+        elif inzone or (price >= e21 and d9 <= 0.4):
+            setup, note = "Bull pullback — ENTRY ZONE", "uptrend pulled back into the 9–21 EMA zone; the swing entry"
+        elif price < e21:
+            setup, note = "Trend at risk", "price below the 21 EMA in an uptrend — wait for reclaim or a cross-down"
+        elif d9 > 2.5:
+            setup, note = "Trending up (extended)", "strong uptrend but stretched above the 9 EMA — chase risk"
+        else:
+            setup, note = "Trending up", "healthy uptrend riding the 9 EMA"
+    else:
+        if since <= 3:
+            setup, note = "Fresh bear cross", "9 EMA just crossed below 21 — new downtrend"
+        elif inzone or (price <= e21 and d9 >= -0.4):
+            setup, note = "Bear pullback (short zone)", "downtrend rallied into the 9–21 EMA zone"
+        elif price > e21:
+            setup, note = "Downtrend weakening", "price back above the 21 EMA in a downtrend"
+        else:
+            setup, note = "Trending down", "downtrend riding below the 9 EMA"
+    ready = "ENTRY ZONE" in setup
+    # entry/stop/target for a long swing (bull pullback)
+    plan = None
+    if bull:
+        stop = round(e21 - 1.0 * av, 2)
+        entry = round(price, 2)
+        risk = entry - stop
+        plan = {"direction": "long", "entry": entry, "stop": stop,
+                "target": round(entry + 2 * risk, 2) if risk > 0 else None,
+                "rr": round((2 * risk) / risk, 1) if risk > 0 else None}
+    return {"trend": "up" if bull else "down", "setup": setup, "note": note, "ready": ready,
+            "ema9": round(e9, 2), "ema21": round(e21, 2), "price": round(price, 2),
+            "distEma9Pct": round(d9, 2), "distEma21Pct": round(d21, 2),
+            "spreadPct": round(spread, 2), "barsSinceCross": since, "plan": plan}
+
+
+def ema_scan_one(symbol, tf="daily"):
+    daily = get_bars(symbol)
+    if not daily:
+        return None
+    bars = resample_weekly(daily) if tf == "weekly" else daily
+    return _ema_state(bars)
+
+
+def ema_scan_view():
+    """9/21 EMA swing scan across the sector ETFs — weekly trend as the filter,
+    daily setup as the trigger (align both for the highest-quality swings)."""
+    rows = []
+    for sym, name in SECTORS:
+        dd = ema_scan_one(sym, "daily")
+        wk = ema_scan_one(sym, "weekly")
+        if not dd:
+            rows.append({"symbol": sym, "name": name, "warming": True})
+            continue
+        aligned = bool(wk and dd["trend"] == wk["trend"])
+        rows.append({"symbol": sym, "name": name, "daily": dd, "weekly": wk,
+                     "aligned": aligned,
+                     "grade": ("A — weekly+daily aligned & ready" if aligned and dd["ready"]
+                               else "B — daily ready (weekly not aligned)" if dd["ready"]
+                               else "trend only")})
+    order = {"Bull pullback — ENTRY ZONE": 0, "Fresh bull cross": 1, "Bear pullback (short zone)": 1,
+             "Fresh bear cross": 2}
+    rows.sort(key=lambda r: (not r.get("aligned", False),
+                             order.get((r.get("daily") or {}).get("setup"), 5)))
+    return {"rows": rows, "rule": "EMA9>EMA21 = uptrend. Highest-quality swing = weekly trend up + daily "
+                                   "pullback into the 9–21 EMA zone. Stop beyond the 21 EMA, exit on a 9<21 cross.",
+            "timeframes": "daily & weekly here; 15-min / 5-min EMAs are on the Chart tab (switch timeframe) and "
+                          "the Futures tab.",
+            "status": "DESCRIPTIVE scan — see the Strategy Zoo (Research → Falsification) for its out-of-sample verdict"}
+
+
 def chart_data(symbol, tf="daily", n=120):
     bars, pivots = pivots_for(symbol, tf)
     if not bars:
@@ -3531,6 +3634,10 @@ def chart_data(symbol, tf="daily", n=120):
     def sma_series(period):
         return [round(sum(closes[i - period + 1:i + 1]) / period, 2) if i >= period - 1 else None
                 for i in range(offset, len(bars))]
+
+    def ema_win(period):                 # EMA over full history, sliced to the shown window
+        full = ema_series(closes, period)
+        return [round(v, 2) if v is not None else None for v in full[offset:]]
 
     # pivots within the shown window (x = index in show)
     pv = [{"x": i - offset, "price": round(p, 2), "type": t} for (i, p, t) in pivots if i >= offset]
@@ -3547,7 +3654,8 @@ def chart_data(symbol, tf="daily", n=120):
             avwap[i - offset] = round(cpv / cv, 2)
     return {"symbol": symbol, "tf": tf, "ok": a.get("ok", False), "setup": a,
             "bars": show, "sma20": sma_series(20), "sma50": sma_series(50), "pivots": pv,
-            "avwap": avwap,
+            "avwap": avwap, "ema9": ema_win(9), "ema21": ema_win(21),
+            "ema": ema_scan_one(symbol, tf),   # 9/21 EMA swing state for this timeframe
             "source": _bars_meta.get(symbol, {}).get("source", "?")}
 
 
@@ -3619,12 +3727,13 @@ def synth_intraday(proxy, days=20):
     return bars
 
 
-def get_intraday(proxy):
-    c = cache_get("intra:" + proxy, 300)
+def get_intraday(proxy, mult=15):
+    ck = "intra:%s:%d" % (proxy, mult)
+    c = cache_get(ck, 300)
     if c is not None:
         return c
-    b = fetch_intraday(proxy)
-    cache_set("intra:" + proxy, b)
+    b = fetch_intraday(proxy, mult=mult)
+    cache_set(ck, b)
     return b
 
 
@@ -3655,9 +3764,9 @@ def _session_levels(sb):
     return vwap, max(b["h"] for b in orb), min(b["l"] for b in orb)
 
 
-def futures_state(fut):
+def futures_state(fut, mult=15):
     sym, name, proxy = fut
-    bars = get_intraday(proxy)
+    bars = get_intraday(proxy, mult)
     sess = _rth_sessions(bars)
     if not sess:
         return {"symbol": sym, "name": name, "proxy": proxy, "warming": True}
@@ -3667,7 +3776,8 @@ def futures_state(fut):
     vwap, orh, orl = _session_levels(sb)
     prior = sess[-2][1] if len(sess) >= 2 else None
     e9 = ema_series(closes_all, 9)[-1]
-    e20 = ema_series(closes_all, 20)[-1]
+    e20 = ema_series(closes_all, 21)[-1]     # 9/21 EMA strategy
+    ema = _ema_state(bars)                    # intraday 9/21 swing setup
     r2 = rsi(closes_all, 2)
     price = closes[-1]
     above_vwap = price > vwap
@@ -3687,21 +3797,23 @@ def futures_state(fut):
         "priorHigh": round(max(b["h"] for b in prior), 2) if prior else None,
         "priorLow": round(min(b["l"] for b in prior), 2) if prior else None,
         "priorClose": round(prior[-1]["c"], 2) if prior else None,
-        "ema9": round(e9, 2) if e9 else None, "ema20": round(e20, 2) if e20 else None,
+        "ema9": round(e9, 2) if e9 else None, "ema21": round(e20, 2) if e20 else None,
         "emaTrend": "up" if (e9 and e20 and e9 > e20) else "down",
+        "emaSetup": (ema or {}).get("setup"), "emaReady": (ema or {}).get("ready"),
         "rsi2": round(r2, 1) if r2 is not None else None, "bias": bias, "rank": rank,
+        "tf": "%dm" % mult,
         "source": _intraday_src.get(proxy, "synth" if (FORCE_SYNTH or not API_KEYS.get("polygon")) else "polygon"),
     }
 
 
-def futures_summary():
-    return {"instruments": [futures_state(f) for f in FUTURES]}
+def futures_summary(mult=15):
+    return {"instruments": [futures_state(f, mult) for f in FUTURES], "tf": "%dm" % mult}
 
 
-def futures_chart(sym, nsess=2):
+def futures_chart(sym, nsess=2, mult=15):
     fut = next((f for f in FUTURES if f[0] == sym.upper()), FUTURES[0])
     proxy = fut[2]
-    bars = get_intraday(proxy)
+    bars = get_intraday(proxy, mult)
     sess = _rth_sessions(bars)
     if not sess:
         return {"symbol": sym, "ok": False, "reason": "warming"}
@@ -3716,13 +3828,13 @@ def futures_chart(sym, nsess=2):
             if j == 0 and si > 0:
                 new_session.append(len(flat))
             flat.append(b)
-    st = futures_state(fut)
+    st = futures_state(fut, mult)
     closes = [b["c"] for b in flat]
     e9 = ema_series([b["c"] for b in bars], 9)
-    e20 = ema_series([b["c"] for b in bars], 20)
+    e21 = ema_series([b["c"] for b in bars], 21)
     tail = len(flat)
     return {"symbol": sym, "proxy": proxy, "ok": True, "bars": flat, "vwap": vwap_series,
-            "newSession": new_session, "ema9": e9[-tail:], "ema20": e20[-tail:],
+            "newSession": new_session, "ema9": e9[-tail:], "ema21": e21[-tail:], "tf": "%dm" % mult,
             "orh": st.get("orh"), "orl": st.get("orl"),
             "priorHigh": st.get("priorHigh"), "priorLow": st.get("priorLow"), "state": st}
 
@@ -6859,7 +6971,22 @@ def _strat_volexp(c, h, l, v):
     return None
 
 
+def _strat_ema921(c, h, l, v):
+    if len(c) < 30:
+        return None
+    e9, e21 = ema_series(c, 9), ema_series(c, 21)
+    if not e9[-1] or not e21[-1]:
+        return None
+    if e9[-1] > e21[-1] and e21[-1] * 0.98 <= c[-1] <= e21[-1] * 1.015:   # uptrend, pullback to 21 EMA
+        return {"technical": 62, "why": "9/21 EMA uptrend, price pulled back to the 21 EMA (swing entry)",
+                "invalidation": "close below the 21 EMA (%.2f)" % e21[-1], "level": round(e21[-1], 2)}
+    return None
+
+
 STRATEGIES = {
+    "ema921-pullback": {"name": "9/21 EMA trend pullback", "fn": _strat_ema921,
+                        "stage": "exploratory — the user's 9/21 EMA strategy; see the Falsification gate for its OOS verdict",
+                        "entry": "EMA9>EMA21 uptrend, price pulls back to the 21 EMA", "exit": "9<21 cross / close below 21 EMA"},
     "rsi2-pullback": {"name": "RSI(2) mean reversion", "fn": _strat_rsi2,
                       "stage": "production on sector ETFs (EXP-12); EXPLORATORY on single stocks — not yet validated there",
                       "entry": "RSI(2)<10 above long MA", "exit": "close above 5d MA (per EXP-12 spec)"},
@@ -7702,7 +7829,37 @@ def _z_breakout(m, cost, look=40, hold=15):
     return trades
 
 
+def _z_ema921(m, cost, hold=15):
+    """9/21 EMA trend-pullback. Long when EMA9>EMA21 (uptrend) AND price pulls
+    back into/near the 21 EMA, then continues; exit on a fixed hold or a 9<21
+    cross. The user's requested strategy — put through the same gate as the
+    rest, so its real out-of-sample edge is measured, not assumed."""
+    trades = []
+    dates = m["dates"]
+    for sym, c in m["C"].items():
+        e9, e21 = ema_series(c, 9), ema_series(c, 21)
+        i = 260
+        while i < len(c) - hold - 1:
+            if (e9[i] and e21[i] and e9[i] > e21[i]                 # uptrend
+                    and c[i] <= e21[i] * 1.01 and c[i] >= e21[i] * 0.98):   # pullback into the 21 EMA
+                j = i + 1
+                # exit on a 9<21 cross or after the max hold
+                while j < len(c) - 1 and j - i < hold and e9[j] and e21[j] and e9[j] >= e21[j]:
+                    j += 1
+                trades.append({"sym": sym, "i": i, "exit_i": j, "date": dates[j],
+                               "ret": (c[j] / c[i] - 1) * 100 - cost})
+                i = j + 1
+            else:
+                i += 1
+    return trades
+
+
 STRATEGY_ZOO = {
+    "ema921": {"name": "9/21 EMA trend-pullback", "fn": _z_ema921, "holdHint": 15,
+               "rationale": "In an established EMA-defined uptrend, pullbacks to the 21 EMA are where trend "
+                            "followers re-add and dip buyers step in, so the trend tends to resume from there.",
+               "otherSide": "Short-term profit-takers and mean-reversion sellers fading the pullback — the bet is "
+                            "that the higher-timeframe trend overpowers them."},
     "rsi2": {"name": "Short-horizon mean reversion (RSI2)", "fn": _z_rsi2, "holdHint": 5,
              "rationale": "Oversold liquid ETFs in an uptrend bounce as forced/again sellers exhaust and "
                           "liquidity providers are paid to absorb the imbalance.",
@@ -9739,6 +9896,37 @@ def _check_position_alerts():
                                % (stp, adverse / risk * 100, px), "warn", px, key="near-stop-%d" % p["id"])
 
 
+_prev_ema = {}
+
+
+def _check_ema_alerts():
+    """9/21 EMA swing alerts: fresh crosses and pullback-into-EMA entry zones on
+    the daily sector ETFs (weekly-aligned entries flagged highest quality)."""
+    try:
+        scan = cache_get("ema", 120) or _cache_and_return("ema", ema_scan_view)
+    except Exception:
+        return
+    for r in scan.get("rows", []):
+        d = r.get("daily")
+        if not d:
+            continue
+        sym, setup = r["symbol"], d["setup"]
+        prev = _prev_ema.get(sym)
+        _prev_ema[sym] = setup
+        if setup == prev:
+            continue
+        if d["ready"]:                       # pullback entry zone
+            q = "A-grade (weekly aligned)" if r.get("aligned") else "B-grade"
+            plan = d.get("plan") or {}
+            push_alert("ema", sym, "9/21 EMA %s — %s. entry ~%.2f · stop %.2f%s. Descriptive setup, not a validated signal."
+                       % (setup, q, plan.get("entry") or d["price"], plan.get("stop") or 0,
+                          " · target %.2f" % plan["target"] if plan.get("target") else ""),
+                       "setup", d["price"], dedupe_hours=24, key="ema-ready-" + sym)
+        elif setup in ("Fresh bull cross", "Fresh bear cross"):
+            push_alert("ema", sym, "9/21 EMA %s on %s — %s" % (setup, sym, d["note"]),
+                       "info" if "bull" in setup else "warn", d["price"], dedupe_hours=48, key="ema-cross-" + sym)
+
+
 _prev_model = []
 
 
@@ -9791,8 +9979,9 @@ def _check_portfolio_risk():
 
 
 def check_alerts():
-    for fn in (_check_signal_alerts, _check_setup_alerts, _check_rotation_alerts, _check_pm_alerts,
-               _check_cc_alerts, _check_position_alerts, _check_price_alerts, _check_portfolio_risk):
+    for fn in (_check_signal_alerts, _check_setup_alerts, _check_ema_alerts, _check_rotation_alerts,
+               _check_pm_alerts, _check_cc_alerts, _check_position_alerts, _check_price_alerts,
+               _check_portfolio_risk):
         try:
             fn()
         except Exception as e:
@@ -9842,9 +10031,14 @@ class Handler(BaseHTTPRequestHandler):
             sym = (qs.get("symbol", ["SPY"])[0]).upper()
             self._json(chart_data(sym, tf))
         elif path == "/api/futures":
-            self._json(cache_get("futures", 60) or _cache_and_return("futures", futures_summary))
+            fmult = 5 if qs.get("tf", ["15m"])[0] == "5m" else 15
+            self._json(cache_get("futures:%d" % fmult, 60) or
+                       _cache_and_return("futures:%d" % fmult, lambda: futures_summary(fmult)))
         elif path == "/api/futures_chart":
-            self._json(futures_chart((qs.get("symbol", ["ES"])[0]).upper()))
+            fmult = 5 if qs.get("tf", ["15m"])[0] == "5m" else 15
+            self._json(futures_chart((qs.get("symbol", ["ES"])[0]).upper(), mult=fmult))
+        elif path == "/api/ema":
+            self._json(cache_get("ema", 120) or _cache_and_return("ema", ema_scan_view))
         elif path == "/api/news":
             self._json(cache_get("news", 1e9) or fetch_news())
         elif path == "/api/calendar":

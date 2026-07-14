@@ -253,6 +253,9 @@
         into the last hour to see a BUY forming before the close.
         Mean-reversion: works in bull/range markets, vulnerable in crashes (the 200-SMA filter is the guardrail).
         Not advice; size small.</div></div>
+    <div class="card"><h2>9/21 EMA swing scan — sector ETFs <span class="muted" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0">(weekly trend + daily trigger)</span></h2>
+      <div id="ema-table"><div class="loading">Scanning 9/21 EMAs…</div></div>
+      <div class="note" id="ema-note"></div></div>
   </section>
 
   <!-- ROTATION -->
@@ -515,12 +518,12 @@
       <b class="amber">This is context, NOT a backtested signal</b> like the daily Signals tab — bias shows
       where price sits vs VWAP and the opening range. Data is delayed.
     </div>
-    <div class="card"><h2>Intraday snapshot</h2><div id="fut-table"><div class="loading">Loading…</div></div></div>
+    <div class="card"><h2>Intraday snapshot <span class="seg" id="fut-tf" style="float:right"><button data-m="15m" class="on">15m</button><button data-m="5m">5m</button></span></h2><div id="fut-table"><div class="loading">Loading…</div></div></div>
     <div class="card">
       <div class="ctl"><span class="seg" id="fut-sel"></span></div>
       <div id="fut-chart"><div class="loading">Pick an instrument…</div></div>
-      <div class="note">15-min candles · <span class="amber">VWAP</span> (amber) · EMA9 (blue) / EMA20 (purple) ·
-        opening-range hi/lo (dashed) · prior-day hi/lo (dotted) · vertical line = new session.</div>
+      <div class="note"><span id="fut-tf-lbl">15-min</span> candles · <span class="amber">VWAP</span> (amber) · <span style="color:#f5a623">EMA9</span> / <span style="color:#e0507a">EMA21</span> ·
+        opening-range hi/lo (dashed) · prior-day hi/lo (dotted) · vertical line = new session. The <b>9/21 EMA setup</b> column shows the intraday trend/pullback state.</div>
     </div>
   </section>
 
@@ -723,7 +726,28 @@ const tabActive=t=>document.getElementById("tab-"+t).classList.contains("active"
 
 // ── SIGNALS (RSI2 mean-reversion) ──
 const sigBadge=s=>{const c=s==="BUY"?"b-ready":s==="Arming"?"b-appr":"b-neu";return `<span class="badge ${c}">${s}</span>`;};
+const emaSetupBadge=s=>{const c=/ENTRY ZONE/.test(s)?'b-ready':/Fresh bull/.test(s)?'b-appr':/Fresh bear|Trend at risk|Bear/.test(s)?'b-bear':/Trending up/.test(s)?'b-long':'b-neu';return `<span class="badge ${c}">${s}</span>`;};
+async function loadEMA(){
+  try{
+    const d=await(await fetch(`${API}/api/ema`)).json();
+    const rows=(d.rows||[]).filter(r=>!r.warming);
+    if(!rows.length){document.getElementById("ema-table").innerHTML='<div class="loading">Warming bars…</div>';return;}
+    const head="<thead><tr><th>Grade</th><th>Sector</th><th>Weekly</th><th>Daily setup</th><th>Price</th><th>EMA9 / EMA21</th><th>vs 21</th><th>Plan (long)</th></tr></thead>";
+    const body="<tbody>"+rows.map(r=>{const dd=r.daily,wk=r.weekly||{},p=(dd.plan||{});return`<tr class="clk" onclick="openChart('${r.symbol}')">
+      <td>${r.aligned?'<span class="badge b-ready">A</span>':dd.ready?'<span class="badge b-appr">B</span>':'<span class="muted">—</span>'}</td>
+      <td><b>${r.symbol}</b> <span class="muted" style="font-size:11px">${r.name}</span></td>
+      <td><span class="${wk.trend==='up'?'up':wk.trend==='down'?'down':'muted'}">${wk.trend||'—'}</span></td>
+      <td>${emaSetupBadge(dd.setup)}</td>
+      <td class="mono">${fmt(dd.price)}</td>
+      <td class="mono muted" style="font-size:11px">${fmt(dd.ema9)} / ${fmt(dd.ema21)}</td>
+      <td class="mono ${dir(dd.distEma21Pct)}" style="font-size:11px">${pct(dd.distEma21Pct)}</td>
+      <td class="mono muted" style="font-size:11px">${dd.ready&&p.entry?`${fmt(p.entry)} · stop ${fmt(p.stop)} · tgt ${fmt(p.target)} · ${p.rr}R`:'—'}</td></tr>`;}).join("")+"</tbody>";
+    document.getElementById("ema-table").innerHTML=`<table>${head}${body}</table>`;
+    document.getElementById("ema-note").innerHTML=`<b>Grade A</b> = weekly trend and daily setup aligned in the 9–21 EMA entry zone (highest quality). ${d.rule} <br>${d.timeframes} <span class="amber">${d.status}</span>`;
+  }catch(e){document.getElementById("ema-table").innerHTML='<div class="loading">EMA scan unavailable.</div>';}
+}
 async function loadSignals(){
+  loadEMA();
   try{
     const d=await(await fetch(`${API}/api/signals`)).json();
     const e=d.edge||{};
@@ -970,6 +994,7 @@ function drawChart(d,livePx){
   // SMA polylines
   const poly=(arr,col)=>{let pts=arr.map((v,i)=>v==null?null:`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean).join(" ");return pts?`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.2" opacity=".9"/>`:"";};
   g+=poly(d.sma20,"#3b82f6"); g+=poly(d.sma50,"#a855f7"); g+=poly(d.avwap,"#2dd4bf");
+  g+=poly(d.ema9,"#f5a623",1.6); g+=poly(d.ema21,"#e0507a",1.6);   // 9/21 EMA strategy
   // ZigZag pivots + connecting line (the detected swing structure)
   const pv=d.pivots||[];
   if(pv.length){
@@ -977,7 +1002,7 @@ function drawChart(d,livePx){
     g+=`<polyline points="${pts}" fill="none" stroke="#8893a3" stroke-width="1" opacity=".55"/>`;
     pv.forEach(p=>{const col=p.type==='H'?"var(--down)":"var(--up)";g+=`<circle cx="${X(p.x).toFixed(1)}" cy="${Y(p.price).toFixed(1)}" r="3" fill="${col}"/>`;});
   }
-  g+=`<text x="${padL+2}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+54}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text><text x="${padL+106}" y="${H-6}" fill="#2dd4bf" font-size="10">AVWAP (last pivot)</text><text x="${padL+214}" y="${H-6}" fill="#8893a3" font-size="10">ZigZag swings</text>`;
+  g+=`<text x="${padL+2}" y="${H-6}" fill="#f5a623" font-size="10">EMA9</text><text x="${padL+42}" y="${H-6}" fill="#e0507a" font-size="10">EMA21</text><text x="${padL+90}" y="${H-6}" fill="#3b82f6" font-size="10">SMA20</text><text x="${padL+140}" y="${H-6}" fill="#a855f7" font-size="10">SMA50</text><text x="${padL+190}" y="${H-6}" fill="#2dd4bf" font-size="10">AVWAP</text><text x="${padL+238}" y="${H-6}" fill="#8893a3" font-size="10">ZigZag</text>`;
   // live price tag on the right axis
   if(livePx!=null&&livePx>=lo&&livePx<=hi){
     const y=Y(livePx);
@@ -993,16 +1018,18 @@ function drawChart(d,livePx){
 // ── FUTURES 15-min ──
 let futSym="ES", futSelBuilt=false;
 const biasBadge=b=>{const c=/^Long/.test(b)?"b-ready":/^Short/.test(b)?"b-bear":/Bull/.test(b)?"b-appr":"b-neu";return `<span class="badge ${c}">${b}</span>`;};
+let futTf="15m";
+document.querySelectorAll("#fut-tf button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#fut-tf button").forEach(x=>x.classList.remove("on"));b.classList.add("on");futTf=b.dataset.m;document.getElementById("fut-tf-lbl").textContent=futTf==="5m"?"5-min":"15-min";loadFutures();loadFuturesChart();});
 async function loadFutures(){
   try{
-    const d=await(await fetch(`${API}/api/futures`)).json();
+    const d=await(await fetch(`${API}/api/futures?tf=${futTf}`)).json();
     const ins=(d.instruments||[]).filter(i=>!i.warming);
     if(!futSelBuilt&&ins.length){
       document.getElementById("fut-sel").innerHTML=ins.map((i,k)=>`<button data-s="${i.symbol}" class="${k===0?'on':''}">${i.symbol}</button>`).join("");
       document.querySelectorAll("#fut-sel button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#fut-sel button").forEach(x=>x.classList.remove("on"));b.classList.add("on");futSym=b.dataset.s;loadFuturesChart();});
       futSelBuilt=true; loadFuturesChart();
     }
-    const head="<thead><tr><th>Inst</th><th>Price</th><th>vs VWAP</th><th>ORB</th><th>OR Hi/Lo</th><th>Prior H/L</th><th>EMA</th><th>RSI2</th><th>Bias</th></tr></thead>";
+    const head="<thead><tr><th>Inst</th><th>Price</th><th>vs VWAP</th><th>ORB</th><th>OR Hi/Lo</th><th>Prior H/L</th><th>9/21 EMA setup</th><th>RSI2</th><th>Bias</th></tr></thead>";
     const body="<tbody>"+ins.map(i=>`<tr>
       <td><b>${i.symbol}</b> <span class="muted" style="font-size:11px">${i.proxy}</span></td>
       <td class="mono">${fmt(i.price)}</td>
@@ -1010,7 +1037,7 @@ async function loadFutures(){
       <td><span class="${i.orbStatus==='above'?'up':i.orbStatus==='below'?'down':'muted'}">${i.orbStatus}</span></td>
       <td class="mono muted">${fmt(i.orh)}/${fmt(i.orl)}</td>
       <td class="mono muted">${i.priorHigh==null?'—':fmt(i.priorHigh)+'/'+fmt(i.priorLow)}</td>
-      <td><span class="${i.emaTrend==='up'?'up':'down'}">${i.emaTrend}</span></td>
+      <td>${i.emaSetup?emaSetupBadge(i.emaSetup):`<span class="${i.emaTrend==='up'?'up':'down'}">${i.emaTrend}</span>`}</td>
       <td class="mono ${i.rsi2==null?'muted':i.rsi2<10?'up':i.rsi2>90?'down':'muted'}">${i.rsi2==null?'—':i.rsi2.toFixed(0)}</td>
       <td>${biasBadge(i.bias)}</td></tr>`).join("")+"</tbody>";
     document.getElementById("fut-table").innerHTML=ins.length?"<table>"+head+body+"</table>":'<div class="loading">Warming intraday bars…</div>';
@@ -1019,9 +1046,9 @@ async function loadFutures(){
 let futData=null;
 const FUT_PROXY={ES:"SPY",NQ:"QQQ",RTY:"IWM",YM:"DIA"};
 async function loadFuturesChart(){
-  if(!futData||futData.symbol!==futSym)document.getElementById("fut-chart").innerHTML='<div class="loading">Loading 15-min chart…</div>';
+  if(!futData||futData.symbol!==futSym)document.getElementById("fut-chart").innerHTML='<div class="loading">Loading intraday chart…</div>';
   try{
-    const d=await(await fetch(`${API}/api/futures_chart?symbol=${futSym}`)).json();
+    const d=await(await fetch(`${API}/api/futures_chart?symbol=${futSym}&tf=${futTf}`)).json();
     if(!d.ok){document.getElementById("fut-chart").innerHTML=`<div class="loading">${d.reason||'no data'}</div>`;futData=null;return;}
     futData=d; drawFuturesChart(d); futLiveTick();
   }catch(e){document.getElementById("fut-chart").innerHTML='<div class="loading">Chart failed.</div>';}
@@ -1056,7 +1083,7 @@ function drawFuturesChart(d,livePx){
     g+=`<line x1="${x.toFixed(1)}" y1="${Y(b.h).toFixed(1)}" x2="${x.toFixed(1)}" y2="${Y(b.l).toFixed(1)}" stroke="${col}" stroke-width="1"/>`;
     const yo=Y(b.o),yc=Y(b.c);g+=`<rect x="${(x-bw/2).toFixed(1)}" y="${Math.min(yo,yc).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(1,Math.abs(yc-yo)).toFixed(1)}" fill="${col}"/>`;});
   const poly=(arr,col,wd)=>{let p=(arr||[]).map((v,i)=>v==null?null:`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean).join(" ");return p?`<polyline points="${p}" fill="none" stroke="${col}" stroke-width="${wd}"/>`:"";};
-  g+=poly(d.vwap,"var(--amber)",1.5);g+=poly(d.ema9,"#3b82f6",1);g+=poly(d.ema20,"#a855f7",1);
+  g+=poly(d.vwap,"var(--amber)",1.5);g+=poly(d.ema9,"#f5a623",1.6);g+=poly(d.ema21,"#e0507a",1.6);
   g+=`<text x="${padL+2}" y="${H-5}" fill="var(--amber)" font-size="10">VWAP</text><text x="${padL+44}" y="${H-5}" fill="#3b82f6" font-size="10">EMA9</text><text x="${padL+86}" y="${H-5}" fill="#a855f7" font-size="10">EMA20</text>`;
   if(livePx!=null&&livePx>=lo&&livePx<=hi){
     const y=Y(livePx);

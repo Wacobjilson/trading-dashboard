@@ -1,5 +1,20 @@
 # Changelog (standalone platform)
 
+## 2026-07-14 · 9/21 EMA swing strategy
+- **9/21 EMA overlays** on the daily/weekly Chart and the intraday Futures
+  chart (amber EMA9 / pink EMA21). Futures gains a **15m / 5m** timeframe
+  toggle, so the EMAs are available on all four timeframes.
+- **9/21 EMA swing scanner** on the Signals tab (`/api/ema`): per sector ETF,
+  weekly trend (filter) + daily setup (trigger) — classifies Fresh cross /
+  Bull pullback ENTRY ZONE / Trending / Trend-at-risk, with entry/stop
+  (beyond the 21 EMA)/target/RR for the long. Grade A = weekly+daily aligned
+  in the entry zone. Fires staged alerts through the bell.
+- **Falsification**: the 9/21 EMA trend-pullback family is added to the
+  Strategy Zoo, so its real out-of-sample verdict (OOS/DSR/regime/cost/
+  permutation) shows up in Research → Falsification — the strategy is
+  DESCRIPTIVE until it survives that gate. Also added as an ODE full-market
+  scanner strategy (ema921-pullback).
+
 ## 2026-07-05 · Phase 21 — Always-On PM Desk
 - **Standing portfolio-manager view** (`/api/pm`, PM Desk card on Intel):
   reads sector money-flow from the RRG quadrants → overweight/underweight book
