@@ -9385,6 +9385,176 @@ AI_MODES["pm-desk"]["parts"].append("capcycle")
 AI_MODES["morning"]["parts"].append("capcycle")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# RESEARCH RADAR — an agent that continuously HUNTS for newly-published studies,
+# reports and data on the capital-cycle / AI-bubble themes, then AI-summarizes
+# what it finds so the PM reasons with fresh evidence (not just the hardcoded
+# analogs). HONEST LIMITS: it surfaces PUBLIC COVERAGE (GDELT news index) and
+# AI-summarizes it — it does NOT verify a study exists or that its numbers are
+# right, and headlines are secondhand. Labeled unverified everywhere; it is a
+# research feed, not a fact-checker. See RESEARCH_RADAR.md.
+# ═════════════════════════════════════════════════════════════════════════════
+# Simple phrase queries — GDELT throttles/errors on complex boolean nests.
+RADAR_THEMES = [
+    ("ai-capex-returns", '"AI spending returns"', "AI capex vs. returns — is the spend generating revenue?"),
+    ("ai-bubble", '"AI bubble"', "AI-bubble warnings & skeptic research"),
+    ("datacenter-glut", '"data center overbuild"', "Data-center overbuild / capacity glut"),
+    ("ai-adoption-roi", '"enterprise AI ROI"', "Corporate AI adoption & measured ROI studies"),
+    ("insider-selling", '"insider selling"', "Insider / executive selling into strength"),
+    ("valuation-extreme", '"market overvalued"', "Valuation extremes & concentration risk"),
+    ("ai-credit", '"AI infrastructure debt"', "AI/data-center financing & credit stress"),
+]
+_radar_lock = threading.Lock()
+_radar = {"themes": {}, "summary": None, "summaryAt": 0, "collectedAt": 0}
+
+
+def _radar_path():
+    return os.path.join(os.environ.get("QUANTA_DATA", "") or os.path.dirname(os.path.abspath(__file__)),
+                        "research_radar.json")
+
+
+def _radar_save():
+    try:
+        with _radar_lock:
+            body = json.dumps({k: _radar[k] for k in ("themes", "summary", "summaryAt", "collectedAt")})
+        with open(_radar_path() + ".tmp", "w") as f:
+            f.write(body)
+        os.replace(_radar_path() + ".tmp", _radar_path())
+    except OSError as e:
+        _ops_err("radar_save", e)
+
+
+def _radar_load():
+    try:
+        with open(_radar_path()) as f:
+            d = json.load(f)
+        with _radar_lock:
+            _radar.update({k: d.get(k, _radar[k]) for k in d})
+    except (OSError, ValueError):
+        pass
+
+
+def _radar_collect_theme(query):
+    """Recent articles for one theme from the GDELT news index (keyless). One
+    retry after a longer pause — GDELT throttles aggressively."""
+    url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=%s&mode=artlist&maxrecords=12"
+           "&format=json&timespan=21d&sort=datedesc" % urllib.parse.quote(query))
+    arts = []
+    for attempt in (0, 1):
+        try:
+            d = http_get_json(url, timeout=25)
+            arts = d.get("articles", []) if isinstance(d, dict) else []
+            if arts:
+                break
+        except Exception as e:
+            if attempt == 1:
+                _ops_err("radar_gdelt", e)
+            time.sleep(8)
+    seen, out = set(), []
+    for a in arts:
+        t = (a.get("title") or "").strip()
+        key = t.lower()[:60]
+        if not t or key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": t[:160], "domain": a.get("domain"), "url": a.get("url"),
+                    "date": (a.get("seendate") or "")[:8]})
+    return out[:8]
+
+
+def radar_collect():
+    """One collection pass across all themes (paced for GDELT's 1 req/5s)."""
+    for tid, query, label in RADAR_THEMES:
+        arts = _radar_collect_theme(query)
+        if arts:
+            with _radar_lock:
+                _radar["themes"][tid] = {"label": label, "query": query, "articles": arts,
+                                         "collectedAt": time.time()}
+        time.sleep(9)                     # GDELT: 1 req / 5s, be generous
+    with _radar_lock:
+        _radar["collectedAt"] = time.time()
+    _radar_save()
+
+
+def radar_summarize():
+    """AI-summarize what the radar found into key findings + a PM-facing
+    synthesis. Grounded strictly in the collected headlines; labeled unverified."""
+    with _radar_lock:
+        themes = {t: dict(v) for t, v in _radar["themes"].items()}
+    if not themes or not ai_status().get("reachable"):
+        return
+    blocks = []
+    for tid, v in themes.items():
+        heads = "\n".join("- %s (%s, %s)" % (a["title"], a.get("domain"), a.get("date")) for a in v["articles"])
+        blocks.append("THEME: %s\n%s" % (v["label"], heads))
+    sysmsg = (AI_SAFETY + "\n\nROLE: You are the platform's Research Radar analyst. Below are RECENT NEWS "
+              "HEADLINES (from the GDELT index) grouped by capital-cycle theme. Extract the concrete, decision-"
+              "relevant FINDINGS/DATA POINTS being reported (studies, numbers, warnings) — e.g. 'a study found X% "
+              "of AI projects show no ROI', 'insiders sold $Xbn'. For each finding cite the theme. Then write a "
+              "3-4 sentence SYNTHESIS for the portfolio manager: what does the latest published research/coverage "
+              "say about AI capital-cycle top risk RIGHT NOW? Rules: summarize ONLY what the headlines state; these "
+              "are secondhand and UNVERIFIED — say so; never invent a number that isn't in a headline. ~250 words.")
+    try:
+        res = ai_chat([{"role": "system", "content": sysmsg},
+                       {"role": "user", "content": "\n\n".join(blocks)[:9000]}], mode="radar", max_tokens=600)
+        import re as _re
+        text = _re.sub(r"<think>[\s\S]*?</think>", "", res["text"]).strip()
+        with _radar_lock:
+            _radar["summary"], _radar["summaryAt"] = text, time.time()
+        _radar_save()
+    except Exception as e:
+        _ops_err("radar_summarize", e)
+
+
+def radar_view():
+    with _radar_lock:
+        themes = [{"id": t, "label": v["label"], "articles": v["articles"], "collectedAt": v.get("collectedAt")}
+                  for t, v in _radar["themes"].items()]
+        summary, summ_at, coll_at = _radar["summary"], _radar["summaryAt"], _radar["collectedAt"]
+    total = sum(len(t["articles"]) for t in themes)
+    return {"themes": themes, "summary": summary, "summaryAt": summ_at, "collectedAt": coll_at,
+            "articleCount": total, "themeCount": len(RADAR_THEMES),
+            "note": "An agent that continuously scans public coverage (GDELT news index) for newly-published "
+                    "studies/data on the capital-cycle themes, then AI-summarizes them into the PM's briefs.",
+            "disclaimer": "Sourced from NEWS COVERAGE and AI-summarized — headlines are secondhand and UNVERIFIED. "
+                          "The radar surfaces what is being reported; it does not confirm a study exists or that "
+                          "its numbers are correct. A research feed, not a fact-checker. Verify before relying."}
+
+
+def _part_radar():
+    with _radar_lock:
+        summary = _radar["summary"]
+        recent = [{"theme": v["label"], "headlines": [a["title"] for a in v["articles"][:3]]}
+                  for v in _radar["themes"].values()]
+    if not summary and not recent:
+        return None
+    return {"latestResearchSynthesis": summary, "byTheme": recent[:7],
+            "note": "AI-summarized from recent news coverage — UNVERIFIED, secondhand; context for the capital-"
+                    "cycle read, not confirmed fact"}
+
+
+AI_PARTS["radar"] = ("Research Radar — latest published studies/data on AI capital-cycle themes (news-sourced)",
+                     _part_radar)
+AI_MODES["pm-desk"]["parts"].append("radar")
+AI_MODES["morning"]["parts"].append("radar")
+RADAR_HOURS = float(os.environ.get("RADAR_HOURS") or 8)
+
+
+def radar_loop():
+    _radar_load()
+    time.sleep(1400)
+    while True:
+        try:
+            with _radar_lock:
+                last = _radar["collectedAt"]
+            if time.time() - last > RADAR_HOURS * 3600:
+                radar_collect()
+                radar_summarize()
+        except Exception as e:
+            _ops_err("radar_loop", e)
+        time.sleep(1800)
+
+
 def cc_replay():
     """Lightweight replay: run the divergence + credit + narrative logic over
     the history we actually have (FRED spreads = years; GDELT = 6mo; capex =
@@ -10519,6 +10689,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(cache_get("capital_cycle", 3600) or _cache_and_return("capital_cycle", capital_cycle_view))
         elif path == "/api/capital_cycle/replay":
             self._json(cache_get("cc_replay", 6 * 3600) or _cache_and_return("cc_replay", cc_replay))
+        elif path == "/api/radar":
+            self._json(radar_view())
         elif path == "/api/paper":
             self._json(paper_view())
         elif path == "/api/deepvalue":
@@ -10637,7 +10809,7 @@ def main():
     print("  options  : CBOE delayed chains for %d symbols (greeks/OI/IV — GEX, walls, max pain…)" % len(OPTIONS_UNIVERSE))
     for fn in (quotes_loop, bars_loop, live_loop, news_loop, calendar_loop, options_loop, deep_loop, congress_loop,
                research_log_loop, agents_loop, market_loop, ode_loop, deepvalue_loop, pm_loop, cc_loop,
-               runner_loop):
+               runner_loop, radar_loop):
         threading.Thread(target=_hb_wrap(fn), daemon=True, name=fn.__name__).start()
     # Dual-stack listener: browsers resolving `localhost` often try ::1 first —
     # an IPv4-only bind costs ~2s per request on such clients (measured on

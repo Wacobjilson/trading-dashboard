@@ -568,6 +568,7 @@
     </div>
     <div class="card" id="cc-signals"><h2>Signals — staged Watch → Warning → Trigger</h2><div id="cc-sig-body"><div class="loading">…</div></div></div>
     <div class="card" id="cc-reference"><h2>Historical analogs &amp; AI spend-vs-revenue reality</h2><div id="cc-ref-body"><div class="loading">…</div></div></div>
+    <div class="card" id="cc-radar"><h2>Research radar — an agent hunting newly-published studies &amp; data <span class="muted" id="radar-status" style="font-weight:normal;font-size:11px;text-transform:none;letter-spacing:0"></span></h2><div id="radar-body"><div class="loading">…</div></div></div>
     <div class="card" id="cc-circular" style="display:none"></div>
     <div id="cc-panels"></div>
     <div class="cols cols2">
@@ -2449,6 +2450,16 @@ async function loadCapCycle(){
           <ul style="margin:4px 0 0 16px;font-size:12px">${(ref.rhymes||[]).map(r=>`<li>${r}</li>`).join('')}</ul></div>
         <div class="note"><b class="amber">Green</b> = reported fact · <b class="amber">amber</b> = estimate/projection (forecast, not fact). ${ref.note}</div>`;
     }
+    // research radar
+    fetch(`${API}/api/radar`).then(r=>r.json()).then(rd=>{
+      document.getElementById("radar-status").textContent=`· ${rd.articleCount||0} articles across ${rd.themeCount||0} themes · ${rd.collectedAt?ago(rd.collectedAt):"warming"}`;
+      document.getElementById("radar-body").innerHTML=
+        `${rd.summary?`<div style="font-size:12.5px;background:rgba(245,166,35,.06);border-left:3px solid var(--amber);padding:8px 12px;border-radius:0 6px 6px 0"><b>PM synthesis</b> <span class="muted" style="font-size:10px">(AI-summarized ${ago(rd.summaryAt)})</span><br>${mdLite(rd.summary)}</div>`:'<div class="muted" style="font-size:12px">Radar warming — first scan + AI summary runs within a few hours (or is rate-paced). It feeds the PM &amp; morning briefs automatically.</div>'}
+        <details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">${rd.articleCount||0} source articles by theme</summary>
+          ${(rd.themes||[]).map(t=>`<div style="margin-top:6px"><div style="font-size:11px;font-weight:600">${t.label}</div>
+            ${(t.articles||[]).map(a=>`<div style="font-size:11px;padding:2px 0" class="muted">• ${a.url?`<a href="${a.url}" target="_blank" rel="noopener" style="color:var(--text)">${a.title}</a>`:a.title} <span style="font-size:9px">[${a.domain}]</span></div>`).join('')||'<div class="muted" style="font-size:10px">—</div>'}</div>`).join('')}</details>
+        <div class="note">${rd.note||''}<br><b class="down">${rd.disclaimer||''}</b></div>`;
+    }).catch(()=>{document.getElementById("radar-body").innerHTML='<div class="loading">Radar unavailable.</div>';});
     // gaps
     document.getElementById("cc-gaps-body").innerHTML=
       `<div style="font-size:12px" class="muted">Per the guardrails — these have no credible free feed and are shown as "no data", never faked:</div>
