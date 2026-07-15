@@ -9394,16 +9394,26 @@ AI_MODES["morning"]["parts"].append("capcycle")
 # right, and headlines are secondhand. Labeled unverified everywhere; it is a
 # research feed, not a fact-checker. See RESEARCH_RADAR.md.
 # ═════════════════════════════════════════════════════════════════════════════
-# Simple phrase queries — GDELT throttles/errors on complex boolean nests.
+# Each theme: id, GDELT phrase query, label, and keywords used to bucket the
+# Alpha Vantage news pool (2nd source) into the theme. GDELT throttles/errors on
+# complex boolean nests, so its queries stay simple.
 RADAR_THEMES = [
-    ("ai-capex-returns", '"AI spending returns"', "AI capex vs. returns — is the spend generating revenue?"),
-    ("ai-bubble", '"AI bubble"', "AI-bubble warnings & skeptic research"),
-    ("datacenter-glut", '"data center overbuild"', "Data-center overbuild / capacity glut"),
-    ("ai-adoption-roi", '"enterprise AI ROI"', "Corporate AI adoption & measured ROI studies"),
-    ("insider-selling", '"insider selling"', "Insider / executive selling into strength"),
-    ("valuation-extreme", '"market overvalued"', "Valuation extremes & concentration risk"),
-    ("ai-credit", '"AI infrastructure debt"', "AI/data-center financing & credit stress"),
+    ("ai-capex-returns", '"AI spending returns"', "AI capex vs. returns — is the spend generating revenue?",
+     ["ai spend", "ai capex", "ai investment", "ai revenue", "ai roi", "ai payback", "monetiz", "ai returns"]),
+    ("ai-bubble", '"AI bubble"', "AI-bubble warnings & skeptic research",
+     ["ai bubble", "ai hype", "bubble", "overhyped", "ai froth", "dot-com", "dotcom"]),
+    ("datacenter-glut", '"data center overbuild"', "Data-center overbuild / capacity glut",
+     ["data center", "data-center", "datacenter", "overbuild", "capacity glut", "oversupply", "vacancy"]),
+    ("ai-adoption-roi", '"enterprise AI ROI"', "Corporate AI adoption & measured ROI studies",
+     ["enterprise ai", "ai adoption", "return on investment", "productivity", "ai pilot", "ai disappoint", "study found"]),
+    ("insider-selling", '"insider selling"', "Insider / executive selling into strength",
+     ["insider selling", "insider sale", "executives sold", "insider sold", "stock sale", "secondary offering"]),
+    ("valuation-extreme", '"market overvalued"', "Valuation extremes & concentration risk",
+     ["overvalued", "valuation", "concentration risk", "bubble territory", "stretched", "frothy", "expensive"]),
+    ("ai-credit", '"AI infrastructure debt"', "AI/data-center financing & credit stress",
+     ["ai debt", "data center debt", "private credit", "financing", "default", "credit spread", "bond", "borrow"]),
 ]
+RADAR_AV_TOPICS = ["technology", "financial_markets", "finance", "economy_macro"]
 _radar_lock = threading.Lock()
 _radar = {"themes": {}, "summary": None, "summaryAt": 0, "collectedAt": 0}
 
@@ -9462,10 +9472,49 @@ def _radar_collect_theme(query):
     return out[:8]
 
 
+def _radar_av_pool():
+    """Second source: Alpha Vantage topic-tagged news (reliable, unlike GDELT).
+    A few topics fetched ONCE per pass (cached 6h) → a pool bucketed into every
+    theme by keyword, so coverage doesn't depend on GDELT not throttling."""
+    key = _key("alphavantage")
+    if not key:
+        return []
+    pool = []
+    for topic in RADAR_AV_TOPICS:
+        ck = "radar_av:" + topic
+        c = cache_get(ck, 6 * 3600)
+        if c is None:
+            try:
+                d = http_get_json("https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=%s"
+                                  "&sort=LATEST&limit=50&apikey=%s" % (topic, urllib.parse.quote(key)), timeout=25)
+                feed = d.get("feed", []) if isinstance(d, dict) else []
+                c = [{"title": (a.get("title") or "")[:160], "url": a.get("url"),
+                      "summary": (a.get("summary") or "")[:300], "domain": a.get("source"),
+                      "date": (a.get("time_published") or "")[:8]} for a in feed if a.get("title")]
+                cache_set(ck, c)
+            except Exception as e:
+                _ops_err("radar_av", e)
+                c = []
+            time.sleep(1)
+        pool.extend(c)
+    return pool
+
+
 def radar_collect():
-    """One collection pass across all themes (paced for GDELT's 1 req/5s)."""
-    for tid, query, label in RADAR_THEMES:
-        arts = _radar_collect_theme(query)
+    """One pass: GDELT phrase search per theme + Alpha Vantage topic pool
+    bucketed into themes by keyword (deduped). Paced for GDELT's 1 req/5s."""
+    av_pool = _radar_av_pool()
+    for tid, query, label, kws in RADAR_THEMES:
+        arts = _radar_collect_theme(query)                 # source 1: GDELT
+        seen = {a["title"].lower()[:60] for a in arts}
+        for a in av_pool:                                  # source 2: Alpha Vantage, keyword-bucketed
+            txt = (a["title"] + " " + a.get("summary", "")).lower()
+            k = a["title"].lower()[:60]
+            if k not in seen and any(w in txt for w in kws):
+                arts.append({"title": a["title"], "domain": a.get("domain"), "url": a.get("url"),
+                             "date": a.get("date"), "src": "AlphaVantage"})
+                seen.add(k)
+        arts = arts[:8]
         if arts:
             with _radar_lock:
                 _radar["themes"][tid] = {"label": label, "query": query, "articles": arts,
